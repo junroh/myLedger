@@ -1,0 +1,8 @@
+[package]
+name = "ledger-pending"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ledger-base.workspace = true
+ledger-stubkit.workspace = true

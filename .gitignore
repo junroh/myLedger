@@ -1,0 +1,6 @@
+# Build output. `cargo` rebuilds it; nothing here belongs to the project.
+/target
+
+# IntelliJ's own view of the project, which is per-machine.
+/.idea
+*.iml

@@ -1,0 +1,17 @@
+[package]
+name = "ledgersim"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ledgersim"
+path = "src/main.rs"
+
+[dependencies]
+ledger-base.workspace = true
+ledger-account.workspace = true
+ledger-sequencer.workspace = true
+ledger-pending.workspace = true
+ledger-stubkit.workspace = true
+lexopt = "0.3.2"
+hdrhistogram = { version = "7.6.0", default-features = false }

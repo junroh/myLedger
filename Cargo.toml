@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = [
+    "base",
+    "account",
+    "sequencer",
+    "pending",
+    "idempotency",
+    "raft",
+    "service",
+    "benchkit",
+    "stubkit",
+    "ledgerd",
+    "ledgerfio",
+    "ledgersim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+ledger-base = { path = "base" }
+ledger-account = { path = "account" }
+ledger-sequencer = { path = "sequencer" }
+ledger-pending = { path = "pending" }
+ledger-idempotency = { path = "idempotency" }
+ledger-raft = { path = "raft" }
+ledger-service = { path = "service" }
+ledger-benchkit = { path = "benchkit" }
+ledger-stubkit = { path = "stubkit" }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = true
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+debug = false

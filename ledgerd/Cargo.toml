@@ -1,0 +1,17 @@
+[package]
+name = "ledgerd"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ledgerd"
+path = "src/main.rs"
+
+[dependencies]
+ledger-base.workspace = true
+ledger-account.workspace = true
+ledger-idempotency.workspace = true
+ledger-pending.workspace = true
+ledger-raft.workspace = true
+ledger-sequencer.workspace = true
+ledger-service.workspace = true

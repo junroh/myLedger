@@ -1,0 +1,19 @@
+[package]
+name = "ledger-sequencer"
+version.workspace = true
+edition.workspace = true
+
+[[bench]]
+name = "pipeline"
+harness = false
+
+[dependencies]
+ledger-base.workspace = true
+
+[dev-dependencies]
+ledger-account.workspace = true
+ledger-benchkit.workspace = true
+ledger-pending.workspace = true
+ledger-idempotency.workspace = true
+ledger-raft.workspace = true
+ledger-stubkit.workspace = true

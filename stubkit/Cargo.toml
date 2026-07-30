@@ -1,0 +1,7 @@
+[package]
+name = "ledger-stubkit"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ledger-base.workspace = true

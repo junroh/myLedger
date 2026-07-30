@@ -1,0 +1,22 @@
+[package]
+name = "ledgerfio"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ledgerfio"
+path = "src/main.rs"
+
+[dependencies]
+ledger-base.workspace = true
+ledger-stubkit.workspace = true
+ledger-account.workspace = true
+ledger-sequencer.workspace = true
+ledger-service.workspace = true
+ledger-pending.workspace = true
+ledger-idempotency.workspace = true
+ledger-raft.workspace = true
+hdrhistogram = { version = "7.6.0", default-features = false }
+lexopt = "0.3.2"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
