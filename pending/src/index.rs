@@ -174,7 +174,11 @@ impl HoldTable {
         }
     }
 
-    pub fn addr_of(&self, key: TxId, verify: &mut dyn FnMut(BlockAddr) -> bool) -> Option<BlockAddr> {
+    pub fn addr_of(
+        &self,
+        key: TxId,
+        verify: &mut dyn FnMut(BlockAddr) -> bool,
+    ) -> Option<BlockAddr> {
         let slot = self.resolve(key, verify)?;
         Some(address_of(self.slot_word(slot)))
     }
@@ -232,7 +236,9 @@ impl HoldTable {
                 self.live += 1;
                 Ok(())
             }
-            Err(displaced) => Err(Homeless { address: address_of(displaced) }),
+            Err(displaced) => Err(Homeless {
+                address: address_of(displaced),
+            }),
         }
     }
 
@@ -254,7 +260,11 @@ impl HoldTable {
     }
 
     /// Which slot is this key's, reading a record only when the marking says the fingerprint is shared.
-    fn resolve(&self, key: TxId, verify: &mut dyn FnMut(BlockAddr) -> bool) -> Option<(usize, usize)> {
+    fn resolve(
+        &self,
+        key: TxId,
+        verify: &mut dyn FnMut(BlockAddr) -> bool,
+    ) -> Option<(usize, usize)> {
         match self.find(key) {
             Found::Absent => None,
             Found::At(slot) => Some(slot),
@@ -273,7 +283,11 @@ impl HoldTable {
     /// A cuckoo slot is cleared outright: there is no probe sequence for a removal to interrupt, so
     /// no tombstone, which is what keeps a table that turns over as fast as it fills usable. The
     /// record itself stays where it is until its segment expires.
-    pub fn remove(&mut self, key: TxId, verify: &mut dyn FnMut(BlockAddr) -> bool) -> Option<BlockAddr> {
+    pub fn remove(
+        &mut self,
+        key: TxId,
+        verify: &mut dyn FnMut(BlockAddr) -> bool,
+    ) -> Option<BlockAddr> {
         let (bucket, way) = self.resolve(key, verify)?;
         let slot = self.buckets[bucket].slots[way];
         self.buckets[bucket].slots[way] = EMPTY;
@@ -397,7 +411,6 @@ impl HoldTable {
         }
         false
     }
-
 }
 
 const fn pack(fingerprint: u64, addr: BlockAddr) -> Slot {
@@ -464,11 +477,17 @@ mod tests {
         let mut table = HoldTable::with_slots(slots);
         let mut refused = 0;
         for key in 1..=holds {
-            if table.insert_new(TxId(u128::from(key)), BlockAddr::from_raw(key)).is_err() {
+            if table
+                .insert_new(TxId(u128::from(key)), BlockAddr::from_raw(key))
+                .is_err()
+            {
                 refused += 1;
             }
         }
-        assert_eq!(refused, 0, "a table at its target load factor refused an insert");
+        assert_eq!(
+            refused, 0,
+            "a table at its target load factor refused an insert"
+        );
         assert_eq!(table.len(), holds as usize);
         for key in 1..=holds {
             assert_eq!(
@@ -478,7 +497,10 @@ mod tests {
             );
         }
         let (_, worst) = table.kick_stats();
-        assert!(worst < MAX_HOPS, "the cascade reached its cap, so the cap is the constraint");
+        assert!(
+            worst < MAX_HOPS,
+            "the cascade reached its cap, so the cap is the constraint"
+        );
     }
 
     /// Two keys that share a fingerprint and a bucket. Sixteen bits make that findable by search, which
@@ -497,10 +519,15 @@ mod tests {
                 pair = Some((TxId(u128::from(other.raw())), key));
                 break;
             }
-            table.insert_new(key, BlockAddr::from_raw(step as u64)).expect("room");
+            table
+                .insert_new(key, BlockAddr::from_raw(step as u64))
+                .expect("room");
         }
         let (first, second) = pair.expect("no shared fingerprint found");
-        assert!(table.ambiguous() == 0, "nothing marked before the clash was inserted");
+        assert!(
+            table.ambiguous() == 0,
+            "nothing marked before the clash was inserted"
+        );
 
         table
             .insert_new(second, BlockAddr::from_raw(second.raw() as u64))
@@ -520,7 +547,9 @@ mod tests {
         );
 
         // And removing one leaves the other where it was — the failure this whole mechanism prevents.
-        table.remove(first, &mut verify_first).expect("the first of the pair");
+        table
+            .remove(first, &mut verify_first)
+            .expect("the first of the pair");
         assert_eq!(
             table.addr_of(second, &mut verify_second),
             Some(BlockAddr::from_raw(second.raw() as u64)),

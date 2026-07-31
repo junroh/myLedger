@@ -2,25 +2,25 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use ledger_base::ports::HoldData;
 use ledger_base::ports::{
-    OverlayState, PendingCommand, PendingEffect, PendingLookup, PendingPort, PendingReply,
-    PendingOverlay,
+    OverlayState, PendingCommand, PendingEffect, PendingLookup, PendingOverlay, PendingPort,
+    PendingReply,
 };
+use ledger_base::BudgetGroup;
 use ledger_base::{
-    Amount, Consumer, Footprint, FxHashMap, LedgerError, MapGauge, Prng, Producer, StagedProducer,
-    TxId, channel,
+    channel, Amount, Consumer, Footprint, FxHashMap, LedgerError, MapGauge, Prng, Producer,
+    StagedProducer, TxId,
 };
 use ledger_stubkit::{IdleBackoff, LatencyRange, WorkerThread};
-use ledger_base::ports::HoldData;
-use ledger_base::BudgetGroup;
 
 use crate::block::{
     BlockAddr, BlockStore, LatencyBlockStore, LogTraffic, MemBlockStore, BLOCK_BYTES,
     RECORDS_PER_BLOCK,
 };
+use crate::engine::{BudgetState, PendingEngine, Started};
 use crate::index::{LOAD_TARGET, SLOT_BYTES};
 use crate::orderer::OrderWait;
-use crate::engine::{BudgetState, PendingEngine, Started};
 use crate::orderer::Orderer;
 use crate::overlay::HoldOverlay;
 
@@ -201,7 +201,10 @@ impl Default for MemoryPendingConfig {
             eviction_per_round: 4096,
             capacity: PendingCapacity::default(),
             index_budget_bytes: 1 << 30,
-            store: StoreModel { queue_depth: 128, ..StoreModel::default() },
+            store: StoreModel {
+                queue_depth: 128,
+                ..StoreModel::default()
+            },
         }
     }
 }
@@ -244,17 +247,27 @@ struct TrafficGauge {
 impl TrafficGauge {
     fn publish(&self, traffic: LogTraffic) {
         self.appended.store(traffic.appended, Ordering::Relaxed);
-        self.died_in_buffer.store(traffic.died_in_buffer, Ordering::Relaxed);
+        self.died_in_buffer
+            .store(traffic.died_in_buffer, Ordering::Relaxed);
         self.flushed.store(traffic.flushed, Ordering::Relaxed);
-        self.left_memory.store(traffic.left_memory, Ordering::Relaxed);
-        self.buffer_reads.store(traffic.buffer_reads, Ordering::Relaxed);
-        self.resident_reads.store(traffic.resident_reads, Ordering::Relaxed);
-        self.store_reads.store(traffic.store_reads, Ordering::Relaxed);
-        self.apply_store_reads.store(traffic.apply_store_reads, Ordering::Relaxed);
-        self.inflight_peak.store(traffic.inflight_peak as u64, Ordering::Relaxed);
-        self.index_live.store(traffic.index_live as u64, Ordering::Relaxed);
-        self.index_slots.store(traffic.index_slots as u64, Ordering::Relaxed);
-        self.worst_cascade.store(u64::from(traffic.worst_cascade), Ordering::Relaxed);
+        self.left_memory
+            .store(traffic.left_memory, Ordering::Relaxed);
+        self.buffer_reads
+            .store(traffic.buffer_reads, Ordering::Relaxed);
+        self.resident_reads
+            .store(traffic.resident_reads, Ordering::Relaxed);
+        self.store_reads
+            .store(traffic.store_reads, Ordering::Relaxed);
+        self.apply_store_reads
+            .store(traffic.apply_store_reads, Ordering::Relaxed);
+        self.inflight_peak
+            .store(traffic.inflight_peak as u64, Ordering::Relaxed);
+        self.index_live
+            .store(traffic.index_live as u64, Ordering::Relaxed);
+        self.index_slots
+            .store(traffic.index_slots as u64, Ordering::Relaxed);
+        self.worst_cascade
+            .store(u64::from(traffic.worst_cascade), Ordering::Relaxed);
         self.ambiguous.store(traffic.ambiguous, Ordering::Relaxed);
         self.overflowed.store(traffic.overflowed, Ordering::Relaxed);
     }
@@ -312,11 +325,15 @@ struct OrderWaitGauge {
 impl OrderWaitGauge {
     fn publish(&self, wait: OrderWait) {
         self.released.store(wait.released, Ordering::Relaxed);
-        self.held_for_order.store(wait.held_for_order, Ordering::Relaxed);
+        self.held_for_order
+            .store(wait.held_for_order, Ordering::Relaxed);
         self.order_nanos.store(wait.order_nanos, Ordering::Relaxed);
-        self.order_worst_nanos.store(wait.order_worst_nanos, Ordering::Relaxed);
-        self.delivery_nanos.store(wait.delivery_nanos, Ordering::Relaxed);
-        self.deepest_lane.store(wait.deepest_lane as u64, Ordering::Relaxed);
+        self.order_worst_nanos
+            .store(wait.order_worst_nanos, Ordering::Relaxed);
+        self.delivery_nanos
+            .store(wait.delivery_nanos, Ordering::Relaxed);
+        self.deepest_lane
+            .store(wait.deepest_lane as u64, Ordering::Relaxed);
     }
 
     fn read(&self) -> OrderWait {
@@ -451,9 +468,11 @@ impl PendingPort for MemoryPending {
             PendingCommand::Apply(PendingEffect::Create { tx_id, amount, .. }) => {
                 self.overlay.created(tx_id, amount)
             }
-            PendingCommand::Apply(PendingEffect::Reduce { pending_ref, remaining, .. }) => {
-                self.overlay.note_remaining(pending_ref, remaining)
-            }
+            PendingCommand::Apply(PendingEffect::Reduce {
+                pending_ref,
+                remaining,
+                ..
+            }) => self.overlay.note_remaining(pending_ref, remaining),
             PendingCommand::Apply(PendingEffect::Remove { pending_ref, .. }) => {
                 self.overlay.forget(pending_ref)
             }
@@ -652,7 +671,9 @@ impl PendingWorker {
         let applied = self.store.applied();
         self.answers += 1;
         let stale = self.stale_answer_every > 0
-            && self.answers.is_multiple_of(u64::from(self.stale_answer_every));
+            && self
+                .answers
+                .is_multiple_of(u64::from(self.stale_answer_every));
         if stale {
             // One decision short of the truth is enough: the check is `at least what I was given`.
             return applied.saturating_sub(1);

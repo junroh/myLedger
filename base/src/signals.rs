@@ -23,7 +23,9 @@ impl Signals {
     }
 
     pub fn requested() -> bool {
-        REQUESTED.get().is_some_and(|flag| flag.load(Ordering::Relaxed))
+        REQUESTED
+            .get()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
     }
 }
 
@@ -41,6 +43,9 @@ mod tests {
         signal_hook::low_level::raise(SIGTERM).expect("raise");
         // The handler runs on this thread before `raise` returns.
         assert!(Signals::requested());
-        assert!(Signals::requested(), "the request is not consumed by reading it");
+        assert!(
+            Signals::requested(),
+            "the request is not consumed by reading it"
+        );
     }
 }

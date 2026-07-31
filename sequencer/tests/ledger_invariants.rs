@@ -5,8 +5,8 @@ use std::time::Duration;
 use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{AckOutcome, TransferFlags};
-use ledger_stubkit::LatencyRange;
 use ledger_raft::EchoRaftConfig;
+use ledger_stubkit::LatencyRange;
 
 use harness::*;
 
@@ -28,13 +28,19 @@ fn accounting_identities_hold_after_mixed_traffic() {
 fn accounting_identities_hold_when_consensus_refuses_batches() {
     let mut harness = Harness::with_stubs(
         NoLatency::pending(),
-        EchoRaftConfig { fail_every: 7, ..NoLatency::raft() },
+        EchoRaftConfig {
+            fail_every: 7,
+            ..NoLatency::raft()
+        },
     );
     fund_until_committed(&mut harness, ALICE, FUNDING * 100);
     fund_until_committed(&mut harness, BOB, FUNDING * 100);
     mixed_traffic(&mut harness, 25);
 
-    assert!(harness.reactor.metrics().commit_failures > 0, "no batch was refused");
+    assert!(
+        harness.reactor.metrics().commit_failures > 0,
+        "no batch was refused"
+    );
     harness.assert_consistent();
 }
 
@@ -45,7 +51,11 @@ fn accounting_identities_hold_when_consensus_refuses_batches() {
 fn the_committed_log_replays_to_the_same_balances_on_a_fresh_store() {
     let mut harness = Harness::with_stubs(
         NoLatency::pending(),
-        EchoRaftConfig { keep_log: true, fail_every: 7, ..NoLatency::raft() },
+        EchoRaftConfig {
+            keep_log: true,
+            fail_every: 7,
+            ..NoLatency::raft()
+        },
     );
     fund_until_committed(&mut harness, ALICE, FUNDING * 10);
     fund_until_committed(&mut harness, BOB, FUNDING * 10);
@@ -139,7 +149,9 @@ fn a_commit_that_answers_the_wrong_batch_applies_nothing() {
             reactor.metrics().proposed_batches > batch
         });
     }
-    harness.tick_until("the reordering was never noticed", |reactor| reactor.is_fail_stopped());
+    harness.tick_until("the reordering was never noticed", |reactor| {
+        reactor.is_fail_stopped()
+    });
     let applied = harness.reactor.accounts().totals();
 
     for _ in 0..1_000 {
@@ -150,8 +162,14 @@ fn a_commit_that_answers_the_wrong_batch_applies_nothing() {
         applied,
         "a batch that could not be paired was applied anyway"
     );
-    assert_eq!(applied.debits_posted, applied.credits_posted, "posted identity");
-    assert_eq!(applied.debits_pending, applied.credits_pending, "pending identity");
+    assert_eq!(
+        applied.debits_posted, applied.credits_posted,
+        "posted identity"
+    );
+    assert_eq!(
+        applied.debits_pending, applied.credits_pending,
+        "pending identity"
+    );
 }
 
 /// An account component that loses count of what it applied, which is the cheapest way to make the
@@ -205,7 +223,10 @@ fn bookkeeping_that_stops_adding_up_seals_the_apply_path() {
             },
             ..ledger_sequencer::ReactorConfig::default()
         },
-        ledger_sequencer::Transport { requests: request_rx, acks: ack_tx },
+        ledger_sequencer::Transport {
+            requests: request_rx,
+            acks: ack_tx,
+        },
         Forgetful(accounts),
         ledger_pending::MemoryPending::start(NoLatency::pending()).expect("a test engine config"),
         ledger_idempotency::MemoryDedup::start(NoLatency::idem()),
@@ -229,9 +250,18 @@ fn bookkeeping_that_stops_adding_up_seals_the_apply_path() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while reactor.metrics().invariant_breaks == 0 {
         reactor.tick();
-        assert!(std::time::Instant::now() < deadline, "the disagreement was never noticed");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the disagreement was never noticed"
+        );
     }
-    assert!(reactor.is_fail_stopped(), "a broken invariant must stop the node");
-    assert_eq!(reactor.audit(), Err(ledger_sequencer::Broken::AccountViewDisagrees));
+    assert!(
+        reactor.is_fail_stopped(),
+        "a broken invariant must stop the node"
+    );
+    assert_eq!(
+        reactor.audit(),
+        Err(ledger_sequencer::Broken::AccountViewDisagrees)
+    );
     let _ = acks.pop();
 }

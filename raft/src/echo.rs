@@ -8,7 +8,7 @@ use std::sync::Mutex;
 
 use ledger_base::ports::{RaftCommit, RaftOutcome, RaftPort, RaftProposal};
 use ledger_base::Effect;
-use ledger_base::{Consumer, Footprint, MapGauge, Prng, Producer, StagedProducer, channel};
+use ledger_base::{channel, Consumer, Footprint, MapGauge, Prng, Producer, StagedProducer};
 use ledger_stubkit::{IdleBackoff, LatencyRange, WorkerThread};
 
 #[derive(Debug, Clone, Copy)]
@@ -80,7 +80,13 @@ impl EchoRaft {
             }
             .run(shutdown)
         });
-        Self { proposals, commits, log, inflight, _thread: thread }
+        Self {
+            proposals,
+            commits,
+            log,
+            inflight,
+            _thread: thread,
+        }
     }
 
     /// What consensus is holding. The log is only kept when a run asked for it, so an empty log here is
@@ -89,9 +95,18 @@ impl EchoRaft {
     /// rather than a steady size.
     pub fn footprint(&self) -> Footprint {
         let mut footprint = Footprint::new();
-        let (entries, capacity) =
-            self.log.lock().map(|log| (log.len(), log.capacity())).unwrap_or_default();
-        footprint.other("kept log", entries, entries, 0, capacity * size_of::<Effect>());
+        let (entries, capacity) = self
+            .log
+            .lock()
+            .map(|log| (log.len(), log.capacity()))
+            .unwrap_or_default();
+        footprint.other(
+            "kept log",
+            entries,
+            entries,
+            0,
+            capacity * size_of::<Effect>(),
+        );
         let effects = self.inflight.effects.peak();
         footprint.other(
             "proposals in flight",
@@ -145,8 +160,14 @@ impl RaftWorker {
 
     /// Once per round rather than once per proposal: a report asks at the end of a run.
     fn publish(&self) {
-        self.gauge.proposals.publish(self.inflight.len(), self.inflight.capacity());
-        let effects: usize = self.inflight.iter().map(|(_, p, _)| p.effects.capacity()).sum();
+        self.gauge
+            .proposals
+            .publish(self.inflight.len(), self.inflight.capacity());
+        let effects: usize = self
+            .inflight
+            .iter()
+            .map(|(_, p, _)| p.effects.capacity())
+            .sum();
         self.gauge.effects.publish(effects, effects);
     }
 
@@ -155,11 +176,12 @@ impl RaftWorker {
         while let Some(proposal) = self.proposals.pop() {
             progress = true;
             self.proposals_seen += 1;
-            let outcome = if self.fail_every > 0 && self.proposals_seen.is_multiple_of(self.fail_every) {
-                RaftOutcome::Failed
-            } else {
-                RaftOutcome::Committed
-            };
+            let outcome =
+                if self.fail_every > 0 && self.proposals_seen.is_multiple_of(self.fail_every) {
+                    RaftOutcome::Failed
+                } else {
+                    RaftOutcome::Committed
+                };
             let due = self.round_trip.due_from(Instant::now(), &mut self.jitter);
             self.inflight.push_back((due, proposal, outcome));
             if self.reorder_every > 0

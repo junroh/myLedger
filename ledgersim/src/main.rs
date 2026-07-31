@@ -174,7 +174,10 @@ fn held(options: &Options, prediction: &Prediction) -> bool {
 }
 
 fn run_capacity() {
-    let mut options = Options { plan: default_plan(), slo_nanos: None };
+    let mut options = Options {
+        plan: default_plan(),
+        slo_nanos: None,
+    };
     let mut sweep = None;
     parse(|name, parser| {
         let value = text(parser, name)?;
@@ -194,9 +197,10 @@ fn run_capacity() {
 fn predict_once(options: Options) {
     match capacity(options.plan) {
         Ok(prediction) => {
-            let verdict = options
-                .slo_nanos
-                .map(|target_nanos| report::Verdict { target_nanos, held: held(&options, &prediction) });
+            let verdict = options.slo_nanos.map(|target_nanos| report::Verdict {
+                target_nanos,
+                held: held(&options, &prediction),
+            });
             report::prediction(&options.plan, &prediction, verdict);
             if verdict.is_some_and(|verdict| !verdict.held) {
                 std::process::exit(1);
@@ -239,7 +243,14 @@ fn sweep_spec(spec: &str) -> Result<(String, Vec<String>), String> {
     if knob.is_empty() || values.iter().any(String::is_empty) {
         return Err(format!("bad sweep `{spec}`"));
     }
-    apply(&mut Options { plan: default_plan(), slo_nanos: None }, &knob, &values[0])?;
+    apply(
+        &mut Options {
+            plan: default_plan(),
+            slo_nanos: None,
+        },
+        &knob,
+        &values[0],
+    )?;
     Ok((knob, values))
 }
 
@@ -252,7 +263,10 @@ const SEARCHED_NANOS: u64 = 100_000_000;
 /// the forward model, because the forward model is the thing that has the real reactor in it.
 fn run_require() {
     let mut options = Options {
-        plan: Plan { duration_nanos: 500_000_000, ..default_plan() },
+        plan: Plan {
+            duration_nanos: 500_000_000,
+            ..default_plan()
+        },
         slo_nanos: Some(5_000_000),
     };
     let mut solve = Solve::Pending;
@@ -272,7 +286,9 @@ fn run_require() {
     let plan = options.plan;
     let slo_nanos = options.slo_nanos.expect("require always has a target");
     if plan.rate == 0 {
-        eprintln!("ledgersim: require needs --rate, since it solves for a component's budget at a rate");
+        eprintln!(
+            "ledgersim: require needs --rate, since it solves for a component's budget at a rate"
+        );
         std::process::exit(2);
     }
     println!(
@@ -293,8 +309,13 @@ fn run_require() {
     // Committed is not the test — duplicates and refusals are part of this traffic, so committed is
     // always below what was offered.
     let met = |plan: &Plan, prediction: &Prediction| {
-        held(&Options { plan: *plan, slo_nanos: Some(slo_nanos) }, prediction)
-            && prediction.offered() >= plan.rate as f64 * 0.95
+        held(
+            &Options {
+                plan: *plan,
+                slo_nanos: Some(slo_nanos),
+            },
+            prediction,
+        ) && prediction.offered() >= plan.rate as f64 * 0.95
     };
     let (best_plan, best) = match probe(0) {
         Err(failure) => report::failure(&failure),
@@ -463,7 +484,9 @@ fn help() {
     println!("  --rate <per-s>      offered load to hold (required)");
     println!("  --slo-p999-us <n>   the tail it has to hold (5000)");
     println!("  --solve <component> which latency is the unknown: pending, raft or idem (pending)");
-    println!("  --pending-us <n>    the pending engine's answer time, when solving for another (1000)");
+    println!(
+        "  --pending-us <n>    the pending engine's answer time, when solving for another (1000)"
+    );
     println!("  --pending-rate <n>  a candidate ceiling to check, 0 for no limit (0)");
     println!("  --raft-us <n>       consensus round trip (10000)");
     println!("  --qd <n>            the client's queue depth (20000)");
@@ -473,7 +496,9 @@ fn help() {
     println!("capacity — what would it do against components this slow?");
     println!("  --duration-ms <n>   virtual time to measure (1000)");
     println!("  --rate <per-s>      offered load, or 0 to saturate (0)");
-    println!("  --qd <n>            the client's queue depth: requests it leaves outstanding (20000)");
+    println!(
+        "  --qd <n>            the client's queue depth: requests it leaves outstanding (20000)"
+    );
     println!("  --accounts <n>      working set (100000)");
     println!("  --pending-us <n>    what the pending engine answers a command in (1000)");
     println!("  --pending-tail-us <n> mean of its tail, which is what reorders answers (200)");
@@ -493,7 +518,9 @@ fn help() {
     println!("  --resolve-after <n> holds committed since, before one is resolved: its age (0)");
     println!("  --flush-blocks <n>  the engine's unwritten window, in blocks (1024)");
     println!("  --resident-blocks <n>  written-and-still-readable window, in blocks (4096)");
-    println!("                      the last three decide the share of resolutions that cost an IO");
+    println!(
+        "                      the last three decide the share of resolutions that cost an IO"
+    );
     println!("  --slo-p999-us <n>   the tail to hold; fails the run (exit 1) when it is worse");
     println!("  --sweep <knob=a,b>  run once per value of any option above, one row each");
 }
@@ -526,12 +553,21 @@ mod tests {
         }
         // Without this the sweep could pass by exercising nothing at all.
         assert!(served >= 8, "only {served} of 16 seeds kept serving");
-        assert_eq!(overflows, 0, "the engine's index could not take a hold the log says exists");
-        assert!(committed > 1_000, "the sweep only committed {committed} effects");
+        assert_eq!(
+            overflows, 0,
+            "the engine's index could not take a hold the log says exists"
+        );
+        assert!(
+            committed > 1_000,
+            "the sweep only committed {committed} effects"
+        );
         // The fetch path — the candidate walk and the fingerprint confirmation — only runs on a store
         // read. Without this the sweep would report that every invariant held about a path it never
         // entered, which is what it did until the windows were made narrow enough to leave memory.
-        assert!(store_reads > 0, "no seed reached the store, so the fetch path is untested");
+        assert!(
+            store_reads > 0,
+            "no seed reached the store, so the fetch path is untested"
+        );
         // Not asserted here: sixteen seeds never draw the stale-answer fault, and raising its odds to
         // make them would shift every other fault's draw to buy one assertion. The mechanism is asserted
         // deterministically in the sequencer's `lane_ordering` tests, and a full `check --seeds 64` run
@@ -575,9 +611,13 @@ mod tests {
             ordered.metrics.seq_gaps, 0,
             "the component reordered the tail, so the sequencer must see no gap"
         );
-        assert!(ordered.metrics.pending_lookups > 0, "no lookup was made at all");
+        assert!(
+            ordered.metrics.pending_lookups > 0,
+            "no lookup was made at all"
+        );
 
-        let unordered = super::sim::explore(1, timings, faults(2), run).expect("no invariant broke");
+        let unordered =
+            super::sim::explore(1, timings, faults(2), run).expect("no invariant broke");
         assert!(
             unordered.metrics.seq_gaps > 0,
             "with the ordering taken away the sequencer has to detect a gap"
@@ -635,8 +675,14 @@ mod tests {
             burst: 8,
         };
         let report = super::sim::explore(1, timings, faults, run).expect("no invariant broke");
-        assert!(report.halted, "the reordered commit should have stopped the node");
-        assert!(!report.funded, "funding cannot finish on a node that stopped serving");
+        assert!(
+            report.halted,
+            "the reordered commit should have stopped the node"
+        );
+        assert!(
+            !report.funded,
+            "funding cannot finish on a node that stopped serving"
+        );
     }
 
     /// Small and quick, and everything the capacity tests do not vary stated once.
@@ -672,11 +718,16 @@ mod tests {
     fn a_capacity_run_measures_the_ledger_and_not_the_harness() {
         // A round trip long enough that a request holds its slot for many ticks, which is what used
         // to make the ledger refuse the client's queue depth as overload.
-        let plan = super::Plan { raft_nanos: 5_000_000, ..quick_plan() };
+        let plan = super::Plan {
+            raft_nanos: 5_000_000,
+            ..quick_plan()
+        };
         let prediction = super::capacity(plan).expect("no invariant broke");
-        assert_eq!(prediction.overloaded, 0, "the ledger was refused load it was never sized for");
-        let per_commit =
-            prediction.metrics.admitted as f64 / prediction.committed.max(1) as f64;
+        assert_eq!(
+            prediction.overloaded, 0,
+            "the ledger was refused load it was never sized for"
+        );
+        let per_commit = prediction.metrics.admitted as f64 / prediction.committed.max(1) as f64;
         assert!(
             per_commit < 3.0,
             "{per_commit:.2} admitted per committed effect: the run is measuring refusals"
@@ -690,16 +741,25 @@ mod tests {
     /// client never sent.
     #[test]
     fn a_chain_reaches_the_ledger_whole_or_waits() {
-        let plan = super::Plan { queue_depth: 20_000, ..quick_plan() };
+        let plan = super::Plan {
+            queue_depth: 20_000,
+            ..quick_plan()
+        };
         let prediction = super::capacity(plan).expect("no invariant broke");
         let metrics = prediction.metrics;
-        assert!(metrics.linked_chains_judged > 0, "no chain was offered at all");
+        assert!(
+            metrics.linked_chains_judged > 0,
+            "no chain was offered at all"
+        );
         assert_eq!(
             metrics.linked_chains_rejected, 0,
             "{} of {} chains were refused, so they were not the chains the client sent",
             metrics.linked_chains_rejected, metrics.linked_chains_judged
         );
-        assert_eq!(metrics.linked_chains_aborted, 0, "a chain was left unterminated");
+        assert_eq!(
+            metrics.linked_chains_aborted, 0,
+            "a chain was left unterminated"
+        );
     }
 
     /// A tail is drawn from what came back, so a component slow enough that the client's queue depth
@@ -715,10 +775,19 @@ mod tests {
             idem_nanos: 99_000_000,
             ..quick_plan()
         };
-        let options = super::Options { plan, slo_nanos: Some(9_000_000_000) };
+        let options = super::Options {
+            plan,
+            slo_nanos: Some(9_000_000_000),
+        };
         let prediction = super::capacity(plan).expect("no invariant broke");
-        assert_eq!(prediction.latency_us[2], 0.0, "the run has to be the empty-histogram shape");
-        assert!(prediction.answered <= prediction.outstanding, "the depth turned over after all");
+        assert_eq!(
+            prediction.latency_us[2], 0.0,
+            "the run has to be the empty-histogram shape"
+        );
+        assert!(
+            prediction.answered <= prediction.outstanding,
+            "the depth turned over after all"
+        );
         assert!(
             !super::held(&options, &prediction),
             "a p99.9 of 0 from {} answers and {} still outstanding passed a 9s target",
@@ -735,7 +804,11 @@ mod tests {
         let per_commit = |duration_nanos| {
             // Enough accounts that funding is a visible share of a short measurement: with a handful,
             // a whole-run counter and a measured one agree by accident.
-            let plan = super::Plan { duration_nanos, accounts: 50_000, ..quick_plan() };
+            let plan = super::Plan {
+                duration_nanos,
+                accounts: 50_000,
+                ..quick_plan()
+            };
             let prediction = super::capacity(plan).expect("no invariant broke");
             prediction.metrics.admitted as f64 / prediction.committed.max(1) as f64
         };

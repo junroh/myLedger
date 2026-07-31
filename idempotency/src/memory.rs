@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use ledger_base::ports::{IdemReply, IdemRequest, IdemVerdict, IdempotencyPort};
 use ledger_base::{
-    Consumer, Footprint, FxHashMap, MapGauge, Prng, Producer, StagedProducer, TxId, channel,
+    channel, Consumer, Footprint, FxHashMap, MapGauge, Prng, Producer, StagedProducer, TxId,
 };
 use ledger_stubkit::{IdleBackoff, LaneOrderer, LatencyRange, WorkerThread};
 

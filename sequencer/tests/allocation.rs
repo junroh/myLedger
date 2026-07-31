@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 
 use ledger_account::MemoryAccounts;
 use ledger_base::ports::AccountFlags;
-use ledger_base::{Ack, AccountId, Request, Transfer, TransferFlags, TxId};
-use ledger_stubkit::LatencyRange;
+use ledger_base::{channel, Consumer, Producer};
+use ledger_base::{AccountId, Ack, Request, Transfer, TransferFlags, TxId};
 use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
 use ledger_pending::{MemoryPending, MemoryPendingConfig};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
-use ledger_base::{channel, Consumer, Producer};
 use ledger_sequencer::{BatchPolicy, Reactor, ReactorConfig, Transport};
+use ledger_stubkit::LatencyRange;
 
 thread_local! {
     static ALLOCATIONS: Cell<u64> = const { Cell::new(0) };
@@ -75,7 +75,10 @@ impl Load {
                 },
                 ..ReactorConfig::default()
             },
-            Transport { requests: request_rx, acks: ack_tx },
+            Transport {
+                requests: request_rx,
+                acks: ack_tx,
+            },
             accounts,
             MemoryPending::start(MemoryPendingConfig {
                 latency: LatencyRange::fixed(Duration::ZERO),
@@ -92,7 +95,14 @@ impl Load {
             }),
         )
         .expect("config");
-        Self { reactor, requests: request_tx, acks: ack_rx, next_id: 1, submitted: 0, acked: 0 }
+        Self {
+            reactor,
+            requests: request_tx,
+            acks: ack_rx,
+            next_id: 1,
+            submitted: 0,
+            acked: 0,
+        }
     }
 
     fn run(&mut self, requests: u64) {
@@ -133,5 +143,8 @@ fn the_steady_state_pipeline_allocates_nothing_per_request() {
     load.run(40_000);
     let allocations = ALLOCATIONS.with(|count| count.get()) - before;
 
-    assert_eq!(allocations, 0, "40k requests must not allocate on the reactor thread");
+    assert_eq!(
+        allocations, 0,
+        "40k requests must not allocate on the reactor thread"
+    );
 }

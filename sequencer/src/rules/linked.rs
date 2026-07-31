@@ -56,7 +56,10 @@ pub struct LinkedScratch {
 
 impl LinkedScratch {
     pub fn new(capacity: usize) -> Self {
-        Self { gains: Vec::with_capacity(capacity), holds: Vec::with_capacity(capacity) }
+        Self {
+            gains: Vec::with_capacity(capacity),
+            holds: Vec::with_capacity(capacity),
+        }
     }
 
     pub fn clear(&mut self) {
@@ -90,16 +93,22 @@ impl LinkedScratch {
 
     /// A hold this chain created, if this chain created it.
     pub fn hold(&self, hold: TxId) -> Option<HoldView> {
-        self.holds.iter().find(|(id, _)| *id == hold).map(|(_, view)| *view)
+        self.holds
+            .iter()
+            .find(|(id, _)| *id == hold)
+            .map(|(_, view)| *view)
     }
 
     fn resolve(&mut self, effect: &Effect) {
-        if let Some((_, view)) = self.holds.iter_mut().find(|(id, _)| *id == effect.pending_ref) {
+        if let Some((_, view)) = self
+            .holds
+            .iter_mut()
+            .find(|(id, _)| *id == effect.pending_ref)
+        {
             view.remaining = effect.remaining_after;
             view.resolved = effect.remaining_after == 0;
         }
     }
-
 
     pub fn add(&mut self, gain: Option<(AcctHandle, Amount)>) {
         if let Some((handle, amount)) = gain {
@@ -274,10 +283,22 @@ mod tests {
     fn the_first_unlinked_request_ends_the_chain() {
         let mut chains = LinkedChains::new(4, 2);
         let first = chains.admit(true).expect("a linked request opens a chain");
-        assert_eq!(chains.admit(true), Some(first), "the same chain, still open");
-        assert_eq!(chains.admit(false), Some(first), "the terminator is the last leg");
+        assert_eq!(
+            chains.admit(true),
+            Some(first),
+            "the same chain, still open"
+        );
+        assert_eq!(
+            chains.admit(false),
+            Some(first),
+            "the terminator is the last leg"
+        );
 
-        assert_eq!(chains.admit(false), None, "a standalone request is not a chain");
+        assert_eq!(
+            chains.admit(false),
+            None,
+            "a standalone request is not a chain"
+        );
         let second = chains.admit(true).expect("the next chain");
         assert_ne!(second, first);
     }
@@ -290,11 +311,18 @@ mod tests {
         let id = chains.admit(true).expect("chain");
         chains.add_leg(id, AcctHandle::new(0), 0);
 
-        assert!(chains.close_batch().is_none(), "the leg is still out for its external results");
+        assert!(
+            chains.close_batch().is_none(),
+            "the leg is still out for its external results"
+        );
         let chain = chains.leg_ready(id).expect("complete once the leg is back");
         assert_eq!(chain.failure(), Some(LedgerError::LinkedChainUnterminated));
 
         chains.open_gates(id);
-        assert_eq!(chains.gate_for(AcctHandle::new(0)), None, "the lane is free again");
+        assert_eq!(
+            chains.gate_for(AcctHandle::new(0)),
+            None,
+            "the lane is free again"
+        );
     }
 }

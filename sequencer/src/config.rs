@@ -78,7 +78,9 @@ impl Default for ReactorConfig {
                 in_flight: 8,
             },
             linked: LinkedPolicy { max_legs: 64 },
-            safety: SafetyPolicy { quarantine_fail_stop: 3 },
+            safety: SafetyPolicy {
+                quarantine_fail_stop: 3,
+            },
             profile: false,
         }
     }
@@ -132,7 +134,10 @@ mod tests {
         assert_eq!(ReactorConfig::default().validate(), Ok(()));
 
         let split = ReactorConfig {
-            batching: BatchPolicy { max: 8, ..ReactorConfig::default().batching },
+            batching: BatchPolicy {
+                max: 8,
+                ..ReactorConfig::default().batching
+            },
             ..ReactorConfig::default()
         };
         assert!(split.batching.max < split.linked.max_legs);

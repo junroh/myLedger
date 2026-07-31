@@ -6,12 +6,15 @@ use std::time::{Duration, Instant};
 
 use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort, AccountRecord};
-use ledger_base::{channel, Ack, AccountId, AckOutcome, Amount, Clock, Consumer, Effect, LogStream, ManualClock, Producer, Request, SystemClock, Transfer, TransferFlags, TxId};
-use ledger_stubkit::LatencyRange;
+use ledger_base::{
+    channel, AccountId, Ack, AckOutcome, Amount, Clock, Consumer, Effect, LogStream, ManualClock,
+    Producer, Request, SystemClock, Transfer, TransferFlags, TxId,
+};
 use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
 use ledger_pending::{MemoryPending, MemoryPendingConfig};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, Reactor, ReactorConfig, Transport};
+use ledger_stubkit::LatencyRange;
 
 pub const LEDGER: u32 = 1;
 pub const EXTERNAL: AccountId = AccountId(1);
@@ -88,20 +91,36 @@ impl Harness<SystemClock> {
         pending: MemoryPendingConfig,
         raft: EchoRaftConfig,
     ) -> Self {
-        Self::build(Self::eager(config), pending, raft, SystemClock::new(), CLIENT_QUEUE)
+        Self::build(
+            Self::eager(config),
+            pending,
+            raft,
+            SystemClock::new(),
+            CLIENT_QUEUE,
+        )
     }
 
     /// A shallow client queue, so a client that stops reading its acks becomes backpressure in a
     /// handful of requests instead of thousands.
     pub fn with_client_queue(config: ReactorConfig, queue: usize) -> Self {
         let config = Self::eager(config);
-        Self::build(config, NoLatency::pending(), NoLatency::raft(), SystemClock::new(), queue)
+        Self::build(
+            config,
+            NoLatency::pending(),
+            NoLatency::raft(),
+            SystemClock::new(),
+            queue,
+        )
     }
 
     /// One effect per batch and no linger, so a request is decided by the tick it is judged in.
     fn eager(config: ReactorConfig) -> ReactorConfig {
         ReactorConfig {
-            batching: BatchPolicy { size: 1, linger: Duration::ZERO, ..config.batching },
+            batching: BatchPolicy {
+                size: 1,
+                linger: Duration::ZERO,
+                ..config.batching
+            },
             ..config
         }
     }
@@ -110,8 +129,17 @@ impl Harness<SystemClock> {
 impl Harness<ManualClock> {
     /// For anything that depends on time passing: the test advances the clock itself.
     pub fn with_clock(batching: BatchPolicy, clock: ManualClock) -> Self {
-        let config = ReactorConfig { batching, ..ReactorConfig::default() };
-        Self::build(config, NoLatency::pending(), NoLatency::raft(), clock, CLIENT_QUEUE)
+        let config = ReactorConfig {
+            batching,
+            ..ReactorConfig::default()
+        };
+        Self::build(
+            config,
+            NoLatency::pending(),
+            NoLatency::raft(),
+            clock,
+            CLIENT_QUEUE,
+        )
     }
 }
 
@@ -132,7 +160,10 @@ impl<C: Clock> Harness<C> {
         let (ack_tx, ack_rx) = channel(client_queue);
         let (reactor, log) = Reactor::with_clock(
             config,
-            Transport { requests: request_rx, acks: ack_tx },
+            Transport {
+                requests: request_rx,
+                acks: ack_tx,
+            },
             accounts,
             MemoryPending::start(pending).expect("a test engine config"),
             MemoryDedup::start(NoLatency::idem()),
@@ -140,7 +171,13 @@ impl<C: Clock> Harness<C> {
             clock,
         )
         .expect("config");
-        Self { reactor, requests: request_tx, acks: ack_rx, log, next_id: 1 }
+        Self {
+            reactor,
+            requests: request_tx,
+            acks: ack_rx,
+            log,
+            next_id: 1,
+        }
     }
 
     pub fn transfer(&mut self, debit: AccountId, credit: AccountId, amount: Amount) -> Transfer {
@@ -173,14 +210,19 @@ impl<C: Clock> Harness<C> {
     }
 
     pub fn submit(&self, tx: Transfer) {
-        self.requests.push(Request::single(tx, 0)).expect("client queue");
+        self.requests
+            .push(Request::single(tx, 0))
+            .expect("client queue");
     }
 
     /// A chain is one submission, so only its last leg ends the batch.
     pub fn submit_chain(&self, legs: &[Transfer]) {
         for (index, leg) in legs.iter().enumerate() {
-            let request =
-                Request { tx: *leg, submitted_at_nanos: 0, end_of_batch: index + 1 == legs.len() };
+            let request = Request {
+                tx: *leg,
+                submitted_at_nanos: 0,
+                end_of_batch: index + 1 == legs.len(),
+            };
             self.requests.push(request).expect("client queue");
         }
     }
@@ -225,7 +267,11 @@ impl<C: Clock> Harness<C> {
 
     pub fn fund(&mut self, account: AccountId, amount: Amount) {
         let tx = self.transfer(EXTERNAL, account, amount);
-        assert_eq!(self.run(tx).outcome, AckOutcome::Committed, "funding {account:?}");
+        assert_eq!(
+            self.run(tx).outcome,
+            AckOutcome::Committed,
+            "funding {account:?}"
+        );
     }
 
     pub fn hold(&mut self, debit: AccountId, credit: AccountId, amount: Amount) -> (TxId, Ack) {
@@ -282,7 +328,11 @@ impl<C: Clock> Harness<C> {
     /// some single account, which the sums would hide. Any test that moves money ends here.
     pub fn assert_consistent(&self) {
         assert_eq!(self.reactor.audit(), Ok(()), "the ledger's own audit");
-        assert_eq!(self.reactor.metrics().invariant_breaks, 0, "an invariant broke during the run");
+        assert_eq!(
+            self.reactor.metrics().invariant_breaks,
+            0,
+            "an invariant broke during the run"
+        );
         for account in ACCOUNTS {
             let columns = self.columns(account);
             let (debits, credits, debits_pending, credits_pending) = columns;
@@ -298,7 +348,11 @@ impl<C: Clock> Harness<C> {
     }
 
     pub fn record(&self, account: AccountId) -> &AccountRecord {
-        let handle = self.reactor.accounts().resolve(account).expect("known account");
+        let handle = self
+            .reactor
+            .accounts()
+            .resolve(account)
+            .expect("known account");
         self.reactor.accounts().record(handle)
     }
 

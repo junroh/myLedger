@@ -14,7 +14,9 @@ pub struct SystemClock {
 
 impl SystemClock {
     pub fn new() -> Self {
-        Self { origin: Instant::now() }
+        Self {
+            origin: Instant::now(),
+        }
     }
 }
 
@@ -39,7 +41,9 @@ pub struct ManualClock {
 
 impl ManualClock {
     pub fn new(nanos: u64) -> Self {
-        Self { nanos: Arc::new(AtomicU64::new(nanos)) }
+        Self {
+            nanos: Arc::new(AtomicU64::new(nanos)),
+        }
     }
 
     pub fn advance(&self, nanos: u64) {

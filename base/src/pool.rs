@@ -20,7 +20,9 @@ impl<T> BufferPool<T> {
     }
 
     pub fn take(&mut self) -> Vec<T> {
-        self.spare.pop().unwrap_or_else(|| Vec::with_capacity(self.capacity))
+        self.spare
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(self.capacity))
     }
 
     /// Buffers held spare, and the bytes behind them. A pool of `in_flight + 1` batch buffers is real
@@ -31,7 +33,11 @@ impl<T> BufferPool<T> {
     }
 
     pub fn bytes(&self) -> usize {
-        self.spare.iter().map(|buffer| buffer.capacity()).sum::<usize>() * size_of::<T>()
+        self.spare
+            .iter()
+            .map(|buffer| buffer.capacity())
+            .sum::<usize>()
+            * size_of::<T>()
     }
 
     /// Returned empty, ready to be handed out again. A pool that kept everything handed back would

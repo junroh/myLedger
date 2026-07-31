@@ -20,7 +20,12 @@ impl LogKind {
     pub const INVARIANT_BROKEN: u16 = 13;
 
     pub fn describe(event: &LogEvent) -> String {
-        let LogEvent { kind, at_nanos, a, b } = *event;
+        let LogEvent {
+            kind,
+            at_nanos,
+            a,
+            b,
+        } = *event;
         let micros = at_nanos / 1_000;
         match kind {
             Self::STARTED => format!("[{micros}us] sequencer started: slots={a} batch_size={b}"),

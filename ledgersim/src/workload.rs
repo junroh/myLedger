@@ -3,7 +3,9 @@
 
 use std::collections::VecDeque;
 
-use ledger_base::{AccountId, Ack, Amount, FxHashMap, Prng, Request, Transfer, TransferFlags, TxId};
+use ledger_base::{
+    AccountId, Ack, Amount, FxHashMap, Prng, Request, Transfer, TransferFlags, TxId,
+};
 
 pub const LEDGER: u32 = 1;
 pub const EXTERNAL: AccountId = AccountId(1);
@@ -36,7 +38,12 @@ struct Holds {
 impl Holds {
     fn new(capacity: usize) -> Self {
         let capacity = capacity.max(64);
-        Self { ring: Vec::with_capacity(capacity), oldest: 0, slot: FxHashMap::default(), capacity }
+        Self {
+            ring: Vec::with_capacity(capacity),
+            oldest: 0,
+            slot: FxHashMap::default(),
+            capacity,
+        }
     }
 
     fn remember(&mut self, hold: Hold) {
@@ -189,7 +196,13 @@ impl Traffic {
         let amount = self.amount();
         let mut transfer = self.transfer(debit, credit, amount);
         transfer.flags = TransferFlags::PENDING;
-        self.holds.remember(Hold { id: transfer.id, debit, credit, amount, committed: false });
+        self.holds.remember(Hold {
+            id: transfer.id,
+            debit,
+            credit,
+            amount,
+            committed: false,
+        });
         transfer
     }
 

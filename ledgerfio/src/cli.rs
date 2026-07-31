@@ -141,7 +141,11 @@ impl Default for Options {
 pub enum Command {
     Run(Options),
     /// The same run repeated with one option taking each value in turn.
-    Sweep { base: Options, knob: String, values: Vec<String> },
+    Sweep {
+        base: Options,
+        knob: String,
+        values: Vec<String>,
+    },
     Layout,
     Help,
 }
@@ -186,7 +190,11 @@ impl Cli {
             Self::apply(&mut options, &key, &value)?;
         }
         match sweep {
-            Some((knob, values)) => Ok(Command::Sweep { base: options, knob, values }),
+            Some((knob, values)) => Ok(Command::Sweep {
+                base: options,
+                knob,
+                values,
+            }),
             None => Ok(Command::Run(options)),
         }
     }
@@ -216,8 +224,8 @@ impl Cli {
     pub fn apply(options: &mut Options, key: &str, value: &str) -> Result<(), String> {
         match key {
             "workload" => {
-                options.workload =
-                    WorkloadKind::parse(value).ok_or_else(|| format!("unknown workload `{value}`"))?
+                options.workload = WorkloadKind::parse(value)
+                    .ok_or_else(|| format!("unknown workload `{value}`"))?
             }
             "accounts" => options.accounts = Self::count(value)?,
             "skew" => options.skew = Self::ratio(value)?.max(1.0),

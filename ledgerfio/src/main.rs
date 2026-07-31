@@ -131,14 +131,20 @@ fn print_help() {
     println!("what to send:");
     println!("  --workload <{}>", workloads.join("|"));
     println!("                              (single-phase) mix of transfer kinds");
-    println!("  --accounts <n>              (100k) working set: cache residency and lane contention");
+    println!(
+        "  --accounts <n>              (100k) working set: cache residency and lane contention"
+    );
     println!("  --seed <n>                  (0x5eed1234) makes a run repeat exactly");
     println!();
     println!("how hard to send it:");
     println!("  --duration <5s|500ms>       (3s) measured phase; funding is not measured");
     println!("  --rate <tx/s>               (0 = as fast as accepted; set a rate to measure latency at load)");
-    println!("  --in-flight <n>             (20k) unanswered requests; with rate 0 this sets latency");
-    println!("  --client-batch <n>          (64) transfers per submission; a chain always goes whole");
+    println!(
+        "  --in-flight <n>             (20k) unanswered requests; with rate 0 this sets latency"
+    );
+    println!(
+        "  --client-batch <n>          (64) transfers per submission; a chain always goes whole"
+    );
     println!("  --client-queue <n>          (65536) queue depth between client and reactor");
     println!("  --repeat <n>                (1) run n times, report median throughput");
     println!();
@@ -148,36 +154,62 @@ fn print_help() {
     println!("  --batch-queued <n>          (--batch-max) judged effects waiting for consensus before intake pauses");
     println!("  --batch-linger <200us>      (200us) how long a partial batch waits: the low-load latency floor");
     println!("  --raft-in-flight <n>        (8) proposals outstanding at once");
-    println!("  --pin <cpu>                 (unset) bind the reactor core (Linux; elsewhere a QoS hint)");
+    println!(
+        "  --pin <cpu>                 (unset) bind the reactor core (Linux; elsewhere a QoS hint)"
+    );
     println!();
     println!("external components (simulated, us or min:max):");
     println!("  --raft-rtt <us>             (900:1400) consensus round trip: the latency floor");
     println!("  --store-read <us>           (0) what a block read costs the engine: the disk it has not got");
-    println!("  --store-iops <n>            (0) reads a second that store can serve, 0 for no ceiling");
+    println!(
+        "  --store-iops <n>            (0) reads a second that store can serve, 0 for no ceiling"
+    );
     println!("  --overlay-limit <n>         (1M) ceiling on the sequencer's own hold decisions; in flight bounds it");
     println!("  --idem-latency <us>         (1:5) dedup; every request pays it");
     println!("  --violate-order-every <n>   (0) return every nth lane reply out of order");
     println!("  --raft-fail-every <n>       (0) refuse every nth batch");
     println!();
     println!("workload shape:");
-    println!("  --skew <f>                  (1.0 uniform) higher concentrates traffic on few accounts");
-    println!("  --external-ratio <0.3|30%>  (0) share of debits on the unconstrained clearing account");
-    println!("  --resolve-after <n>         (0) resolve a hold once n more exist: its age, and so which");
-    println!("                              engine window answers it — 0 resolves each one at once");
+    println!(
+        "  --skew <f>                  (1.0 uniform) higher concentrates traffic on few accounts"
+    );
+    println!(
+        "  --external-ratio <0.3|30%>  (0) share of debits on the unconstrained clearing account"
+    );
+    println!(
+        "  --resolve-after <n>         (0) resolve a hold once n more exist: its age, and so which"
+    );
+    println!(
+        "                              engine window answers it — 0 resolves each one at once"
+    );
     println!();
     println!("what the engine is sized for (it derives every window from these):");
     println!("  --daily-arrivals <n>        (1m) transfers a day; scales both memory windows");
     println!("  --retention-days <n>        (2) how long a hold may live: with the share below, the index");
-    println!("  --survivor-share <50%>      (50%) still unresolved when retention ends: sizes the index");
-    println!("  --flush-survivors <50%>     (50%) still unresolved when their block is flushed: sizes");
-    println!("                              residency, and `died in buffer` measures the same thing");
-    println!("  --flush-window <hours>      (1) how long a record may go unwritten: a recovery bound");
-    println!("  --residency <hours>         (24) how long it stays readable in memory: a latency bound");
-    println!("  --index-budget <bytes>      (1073741824) refuse a declaration needing a larger index");
+    println!(
+        "  --survivor-share <50%>      (50%) still unresolved when retention ends: sizes the index"
+    );
+    println!(
+        "  --flush-survivors <50%>     (50%) still unresolved when their block is flushed: sizes"
+    );
+    println!(
+        "                              residency, and `died in buffer` measures the same thing"
+    );
+    println!(
+        "  --flush-window <hours>      (1) how long a record may go unwritten: a recovery bound"
+    );
+    println!(
+        "  --residency <hours>         (24) how long it stays readable in memory: a latency bound"
+    );
+    println!(
+        "  --index-budget <bytes>      (1073741824) refuse a declaration needing a larger index"
+    );
     println!();
     println!("measuring:");
     println!("  --sweep <knob=v1,v2>        run once per value and print one row each");
-    println!("  --cpu                       time each reactor stage; changes the throughput it reports");
+    println!(
+        "  --cpu                       time each reactor stage; changes the throughput it reports"
+    );
     println!("  --slo-p999 <50ms>           fail the run (exit 1) when end-to-end p99.9 is worse");
     println!();
     println!("output:");

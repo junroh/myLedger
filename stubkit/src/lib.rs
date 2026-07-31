@@ -6,12 +6,12 @@
 //! implementation of a contract — and no way to violate one on purpose. When a real component
 //! arrives it brings its own ordering, and this crate leaves its dependency graph.
 
-mod server;
 mod lane_order;
 mod latency;
+mod server;
 mod worker;
 
-pub use server::{Server, ServerStats};
 pub use lane_order::LaneOrderer;
 pub use latency::LatencyRange;
+pub use server::{Server, ServerStats};
 pub use worker::{IdleBackoff, WorkerThread};

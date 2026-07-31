@@ -21,7 +21,8 @@ fn a_chain_cannot_resolve_a_budget_group_hold_it_created() {
 
     let acks = harness.run_chain(&[hold, settle]);
     assert!(
-        acks.iter().all(|ack| matches!(ack.outcome, AckOutcome::Rejected(_))),
+        acks.iter()
+            .all(|ack| matches!(ack.outcome, AckOutcome::Rejected(_))),
         "{acks:?}"
     );
     assert_eq!(harness.columns(POINTS), (0, 100, 0, 0), "nothing moved");
@@ -51,7 +52,10 @@ fn a_shared_budget_group_resolves_as_one_unit() {
     let holds = [legs[0].id, legs[1].id, legs[2].id];
 
     let acks = harness.run_chain(&legs);
-    assert!(acks.iter().all(|ack| ack.outcome == AckOutcome::Committed), "{acks:?}");
+    assert!(
+        acks.iter().all(|ack| ack.outcome == AckOutcome::Committed),
+        "{acks:?}"
+    );
     assert_eq!(harness.columns(POINTS), (0, 30, 30, 0));
 
     let alone = harness.resolve(holds[0], POINTS, BOB, 30, TransferFlags::POST_PENDING);
@@ -61,11 +65,12 @@ fn a_shared_budget_group_resolves_as_one_unit() {
         "one hold cannot cover a group of three"
     );
 
-    let short = harness
-        .resolve_together(&[(holds[0], POINTS, BOB, 30), (holds[1], DEPOSIT, BOB, 70)]);
+    let short =
+        harness.resolve_together(&[(holds[0], POINTS, BOB, 30), (holds[1], DEPOSIT, BOB, 70)]);
     assert!(
-        short.iter().all(|ack| ack.outcome
-            == AckOutcome::Rejected(LedgerError::SharedBudgetGroupIncomplete)),
+        short.iter().all(
+            |ack| ack.outcome == AckOutcome::Rejected(LedgerError::SharedBudgetGroupIncomplete)
+        ),
         "a chain that leaves a member out: {short:?}"
     );
 
@@ -75,8 +80,9 @@ fn a_shared_budget_group_resolves_as_one_unit() {
         (holds[2], ALICE, BOB, 50),
     ]);
     assert!(
-        half.iter().all(|ack| ack.outcome
-            == AckOutcome::Rejected(LedgerError::PartialResolutionNotAllowed)),
+        half.iter().all(
+            |ack| ack.outcome == AckOutcome::Rejected(LedgerError::PartialResolutionNotAllowed)
+        ),
         "a chain that moves part of a member: {half:?}"
     );
 
@@ -85,7 +91,10 @@ fn a_shared_budget_group_resolves_as_one_unit() {
         (holds[1], DEPOSIT, BOB, 70),
         (holds[2], ALICE, BOB, 50),
     ]);
-    assert!(acks.iter().all(|ack| ack.outcome == AckOutcome::Committed), "{acks:?}");
+    assert!(
+        acks.iter().all(|ack| ack.outcome == AckOutcome::Committed),
+        "{acks:?}"
+    );
     assert_eq!(harness.columns(POINTS), (30, 30, 0, 0));
     assert_eq!(harness.columns(DEPOSIT), (70, 70, 0, 0));
     assert_eq!(harness.columns(BOB), (0, 150, 0, 0));

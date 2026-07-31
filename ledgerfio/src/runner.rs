@@ -14,8 +14,8 @@ use crate::cli::Options;
 use crate::client::Client;
 use crate::histogram::Histogram;
 use crate::report::{LatencySummary, RunReport};
-use ledger_base::Signals;
 use crate::workload::{Shape, Workload, CLEARING_ACCOUNT, EXTERNAL_ACCOUNT};
+use ledger_base::Signals;
 
 const LEDGER: u32 = 1;
 const DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -44,8 +44,10 @@ impl Runner {
         // A signal now stops the run: the driver stops submitting and the service drains.
         Signals::install();
         let stop = service.stop_token();
-        let mut driver =
-            Driver::new(Client::new(endpoint.requests, endpoint.acks), options.client_batch);
+        let mut driver = Driver::new(
+            Client::new(endpoint.requests, endpoint.acks),
+            options.client_batch,
+        );
         driver.fund(&mut workload);
         let elapsed = driver.measure(&mut workload, &options);
         if Signals::requested() {
@@ -97,7 +99,10 @@ impl Runner {
     fn start_ledger(
         options: &Options,
         workload: &Workload,
-    ) -> (LedgerService<MemoryAccounts, MemoryPending, MemoryDedup, EchoRaft>, ClientEndpoint) {
+    ) -> (
+        LedgerService<MemoryAccounts, MemoryPending, MemoryDedup, EchoRaft>,
+        ClientEndpoint,
+    ) {
         LedgerService::start(
             ServiceConfig {
                 reactor: Self::reactor_config(options),
@@ -113,8 +118,11 @@ impl Runner {
                 overlay_soft_limit: options.overlay_limit,
                 store: StoreModel {
                     read_base_nanos: options.store_read.min.as_nanos() as u64,
-                    read_tail_nanos: (options.store_read.max.saturating_sub(options.store_read.min))
-                        .as_nanos() as u64,
+                    read_tail_nanos: (options
+                        .store_read
+                        .max
+                        .saturating_sub(options.store_read.min))
+                    .as_nanos() as u64,
                     iops: options.store_iops,
                     queue_depth: 128,
                 },
@@ -168,7 +176,11 @@ impl Runner {
         accounts.open(EXTERNAL_ACCOUNT, LEDGER, AccountFlags::NONE);
         accounts.open(CLEARING_ACCOUNT, LEDGER, AccountFlags::NONE);
         for index in 0..workload.account_count() {
-            accounts.open(workload.user_account(index), LEDGER, AccountFlags::CONSTRAINED);
+            accounts.open(
+                workload.user_account(index),
+                LEDGER,
+                AccountFlags::CONSTRAINED,
+            );
         }
         accounts
     }
@@ -198,7 +210,14 @@ impl BatchLatency {
     fn new(size: usize) -> Self {
         Self {
             size: size.max(1) as u128,
-            open: vec![Group { id: NO_GROUP, opened_at_nanos: 0, acked: 0 }; TRACKED_GROUPS],
+            open: vec![
+                Group {
+                    id: NO_GROUP,
+                    opened_at_nanos: 0,
+                    acked: 0
+                };
+                TRACKED_GROUPS
+            ],
             histogram: Histogram::new(),
         }
     }
@@ -207,7 +226,11 @@ impl BatchLatency {
         let id = (ack.tx_id.raw() / self.size) as u64;
         let group = &mut self.open[id as usize % TRACKED_GROUPS];
         if group.id != id {
-            *group = Group { id, opened_at_nanos: ack.submitted_at_nanos, acked: 0 };
+            *group = Group {
+                id,
+                opened_at_nanos: ack.submitted_at_nanos,
+                acked: 0,
+            };
         }
         group.opened_at_nanos = group.opened_at_nanos.min(ack.submitted_at_nanos);
         group.acked += 1;
@@ -223,7 +246,11 @@ impl BatchLatency {
     }
 
     fn reset(&mut self) {
-        self.open.fill(Group { id: NO_GROUP, opened_at_nanos: 0, acked: 0 });
+        self.open.fill(Group {
+            id: NO_GROUP,
+            opened_at_nanos: 0,
+            acked: 0,
+        });
         self.histogram = Histogram::new();
     }
 }

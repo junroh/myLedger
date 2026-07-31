@@ -134,7 +134,14 @@ impl Footprint {
         capacity: usize,
         bytes: usize,
     ) {
-        self.parts.push(Part { name, entries, peak_entries: peak, capacity, bytes, exact: true });
+        self.parts.push(Part {
+            name,
+            entries,
+            peak_entries: peak,
+            capacity,
+            bytes,
+            exact: true,
+        });
     }
 
     /// A hash table on another thread, read from what its owner published.

@@ -39,7 +39,10 @@ mod tests {
         }
         let first: Vec<u64> = map.keys().copied().collect();
         let second: Vec<u64> = again.keys().copied().collect();
-        assert_eq!(first, second, "the same insertions must walk in the same order");
+        assert_eq!(
+            first, second,
+            "the same insertions must walk in the same order"
+        );
     }
 
     /// A wide key is mixed whole: one that differs only in its high half must not land where one

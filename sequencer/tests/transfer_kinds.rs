@@ -44,7 +44,10 @@ fn a_settle_larger_than_the_remaining_hold_is_rejected() {
     let ack = harness.resolve(hold, ALICE, BOB, 100, TransferFlags::POST_PENDING);
     assert_eq!(
         ack.outcome,
-        AckOutcome::Rejected(LedgerError::SettleExceedsRemaining { remaining: 50, requested: 100 })
+        AckOutcome::Rejected(LedgerError::SettleExceedsRemaining {
+            remaining: 50,
+            requested: 100
+        })
     );
     assert_eq!(harness.columns(ALICE), (250, FUNDING, 50, 0));
     harness.assert_consistent();

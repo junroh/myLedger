@@ -3,14 +3,17 @@ use std::time::{Duration, Instant};
 
 use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
-use ledger_base::{Ack, AccountId, AcctHandle, Amount, BudgetGroup, LinkedChainId, Effect, EffectKind, Request, Seq, Transfer, TransferFlags, TxId};
-use ledger_stubkit::{LatencyRange};
+use ledger_base::{channel, Consumer, Producer};
+use ledger_base::{
+    AccountId, AcctHandle, Ack, Amount, BudgetGroup, Effect, EffectKind, LinkedChainId, Request,
+    Seq, Transfer, TransferFlags, TxId,
+};
 use ledger_benchkit::{BenchOptions, Samples, STRIDE};
 use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
 use ledger_pending::{MemoryPending, MemoryPendingConfig};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
-use ledger_base::{channel, Consumer, Producer};
 use ledger_sequencer::{BatchPolicy, LaneTable, Reactor, ReactorConfig, Transport};
+use ledger_stubkit::LatencyRange;
 
 const LEDGER: u32 = 1;
 const EXTERNAL: AccountId = AccountId(1);
@@ -41,7 +44,10 @@ impl PipelineBench {
                 },
                 ..ReactorConfig::default()
             },
-            Transport { requests: request_rx, acks: ack_tx },
+            Transport {
+                requests: request_rx,
+                acks: ack_tx,
+            },
             accounts,
             MemoryPending::start(MemoryPendingConfig {
                 latency: LatencyRange::fixed(Duration::ZERO),
@@ -59,8 +65,13 @@ impl PipelineBench {
         )
         .expect("config");
 
-        let mut driver =
-            Driver { requests: request_tx, acks: ack_rx, submitted: 0, acked: 0, next_id: 1 };
+        let mut driver = Driver {
+            requests: request_tx,
+            acks: ack_rx,
+            submitted: 0,
+            acked: 0,
+            next_id: 1,
+        };
         driver.drive(&mut reactor, REQUESTS / 10, self.accounts);
         let started = Instant::now();
         driver.drive(&mut reactor, REQUESTS, self.accounts);
@@ -92,9 +103,7 @@ impl Driver {
                     id: TxId(self.next_id),
                     pending_ref: TxId::ABSENT,
                     debit_account: EXTERNAL,
-                    credit_account: AccountId(
-                        100 + self.submitted.wrapping_mul(STRIDE) % accounts,
-                    ),
+                    credit_account: AccountId(100 + self.submitted.wrapping_mul(STRIDE) % accounts),
                     amount: 1,
                     ledger: LEDGER,
                     flags: TransferFlags::NONE,
@@ -166,18 +175,18 @@ impl SplitBench {
             .map(|step| {
                 let index = (step as u64).wrapping_mul(STRIDE) as usize % self.accounts;
                 Effect {
-                tx_id: TxId(index as u128 + 1),
-                pending_ref: TxId::ABSENT,
-                debit_account: AccountId(index as u64 + 1),
-                credit_account: AccountId(index as u64 + 1),
-                amount: 1,
-                remaining_after: 0,
-                debit: AcctHandle::new(index),
-                credit: AcctHandle::new(index),
-                chain: LinkedChainId::ABSENT,
-                budget: BudgetGroup::ABSENT,
-                ledger: LEDGER,
-                kind: EffectKind::Post,
+                    tx_id: TxId(index as u128 + 1),
+                    pending_ref: TxId::ABSENT,
+                    debit_account: AccountId(index as u64 + 1),
+                    credit_account: AccountId(index as u64 + 1),
+                    amount: 1,
+                    remaining_after: 0,
+                    debit: AcctHandle::new(index),
+                    credit: AcctHandle::new(index),
+                    chain: LinkedChainId::ABSENT,
+                    budget: BudgetGroup::ABSENT,
+                    ledger: LEDGER,
+                    kind: EffectKind::Post,
                 }
             })
             .collect();
@@ -295,7 +304,11 @@ impl SlotLayoutBench {
             let index = (step.wrapping_mul(STRIDE) % self.slots as u64) as usize;
             // Four touches, the way a request visits its slot: prepare, dispatch, judge, finish.
             for _ in 0..4 {
-                let body = if self.padded { &mut padded[index].0 } else { &mut packed[index] };
+                let body = if self.padded {
+                    &mut padded[index].0
+                } else {
+                    &mut packed[index]
+                };
                 body.seq += 1;
                 body.tail += body.digest;
                 black_box(body.lane);
@@ -321,8 +334,15 @@ fn main() {
 
     for accounts in [1_000usize, 1_000_000, 8_000_000] {
         for line_aligned in [false, true] {
-            let bench = LaneLayoutBench { accounts, line_aligned };
-            let layout = if line_aligned { "line-aligned" } else { "32B snug" };
+            let bench = LaneLayoutBench {
+                accounts,
+                line_aligned,
+            };
+            let layout = if line_aligned {
+                "line-aligned"
+            } else {
+                "32B snug"
+            };
             let mut samples = Samples::new(format!("lane {layout} ({accounts} acct)"), INLINE_OPS);
             for _ in 0..options.repeat {
                 samples.add(bench.run());
@@ -356,8 +376,7 @@ fn main() {
         for fused in [false, true] {
             let bench = SplitBench { accounts, fused };
             let layout = if fused { "fused" } else { "split (current)" };
-            let mut samples =
-                Samples::new(format!("lane+apply {layout} ({accounts})"), INLINE_OPS);
+            let mut samples = Samples::new(format!("lane+apply {layout} ({accounts})"), INLINE_OPS);
             for _ in 0..options.repeat {
                 samples.add(bench.run());
             }

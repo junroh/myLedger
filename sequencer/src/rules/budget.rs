@@ -47,7 +47,9 @@ struct Tally {
 
 impl BudgetCoverage {
     pub fn new(capacity: usize) -> Self {
-        Self { tallies: Vec::with_capacity(capacity) }
+        Self {
+            tallies: Vec::with_capacity(capacity),
+        }
     }
 
     pub fn clear(&mut self) {
@@ -61,7 +63,13 @@ impl BudgetCoverage {
             tally.amount += amount;
             return;
         }
-        self.tallies.push(Tally { budget, legs: 1, amount, members, remaining });
+        self.tallies.push(Tally {
+            budget,
+            legs: 1,
+            amount,
+            members,
+            remaining,
+        });
     }
 
     pub fn misses_a_member(&self) -> bool {
@@ -106,7 +114,10 @@ mod tests {
         assert_eq!(BudgetRules::allow_resolution(&alone, 100, true), Ok(()));
 
         let unbudgeted = hold(0, 100);
-        assert_eq!(BudgetRules::allow_resolution(&unbudgeted, 40, false), Ok(()));
+        assert_eq!(
+            BudgetRules::allow_resolution(&unbudgeted, 40, false),
+            Ok(())
+        );
     }
 
     /// Coverage is complete only when every member of the group is resolved for its whole

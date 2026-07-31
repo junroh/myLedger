@@ -59,7 +59,12 @@ impl MemoryAccounts {
                 + self.ids.capacity() * size_of::<AccountId>(),
         );
         let mut index = Footprint::new();
-        index.hash_table::<AccountId, AcctHandle>("account index", live, self.index.capacity(), live);
+        index.hash_table::<AccountId, AcctHandle>(
+            "account index",
+            live,
+            self.index.capacity(),
+            live,
+        );
         for part in index.parts() {
             footprint.other(part.name, part.entries, part.peak_entries, 0, part.bytes);
         }
@@ -188,7 +193,11 @@ mod tests {
         let refused = store.apply(&post(&store, step));
 
         assert_eq!(refused, Err(LedgerError::BalanceOverflow));
-        assert_eq!(store.totals(), before, "a refused effect must leave both sides untouched");
+        assert_eq!(
+            store.totals(),
+            before,
+            "a refused effect must leave both sides untouched"
+        );
         assert_eq!(
             store.totals().debits_posted,
             store.totals().credits_posted,

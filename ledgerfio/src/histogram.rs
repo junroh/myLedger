@@ -52,7 +52,9 @@ impl Histogram {
         if self.count == 0 {
             return 0;
         }
-        self.quantiles.value_at_quantile(quantile).min(self.max_nanos)
+        self.quantiles
+            .value_at_quantile(quantile)
+            .min(self.max_nanos)
     }
 }
 
@@ -77,11 +79,18 @@ mod tests {
 
         assert_eq!(histogram.count(), 10_000);
         assert_eq!(histogram.max_nanos(), 10_000_000);
-        assert_eq!(histogram.mean_nanos(), 5_000_500, "the mean is exact, not bucketed");
+        assert_eq!(
+            histogram.mean_nanos(),
+            5_000_500,
+            "the mean is exact, not bucketed"
+        );
 
         for (quantile, truth) in [(0.5, 5_000_000u64), (0.9, 9_000_000), (0.999, 9_990_000)] {
             let reported = histogram.percentile_nanos(quantile);
-            assert!(reported >= truth, "{quantile} under-reported: {reported} < {truth}");
+            assert!(
+                reported >= truth,
+                "{quantile} under-reported: {reported} < {truth}"
+            );
             let error = (reported - truth) as f64 / truth as f64;
             assert!(error < 0.001, "{quantile} off by {:.3}%", error * 100.0);
         }
@@ -93,7 +102,14 @@ mod tests {
     #[test]
     fn small_values_are_exact_and_an_empty_histogram_is_zero() {
         let empty = Histogram::new();
-        assert_eq!((empty.count(), empty.mean_nanos(), empty.percentile_nanos(0.99)), (0, 0, 0));
+        assert_eq!(
+            (
+                empty.count(),
+                empty.mean_nanos(),
+                empty.percentile_nanos(0.99)
+            ),
+            (0, 0, 0)
+        );
 
         let mut histogram = Histogram::new();
         for value in 0..16u64 {

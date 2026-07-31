@@ -13,7 +13,12 @@ pub struct Outbox {
 
 impl Outbox {
     pub fn new(acks: Producer<Ack>, limit: usize, reserve: usize) -> Self {
-        Self { acks, backlog: VecDeque::with_capacity(reserve), limit, peak: Peak::default() }
+        Self {
+            acks,
+            backlog: VecDeque::with_capacity(reserve),
+            limit,
+            peak: Peak::default(),
+        }
     }
 
     /// Order is preserved: nothing overtakes a backlogged ack.

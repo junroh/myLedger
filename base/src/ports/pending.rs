@@ -131,7 +131,10 @@ impl HoldView {
     /// ever decreases, so the smaller of two observations of it is the newer one — and the sequencer's is
     /// taken the moment it decides, while the engine's answer can have been in flight across that.
     pub fn compose(record: &HoldData, overlay: OverlayState) -> Self {
-        let committed = overlay.remaining.unwrap_or(record.remaining).min(record.remaining);
+        let committed = overlay
+            .remaining
+            .unwrap_or(record.remaining)
+            .min(record.remaining);
         Self {
             debit_account: record.debit_account,
             credit_account: record.credit_account,

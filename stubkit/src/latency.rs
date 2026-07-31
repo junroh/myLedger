@@ -14,7 +14,10 @@ impl LatencyRange {
     }
 
     pub const fn fixed(value: Duration) -> Self {
-        Self { min: value, max: value }
+        Self {
+            min: value,
+            max: value,
+        }
     }
 
     pub fn sample(&self, prng: &mut Prng) -> Duration {

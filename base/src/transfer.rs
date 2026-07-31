@@ -112,7 +112,8 @@ impl Transfer {
             Ok(kind) => kind,
             Err(err) => return Err(err),
         };
-        if self.id.is_absent() || self.debit_account.is_absent() || self.credit_account.is_absent() {
+        if self.id.is_absent() || self.debit_account.is_absent() || self.credit_account.is_absent()
+        {
             return Err(LedgerError::InvalidFlags);
         }
         if self.debit_account.raw() == self.credit_account.raw() {

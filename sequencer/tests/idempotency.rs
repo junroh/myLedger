@@ -15,8 +15,16 @@ fn a_resubmitted_transaction_moves_the_money_once() {
     assert_eq!(harness.run(transfer).outcome, AckOutcome::Committed);
     assert_eq!(harness.columns(ALICE), (100, FUNDING, 0, 0));
 
-    assert_eq!(harness.run(transfer).outcome, AckOutcome::Duplicate, "same body");
-    assert_eq!(harness.columns(ALICE), (100, FUNDING, 0, 0), "a duplicate moves nothing");
+    assert_eq!(
+        harness.run(transfer).outcome,
+        AckOutcome::Duplicate,
+        "same body"
+    );
+    assert_eq!(
+        harness.columns(ALICE),
+        (100, FUNDING, 0, 0),
+        "a duplicate moves nothing"
+    );
 
     let mut altered = transfer;
     altered.amount = 500;

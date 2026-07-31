@@ -1,15 +1,15 @@
 /// The line size of the machine being built for: aligning to anything else pays memory for nothing.
 /// Padding a 64-byte-line machine to 128 would buy one thing — x86 pulls adjacent lines in pairs, so a
 /// pair of padded atomics can still share a fetch — and cost double the padding for a benefit nobody
-/// here can measure. Claims are checked against every size in `SUPPORTED_LINES`, so portability is a
-/// build-time fact rather than a padding choice.
-#[cfg(target_arch = "aarch64")]
+/// here can measure. The workspace's Cargo configuration selects the known 128-byte Apple Silicon
+/// target; generic ARM64 stays at 64 bytes unless its deployment configuration says otherwise.
+#[cfg(ledger_cache_line_128)]
 pub const CACHE_LINE: usize = 128;
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(ledger_cache_line_128))]
 pub const CACHE_LINE: usize = 64;
 
-/// Line sizes the ledger targets. Claims are checked against all of them, so a claim that holds
-/// here holds on the other targets too.
+/// The supported line sizes. `Inside` claims are checked against both, while `WholeLines` claims
+/// are checked against the line size selected for this build.
 pub const SUPPORTED_LINES: [usize; 2] = [64, 128];
 
 /// Declares a struct that starts on a cache line and occupies whole lines. Use it for state
@@ -17,18 +17,20 @@ pub const SUPPORTED_LINES: [usize; 2] = [64, 128];
 /// share a line across threads. State that *does* fit in a line should instead be sized to divide
 /// it — see `never_straddles` — which is cheaper in memory and just as free of straddling.
 ///
-/// `repr(align(..))` only accepts literals, so this macro is the single place the alignment is
-/// written; the emitted const assertions turn a layout regression into a build failure.
+/// `repr(align(..))` only accepts literals, so the public macro supplies the target's alignment
+/// here; the emitted const assertions turn a layout regression into a build failure.
 #[macro_export]
-macro_rules! cache_aligned {
+#[doc(hidden)]
+macro_rules! __cache_aligned {
     (
+        $alignment:literal;
         $(#[$attr:meta])*
         $vis:vis struct $name:ident {
             $($(#[$field_attr:meta])* $fvis:vis $field:ident : $ty:ty),* $(,)?
         }
     ) => {
         $(#[$attr])*
-        #[repr(align(128))]
+        #[repr(align($alignment))]
         $vis struct $name { $($(#[$field_attr])* $fvis $field : $ty),* }
 
         const _: () = {
@@ -41,8 +43,25 @@ macro_rules! cache_aligned {
     };
 }
 
+#[cfg(ledger_cache_line_128)]
+#[macro_export]
+macro_rules! cache_aligned {
+    ($($input:tt)*) => {
+        $crate::__cache_aligned!(128; $($input)*);
+    };
+}
+
+#[cfg(not(ledger_cache_line_128))]
+#[macro_export]
+macro_rules! cache_aligned {
+    ($($input:tt)*) => {
+        $crate::__cache_aligned!(64; $($input)*);
+    };
+}
+
 /// Keeps a value written by one thread off the lines its neighbours read.
-#[repr(align(128))]
+#[cfg_attr(ledger_cache_line_128, repr(align(128)))]
+#[cfg_attr(not(ledger_cache_line_128), repr(align(64)))]
 #[derive(Debug, Default)]
 pub struct CachePadded<T>(T);
 
@@ -104,22 +123,32 @@ impl TypeLayout {
         self.size == self.expected
     }
 
-    /// Whether the type actually sits the way it claims to, on every line size the ledger targets.
+    /// Whether the type actually sits the way it claims to. Small packed values must be portable
+    /// across every supported line size; deliberately padded values must fit the selected target.
     pub const fn honours_fit(&self) -> bool {
-        let mut index = 0;
-        while index < SUPPORTED_LINES.len() {
-            if !self.honours_fit_on(SUPPORTED_LINES[index]) {
-                return false;
+        match self.fit {
+            LineFit::Inside => {
+                let mut index = 0;
+                while index < SUPPORTED_LINES.len() {
+                    if !self.honours_fit_on(SUPPORTED_LINES[index]) {
+                        return false;
+                    }
+                    index += 1;
+                }
+                true
             }
-            index += 1;
+            LineFit::WholeLines => self.honours_fit_on(CACHE_LINE),
+            LineFit::Straddles(_) => true,
         }
-        true
     }
 
     const fn honours_fit_on(&self, line: usize) -> bool {
         match self.fit {
             LineFit::Inside => {
-                self.size > 0 && self.size <= line && line.is_multiple_of(self.size) && self.align >= self.size
+                self.size > 0
+                    && self.size <= line
+                    && line.is_multiple_of(self.size)
+                    && self.align >= self.size
             }
             LineFit::WholeLines => self.size.is_multiple_of(line) && self.align >= line,
             LineFit::Straddles(_) => true,
@@ -161,11 +190,17 @@ macro_rules! layout_claim {
 
         const _: () = assert!(
             $name.matches_expected_size(),
-            concat!(stringify!($type), " changed size; update the declaration deliberately")
+            concat!(
+                stringify!($type),
+                " changed size; update the declaration deliberately"
+            )
         );
         const _: () = assert!(
             $name.honours_fit(),
-            concat!(stringify!($type), " no longer sits against the cache line as it claims")
+            concat!(
+                stringify!($type),
+                " no longer sits against the cache line as it claims"
+            )
         );
     };
 }
@@ -191,7 +226,10 @@ pub const HOT_TYPES: &[TypeLayout] = &[
     crate::ports::account::LAYOUT,
 ];
 
-const _: () = assert!(layouts_are_sound(HOT_TYPES), "a watched type broke its layout contract");
+const _: () = assert!(
+    layouts_are_sound(HOT_TYPES),
+    "a watched type broke its layout contract"
+);
 
 #[cfg(test)]
 mod tests {
@@ -206,7 +244,10 @@ mod tests {
         #[allow(dead_code)]
         struct Snug([u8; 32]);
         let snug = TypeLayout::of::<Snug>("Snug", 32, LineFit::Inside);
-        assert!(snug.honours_fit(), "32 divides 64 and 128, and the alignment says so");
+        assert!(
+            snug.honours_fit(),
+            "32 divides 64 and 128, and the alignment says so"
+        );
 
         // 24 bytes divides neither line size: an array of them straddles.
         #[allow(dead_code)]
@@ -221,18 +262,18 @@ mod tests {
         assert!(!TypeLayout::of::<Loose>("Loose", 32, LineFit::Inside).honours_fit());
     }
 
-    /// `WholeLines` has to hold on the 64-byte target too, which means whole 128-byte units.
+    /// `WholeLines` follows the cache line selected for the current build.
     #[test]
-    fn whole_lines_means_whole_lines_on_both_targets() {
+    fn whole_lines_means_whole_lines_on_the_selected_target() {
         cache_aligned! {
             #[allow(dead_code)]
             struct Padded {
                 value: u64,
             }
         }
-        let padded = TypeLayout::of::<Padded>("Padded", 128, LineFit::WholeLines);
+        let padded = TypeLayout::of::<Padded>("Padded", CACHE_LINE, LineFit::WholeLines);
         assert!(padded.honours_fit());
-        assert_eq!(padded.size, 128, "the macro pads to a whole line");
+        assert_eq!(padded.size, CACHE_LINE, "the macro pads to a whole line");
     }
 
     /// The declared size is a budget: a type that grew must be looked at rather than accepted.

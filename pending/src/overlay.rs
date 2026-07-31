@@ -20,14 +20,20 @@ pub struct HoldOverlay {
 enum Entry {
     /// Nothing decided yet. It exists so that an answer on its way, and the pins of the requests
     /// waiting for it, have somewhere to land.
-    Watched { pinned: u32 },
+    Watched {
+        pinned: u32,
+    },
     /// The engine looked and the hold is not there. Kept, because asking again would get the same
     /// answer.
-    Missing { pinned: u32 },
+    Missing {
+        pinned: u32,
+    },
     /// A committed removal took the hold away while a request in flight still had it pinned. Answers
     /// the same as `Missing` — the hold is gone — but exists only to carry those pins, so it goes with
     /// the last of them instead of being kept for the next lookup to find.
-    Removed { pinned: u32 },
+    Removed {
+        pinned: u32,
+    },
     Decided(Hold),
 }
 
@@ -43,9 +49,9 @@ impl Entry {
 
     fn pinned(&self) -> u32 {
         match self {
-            Entry::Watched { pinned }
-            | Entry::Missing { pinned }
-            | Entry::Removed { pinned } => *pinned,
+            Entry::Watched { pinned } | Entry::Missing { pinned } | Entry::Removed { pinned } => {
+                *pinned
+            }
             Entry::Decided(hold) => hold.pinned,
         }
     }
@@ -74,14 +80,19 @@ impl HoldOverlay {
     }
 
     pub fn hold_is_missing(&self, hold: TxId) -> bool {
-        matches!(self.entries.get(&hold), Some(Entry::Missing { .. } | Entry::Removed { .. }))
+        matches!(
+            self.entries.get(&hold),
+            Some(Entry::Missing { .. } | Entry::Removed { .. })
+        )
     }
 
     /// Only a place for the pins of the requests waiting on the answer. What is already here must
     /// survive its own lookup: these are the sequencer's decisions, and the answer coming back can
     /// have been in flight across them.
     pub fn begin_lookup(&mut self, hold: TxId) {
-        self.entries.entry(hold).or_insert(Entry::Watched { pinned: 0 });
+        self.entries
+            .entry(hold)
+            .or_insert(Entry::Watched { pinned: 0 });
         self.peak.saw(self.entries.len());
     }
 
@@ -326,7 +337,10 @@ mod tests {
         // because the pin does.
         assert!(overlay.hold_is_missing(HOLD));
         overlay.maintain();
-        assert!(overlay.hold_is_missing(HOLD), "a pinned entry may not be evicted");
+        assert!(
+            overlay.hold_is_missing(HOLD),
+            "a pinned entry may not be evicted"
+        );
 
         // The marker exists only to carry the pin, so it goes with it rather than waiting for
         // housekeeping: a workload that resolves every hold would otherwise leave one per hold.
@@ -358,12 +372,19 @@ mod tests {
         overlay.begin_lookup(HOLD);
         overlay.created(HOLD, 100);
         overlay.admit_lookup(HOLD, None);
-        assert!(!overlay.hold_is_missing(HOLD), "the hold was created while the answer was in flight");
+        assert!(
+            !overlay.hold_is_missing(HOLD),
+            "the hold was created while the answer was in flight"
+        );
 
         // The other direction: a settle commits, so the sequencer knows the hold is down to 40, and
         // then an answer taken before that write arrives saying 100.
         overlay.note_remaining(HOLD, 40);
         overlay.admit_lookup(HOLD, Some(100));
-        assert_eq!(overlay.overlay(HOLD).remaining, Some(40), "the older reading was dropped");
+        assert_eq!(
+            overlay.overlay(HOLD).remaining,
+            Some(40),
+            "the older reading was dropped"
+        );
     }
 }

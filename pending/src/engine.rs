@@ -99,7 +99,15 @@ impl PendingEngine {
     /// would reject a hold that exists, a few times in every ten thousand.
     pub fn begin_lookup(&mut self, handle: u64, key: TxId, now: u64) -> Started {
         let candidates = self.index.candidates(key);
-        self.walk(Fetch { key, candidates, next: 0 }, handle, now)
+        self.walk(
+            Fetch {
+                key,
+                candidates,
+                next: 0,
+            },
+            handle,
+            now,
+        )
     }
 
     /// The next lookup the store has finished, if its record turns out to be the key that was asked
@@ -244,7 +252,11 @@ impl PendingEngine {
             }
             // Nothing is read: the slot is found by address and the group's arithmetic came with the
             // decision. This is every full settle and every void, which is most of the traffic.
-            PendingEffect::Remove { pending_ref, budget, released } => {
+            PendingEffect::Remove {
+                pending_ref,
+                budget,
+                released,
+            } => {
                 let Self { index, records, .. } = self;
                 let mut verify = Self::verifier(records, pending_ref);
                 if index.remove(pending_ref, &mut verify).is_none() {
@@ -383,7 +395,16 @@ mod tests {
         engine.write(create(TxId(9), 100, BudgetGroup::ABSENT));
         let (_, after_create) = (engine.records.blocks(), engine.records.appended());
 
-        engine.write(PendingEffect::Reduce { pending_ref: TxId(9), debit_account: AccountId(1), credit_account: AccountId(2), amount: 100, remaining: 40, consumed: 60, ledger: 1, budget: BudgetGroup::ABSENT });
+        engine.write(PendingEffect::Reduce {
+            pending_ref: TxId(9),
+            debit_account: AccountId(1),
+            credit_account: AccountId(2),
+            amount: 100,
+            remaining: 40,
+            consumed: 60,
+            ledger: 1,
+            budget: BudgetGroup::ABSENT,
+        });
         assert_eq!(
             engine.records.appended(),
             after_create + 1,
@@ -391,7 +412,16 @@ mod tests {
         );
         assert_eq!(engine.lookup(TxId(9)).map(|hold| hold.remaining), Some(40));
 
-        engine.write(PendingEffect::Reduce { pending_ref: TxId(9), debit_account: AccountId(1), credit_account: AccountId(2), amount: 100, remaining: 10, consumed: 30, ledger: 1, budget: BudgetGroup::ABSENT });
+        engine.write(PendingEffect::Reduce {
+            pending_ref: TxId(9),
+            debit_account: AccountId(1),
+            credit_account: AccountId(2),
+            amount: 100,
+            remaining: 10,
+            consumed: 30,
+            ledger: 1,
+            budget: BudgetGroup::ABSENT,
+        });
         assert_eq!(engine.records.appended(), after_create + 2);
         assert_eq!(engine.lookup(TxId(9)).map(|hold| hold.remaining), Some(10));
 
@@ -400,7 +430,10 @@ mod tests {
             budget: BudgetGroup::ABSENT,
             released: 10,
         });
-        assert!(engine.lookup(TxId(9)).is_none(), "a removed hold is gone from the index");
+        assert!(
+            engine.lookup(TxId(9)).is_none(),
+            "a removed hold is gone from the index"
+        );
         assert_eq!(
             engine.records.appended(),
             after_create + 2,
@@ -433,7 +466,9 @@ mod tests {
             ledger: 1,
             budget: group,
         });
-        let last = engine.lookup(TxId(members as u128)).expect("the last member");
+        let last = engine
+            .lookup(TxId(members as u128))
+            .expect("the last member");
         assert_eq!(last.budget_remaining, members as Amount * 10 - 6);
         assert_eq!(last.budget_members, members as u32);
     }
@@ -546,19 +581,31 @@ mod apply_tests {
         }
 
         let carried = engine.traffic().flushed;
-        assert!(carried > 0, "nothing was carried on, so the flush window never closed");
+        assert!(
+            carried > 0,
+            "nothing was carried on, so the flush window never closed"
+        );
         let before = engine.traffic();
         assert_eq!(engine.lookup(survivor).map(|hold| hold.amount), Some(500));
         let after = engine.traffic();
-        assert_eq!(after.store_reads, before.store_reads, "a resident record cost an IO");
-        assert!(after.resident_reads > before.resident_reads, "it was not read from residency");
+        assert_eq!(
+            after.store_reads, before.store_reads,
+            "a resident record cost an IO"
+        );
+        assert!(
+            after.resident_reads > before.resident_reads,
+            "it was not read from residency"
+        );
 
         // Now push it past residency. Its content is on the store, so nothing is lost — but answering
         // for it is an IO from here on, which is exactly what `left_memory` counts.
         for index in 0..RECORDS_PER_BLOCK * 6 {
             engine.write(create(TxId(9_000 + index as u128), 10));
         }
-        assert!(engine.traffic().left_memory > 0, "residency never dropped a block");
+        assert!(
+            engine.traffic().left_memory > 0,
+            "residency never dropped a block"
+        );
         let before = engine.traffic();
         assert_eq!(engine.lookup(survivor).map(|hold| hold.amount), Some(500));
         assert!(
@@ -587,7 +634,11 @@ mod buffer_tests {
     }
 
     fn resolve(tx_id: TxId, released: Amount) -> PendingEffect {
-        PendingEffect::Remove { pending_ref: tx_id, budget: BudgetGroup::ABSENT, released }
+        PendingEffect::Remove {
+            pending_ref: tx_id,
+            budget: BudgetGroup::ABSENT,
+            released,
+        }
     }
 
     /// The saving the whole capacity estimate rests on: a hold resolved before its block is compacted
@@ -611,9 +662,15 @@ mod buffer_tests {
         // would be measuring those instead.
         engine.write(create(TxId(1_000_000), 10));
         let traffic = engine.traffic();
-        assert!(traffic.died_in_buffer >= holds as u64, "records were carried on that were dead");
+        assert!(
+            traffic.died_in_buffer >= holds as u64,
+            "records were carried on that were dead"
+        );
         assert_eq!(traffic.flushed, 0, "a dead record was written to the store");
-        assert_eq!(traffic.store_reads, 0, "nothing should have been read from the store yet");
+        assert_eq!(
+            traffic.store_reads, 0,
+            "nothing should have been read from the store yet"
+        );
     }
 
     /// And a hold that outlives the window is carried on with its index entry following it, so it is
@@ -629,13 +686,21 @@ mod buffer_tests {
         for index in 0..RECORDS_PER_BLOCK * 2 + 2 {
             engine.write(create(TxId(1_000 + index as u128), 10));
         }
-        let after = engine.lookup(survivor).expect("the survivor is still there");
+        let after = engine
+            .lookup(survivor)
+            .expect("the survivor is still there");
         assert_eq!(after.remaining, 500, "the survivor came back changed");
-        assert!(engine.traffic().flushed > 0, "nothing was carried on at all");
+        assert!(
+            engine.traffic().flushed > 0,
+            "nothing was carried on at all"
+        );
 
         // And it is still the hold the index says it is, at whatever address compaction gave it.
         engine.write(resolve(survivor, 500));
-        assert!(engine.lookup(survivor).is_none(), "the survivor was not resolved");
+        assert!(
+            engine.lookup(survivor).is_none(),
+            "the survivor was not resolved"
+        );
     }
 
     /// A partial resolution's old version is dead the moment the index moves on, so compaction drops it
@@ -744,5 +809,4 @@ mod fetch_tests {
         assert!(answered(engine.begin_lookup(1, TxId(999_999), 0)).is_none());
         assert_eq!(engine.inflight(), 0);
     }
-
 }

@@ -425,7 +425,7 @@ side reading the other's fields.
 
 ## 5. Line-aligned or packed: measure, per structure
 
-Padding follows the machine's own line size — 128 here, 64 on x86 — because aligning to anything else
+Padding follows the machine's own line size — 128 on Apple Silicon, 64 on x86 and generic ARM64 — because aligning to anything else
 pays memory for nothing. Going to 128 everywhere would buy exactly one thing: x86 pulls adjacent lines
 in pairs, so a pair of padded atomics can still share a fetch. That is a real effect and it is also one
 nobody here can measure, so it is not bought. It would reach very little anyway: only the two padded
@@ -433,9 +433,14 @@ atomics in each SPSC ring and `WorkItem`'s alignment, since `WorkItem` is 128 by
 fields. Nothing that dominates memory is padded at all — an `AccountRecord` is 40 bytes and a
 `LaneState` is 32, both by deliberate claim.
 
-What makes this portable is not the padding but the checking: every claim is verified against **all** of
-`SUPPORTED_LINES` at build time, so one that holds here holds on a 64-byte machine. `LaneState` at 32
-bytes is `Inside` on either; `WorkItem` at 128 occupies whole lines on either.
+Generic ARM64 does not identify a cache-line size, so it defaults to 64 bytes; a measured 128-byte
+deployment changes the central Cargo target configuration at build time. What makes the packed state portable is the checking:
+an `Inside` claim is verified against **all** of `SUPPORTED_LINES`, while a deliberately padded
+`WholeLines` claim is verified against the line selected for that build. `LaneState` at 32 bytes is
+`Inside` on either; `WorkItem` is aligned and padded to the selected line.
+
+The setting is workspace-wide rather than an executable feature: `.cargo/config.toml` selects the
+Apple Silicon target and therefore applies to both the base layout types and the sequencer's `WorkItem`.
 
 A smaller line is not simply worse, and the tempting number is the wrong one. `ledgerfio layout` prints
 how many values share a line, but that is density, not the cost of a random access. A random access

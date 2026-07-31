@@ -97,8 +97,11 @@ impl Batcher {
             self.open_bytes_peak.entries() * size_of::<Effect>(),
         );
         // Each batch in flight carries the slot list it will answer, which comes from the pool.
-        let in_flight_slots: usize =
-            self.in_flight.iter().map(|batch| batch.slots.capacity()).sum();
+        let in_flight_slots: usize = self
+            .in_flight
+            .iter()
+            .map(|batch| batch.slots.capacity())
+            .sum();
         footprint.other(
             "batches awaiting consensus",
             self.in_flight.len(),
@@ -137,11 +140,21 @@ impl Batcher {
         }
         let take = self.chain_boundary(self.effects.len().min(self.policy.max));
         let (effects, slots) = self.detach(take);
-        Some((RaftProposal { batch_id: self.next_batch_id, effects }, slots))
+        Some((
+            RaftProposal {
+                batch_id: self.next_batch_id,
+                effects,
+            },
+            slots,
+        ))
     }
 
     pub fn on_proposed(&mut self, batch_id: u64, slots: Vec<SlotId>, now_nanos: u64) {
-        self.in_flight.push_back(InFlightBatch { batch_id, slots, proposed_at_nanos: now_nanos });
+        self.in_flight.push_back(InFlightBatch {
+            batch_id,
+            slots,
+            proposed_at_nanos: now_nanos,
+        });
         self.in_flight_peak.saw(self.in_flight.len());
         self.next_batch_id += 1;
         if self.effects.is_empty() {
@@ -244,10 +257,16 @@ mod tests {
         batcher.push(effect(0), 0, 0);
         let (proposal, slots) = batcher.take_proposal(0).expect("a batch is due");
         batcher.on_proposed(proposal.batch_id, slots, 0);
-        assert!(batcher.take_proposal(0).is_none(), "every proposal it may hold is in flight");
+        assert!(
+            batcher.take_proposal(0).is_none(),
+            "every proposal it may hold is in flight"
+        );
 
         for slot in 1..=4 {
-            assert!(!batcher.is_saturated(), "room for {slot} effects was promised");
+            assert!(
+                !batcher.is_saturated(),
+                "room for {slot} effects was promised"
+            );
             batcher.push(effect(slot as u32), slot as SlotId, 0);
         }
         assert!(batcher.is_saturated(), "at the bound, intake has to pause");
@@ -270,11 +289,20 @@ mod tests {
         }
 
         let (first, slots) = batcher.take_proposal(0).expect("a full batch is due");
-        assert_eq!(first.effects.len(), 1, "the chain's first leg would have been cut off");
+        assert_eq!(
+            first.effects.len(),
+            1,
+            "the chain's first leg would have been cut off"
+        );
         batcher.on_proposed(first.batch_id, slots, 0);
 
-        let (second, _) = batcher.take_proposal(0).expect("the chain is still waiting");
+        let (second, _) = batcher
+            .take_proposal(0)
+            .expect("the chain is still waiting");
         assert_eq!(second.effects.len(), 2);
-        assert!(second.effects.iter().all(|effect| effect.chain == LinkedChainId(7)));
+        assert!(second
+            .effects
+            .iter()
+            .all(|effect| effect.chain == LinkedChainId(7)));
     }
 }

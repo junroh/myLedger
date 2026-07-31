@@ -206,7 +206,10 @@ struct Filling {
 
 impl Filling {
     fn new() -> Self {
-        Self { bytes: vec![0; BLOCK_BYTES], filled: 0 }
+        Self {
+            bytes: vec![0; BLOCK_BYTES],
+            filled: 0,
+        }
     }
 
     fn full(&self) -> bool {
@@ -411,7 +414,11 @@ impl RecordLog {
             self.buffer.push_back(Filling::new());
         }
         let ordinal = self.oldest + self.buffer.len() as u64 - 1;
-        let index = self.buffer.back_mut().expect("a block to fill").put(key, hold);
+        let index = self
+            .buffer
+            .back_mut()
+            .expect("a block to fill")
+            .put(key, hold);
         self.appended += 1;
         BlockAddr::buffered(ordinal, index as u8)
     }
@@ -515,8 +522,6 @@ impl RecordLog {
         let (key, hold) = decode(&self.scratch[at..at + RECORD_BYTES], addr);
         Some((handle, addr, key, hold))
     }
-
-
 
     /// Records appended, records that never left the buffer because they were resolved first, records
     /// carried on to the store, and reads answered from memory against reads that went to the store.
@@ -645,9 +650,15 @@ mod tests {
     #[test]
     fn an_address_carries_its_three_parts() {
         let addr = BlockAddr::new(63, (1 << BLOCK_BITS) - 1, 63);
-        assert_eq!((addr.segment(), addr.block(), addr.index()), (63, (1 << BLOCK_BITS) - 1, 63));
+        assert_eq!(
+            (addr.segment(), addr.block(), addr.index()),
+            (63, (1 << BLOCK_BITS) - 1, 63)
+        );
         let modest = BlockAddr::new(2, 1_000_000, 7);
-        assert_eq!((modest.segment(), modest.block(), modest.index()), (2, 1_000_000, 7));
+        assert_eq!(
+            (modest.segment(), modest.block(), modest.index()),
+            (2, 1_000_000, 7)
+        );
         assert_eq!(BlockAddr::from_raw(modest.raw()), modest);
     }
 

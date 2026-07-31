@@ -7,14 +7,12 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use ledger_base::ports::{
-    IdemReply, IdemRequest, IdemVerdict, IdempotencyPort, OverlayState,
-    PendingCommand, PendingEffect, PendingPort, PendingReply, RaftCommit, RaftOutcome, RaftPort,
-    RaftProposal, PendingOverlay,
+    IdemReply, IdemRequest, IdemVerdict, IdempotencyPort, OverlayState, PendingCommand,
+    PendingEffect, PendingOverlay, PendingPort, PendingReply, RaftCommit, RaftOutcome, RaftPort,
+    RaftProposal,
 };
 use ledger_base::{Amount, FxHashMap, Prng, TxId};
-use ledger_pending::{
-    HoldOverlay, PendingEngine, DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS,
-};
+use ledger_pending::{HoldOverlay, PendingEngine, DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS};
 use ledger_stubkit::{LaneOrderer, Server, ServerStats};
 
 /// How fast each component answers, and how much it keeps. Nothing here misbehaves — a slow component
@@ -81,8 +79,16 @@ impl Timings {
             // completing in the device's order — while the faults are on. A deployment's windows would
             // answer everything from memory, which is the right answer there and no coverage here. One
             // seed in four keeps them wide, so the memory path is still exercised too.
-            flush_blocks: if pick(4) == 0 { DEFAULT_FLUSH_BLOCKS } else { 1 + pick(3) as usize },
-            resident_blocks: if pick(4) == 0 { DEFAULT_RESIDENT_BLOCKS } else { pick(3) as usize },
+            flush_blocks: if pick(4) == 0 {
+                DEFAULT_FLUSH_BLOCKS
+            } else {
+                1 + pick(3) as usize
+            },
+            resident_blocks: if pick(4) == 0 {
+                DEFAULT_RESIDENT_BLOCKS
+            } else {
+                pick(3) as usize
+            },
             idem_nanos: pick(3) * step_nanos,
             raft_nanos: (1 + pick(4)) * step_nanos,
             raft_tail_nanos: pick(3) * step_nanos,
@@ -119,14 +125,21 @@ impl Faults {
             stale_answer_every: if pick(5) == 0 { 2 + pick(8) as u32 } else { 0 },
             fail_every: if pick(3) == 0 { 3 + pick(8) } else { 0 },
             reorder_every: if pick(5) == 0 { 2 + pick(6) } else { 0 },
-            inbox_depth: if pick(3) == 0 { 2 + pick(8) as usize } else { 64 + pick(256) as usize },
+            inbox_depth: if pick(3) == 0 {
+                2 + pick(8) as usize
+            } else {
+                64 + pick(256) as usize
+            },
             slow_client_every: if pick(3) == 0 { 2 + pick(8) } else { 0 },
         }
     }
 
     /// Inboxes deep enough that a capacity run is not measuring a bound this tool chose.
     pub fn none(inbox_depth: usize) -> Self {
-        Self { inbox_depth, ..Self::default() }
+        Self {
+            inbox_depth,
+            ..Self::default()
+        }
     }
 }
 
@@ -298,7 +311,10 @@ impl PendingFake {
         }
         let deepest = state.orderer.behind_heads();
         state.order_wait.deepest = state.order_wait.deepest.max(deepest);
-        state.earliest = match (state.inbox.front().map(|(due, _)| *due), state.orderer.next_due()) {
+        state.earliest = match (
+            state.inbox.front().map(|(due, _)| *due),
+            state.orderer.next_due(),
+        ) {
             (Some(inbox), Some(held)) => Some(inbox.min(held)),
             (only, None) | (None, only) => only,
         };
@@ -317,7 +333,9 @@ impl PendingState {
         let applied = self.store.applied();
         self.answers += 1;
         let stale = self.stale_answer_every > 0
-            && self.answers.is_multiple_of(u64::from(self.stale_answer_every));
+            && self
+                .answers
+                .is_multiple_of(u64::from(self.stale_answer_every));
         if stale {
             return applied.saturating_sub(1);
         }
@@ -337,9 +355,11 @@ impl PendingState {
         };
         match effect {
             PendingEffect::Create { tx_id, amount, .. } => self.overlay.created(tx_id, amount),
-            PendingEffect::Reduce { pending_ref, remaining, .. } => {
-                self.overlay.note_remaining(pending_ref, remaining)
-            }
+            PendingEffect::Reduce {
+                pending_ref,
+                remaining,
+                ..
+            } => self.overlay.note_remaining(pending_ref, remaining),
             PendingEffect::Remove { pending_ref, .. } => self.overlay.forget(pending_ref),
         }
     }
@@ -398,11 +418,17 @@ impl PendingOverlay for PendingFake {
     }
 
     fn release_reservation(&mut self, hold: TxId, amount: Amount) {
-        self.0.borrow_mut().overlay.release_reservation(hold, amount);
+        self.0
+            .borrow_mut()
+            .overlay
+            .release_reservation(hold, amount);
     }
 
     fn compensate(&mut self, hold: TxId, amount: Amount, resolves: bool) {
-        self.0.borrow_mut().overlay.compensate(hold, amount, resolves);
+        self.0
+            .borrow_mut()
+            .overlay
+            .compensate(hold, amount, resolves);
     }
 
     fn maintain(&mut self) -> usize {
@@ -534,7 +560,11 @@ impl RaftFake {
     pub fn drive(&self, now: u64) {
         let mut state = self.0.borrow_mut();
         state.now = now;
-        while state.inflight.front().is_some_and(|(due, _, _)| *due <= now) {
+        while state
+            .inflight
+            .front()
+            .is_some_and(|(due, _, _)| *due <= now)
+        {
             let (_, proposal, outcome) = state.inflight.pop_front().expect("a due proposal");
             state.ready.push_back(RaftCommit {
                 batch_id: proposal.batch_id,

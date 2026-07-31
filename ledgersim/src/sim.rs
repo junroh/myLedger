@@ -69,7 +69,13 @@ impl Costs {
 impl Default for Costs {
     fn default() -> Self {
         // Measured with `ledgerfio run --workload hold-settle --cpu` on one Apple M-series core.
-        Self { intake_ns: 181.0, judge_ns: 93.0, propose_ns: 5.0, apply_ns: 135.0, tick_ns: 50.0 }
+        Self {
+            intake_ns: 181.0,
+            judge_ns: 93.0,
+            propose_ns: 5.0,
+            apply_ns: 135.0,
+            tick_ns: 50.0,
+        }
     }
 }
 
@@ -166,7 +172,13 @@ impl Run {
         } else {
             1 + prng.next_u64() % 2
         };
-        Self { steps, accounts, batch_size, batches_in_flight, burst }
+        Self {
+            steps,
+            accounts,
+            batch_size,
+            batches_in_flight,
+            burst,
+        }
     }
 }
 
@@ -329,7 +341,11 @@ impl Prediction {
         if seconds <= 0.0 {
             return 0.0;
         }
-        let counted = if self.arrivals > 0 { self.arrivals } else { self.submitted };
+        let counted = if self.arrivals > 0 {
+            self.arrivals
+        } else {
+            self.submitted
+        };
         counted as f64 / seconds
     }
 
@@ -476,7 +492,13 @@ pub fn explore(
     faults: Faults,
     run: Run,
 ) -> Result<Report, Box<Failure>> {
-    let Run { steps, accounts, batch_size, batches_in_flight, burst } = run;
+    let Run {
+        steps,
+        accounts,
+        batch_size,
+        batches_in_flight,
+        burst,
+    } = run;
     let mut prng = Prng::new(seed);
     let mut sim = Sim::new(
         &mut prng,
@@ -515,7 +537,13 @@ pub fn explore(
         sim.step();
         sim.collect();
         if let Err(broken) = sim.audit_due() {
-            return Err(Box::new(Failure { seed, step, broken, timings, faults }));
+            return Err(Box::new(Failure {
+                seed,
+                step,
+                broken,
+                timings,
+                faults,
+            }));
         }
         // A halted sequencer refuses everything from here on, so the remaining steps would explore
         // nothing: drain and report it instead of spinning.
@@ -529,7 +557,13 @@ pub fn explore(
         sim.step();
         sim.collect();
         if let Err(broken) = sim.reactor.audit() {
-            return Err(Box::new(Failure { seed, step: steps + step, broken, timings, faults }));
+            return Err(Box::new(Failure {
+                seed,
+                step: steps + step,
+                broken,
+                timings,
+                faults,
+            }));
         }
     }
     let overflowed = sim.pending.overflowed();
@@ -614,11 +648,23 @@ pub fn capacity(plan: Plan) -> Result<Prediction, Box<Failure>> {
         sim.step();
         sim.collect();
         if let Err(broken) = sim.audit_due() {
-            return Err(Box::new(Failure { seed: 0, step: sim.now, broken, timings, faults }));
+            return Err(Box::new(Failure {
+                seed: 0,
+                step: sim.now,
+                broken,
+                timings,
+                faults,
+            }));
         }
     }
     if let Err(broken) = sim.reactor.audit() {
-        return Err(Box::new(Failure { seed: 0, step: sim.now, broken, timings, faults }));
+        return Err(Box::new(Failure {
+            seed: 0,
+            step: sim.now,
+            broken,
+            timings,
+            faults,
+        }));
     }
     let engine = sim.pending.engine();
     let order_wait = sim.pending.order_wait();
@@ -633,7 +679,12 @@ pub fn capacity(plan: Plan) -> Result<Prediction, Box<Failure>> {
         arrivals: sim.arrivals - arrivals_before,
         overloaded: sim.overloaded - overloaded_before,
         charge: sim.charged.since(&charged_before),
-        latency_us: [percentile(0.5), percentile(0.99), percentile(0.999), percentile(1.0)],
+        latency_us: [
+            percentile(0.5),
+            percentile(0.99),
+            percentile(0.999),
+            percentile(1.0),
+        ],
         mean_us: sim.latency.mean() / 1_000.0,
         pending_commands: engine.reads,
         pending_queue_us: engine.queued_nanos as f64 / engine.reads.max(1) as f64 / 1_000.0,
@@ -669,7 +720,11 @@ impl Sim {
         let mut store = MemoryAccounts::with_capacity(accounts as usize + 1);
         store.open(EXTERNAL, LEDGER, AccountFlags::NONE);
         for index in 0..accounts {
-            store.open(AccountId(FIRST_USER + index), LEDGER, AccountFlags::CONSTRAINED);
+            store.open(
+                AccountId(FIRST_USER + index),
+                LEDGER,
+                AccountFlags::CONSTRAINED,
+            );
         }
         let clock = ManualClock::new(0);
         let (requests, request_rx) = channel(queue);
@@ -689,7 +744,10 @@ impl Sim {
         };
         let (reactor, _log) = Reactor::with_clock(
             config,
-            Transport { requests: request_rx, acks: ack_tx },
+            Transport {
+                requests: request_rx,
+                acks: ack_tx,
+            },
             store,
             pending.clone(),
             idem.clone(),
@@ -744,8 +802,9 @@ impl Sim {
     /// are allowed to cause: the run then explores a halted node, and saying so beats waiting forever
     /// for a commit that is never coming.
     fn fund(&mut self) -> bool {
-        let mut owed: Vec<AccountId> =
-            (0..self.traffic.accounts()).map(|index| AccountId(FIRST_USER + index)).collect();
+        let mut owed: Vec<AccountId> = (0..self.traffic.accounts())
+            .map(|index| AccountId(FIRST_USER + index))
+            .collect();
         let mut sent: FxHashMap<TxId, AccountId> = FxHashMap::default();
         let mut idle = 0;
         while !owed.is_empty() || !sent.is_empty() {
@@ -757,7 +816,11 @@ impl Sim {
             while sent.len() < self.queue_depth as usize {
                 let Some(account) = owed.pop() else { break };
                 let transfer = self.traffic.funding(account, FUNDING);
-                if self.requests.push(Request::single(transfer, self.now)).is_err() {
+                if self
+                    .requests
+                    .push(Request::single(transfer, self.now))
+                    .is_err()
+                {
                     owed.push(account);
                     break;
                 }
@@ -774,7 +837,11 @@ impl Sim {
                     }
                 }
             }
-            idle = if sent.len() + owed.len() < before { 0 } else { idle + 1 };
+            idle = if sent.len() + owed.len() < before {
+                0
+            } else {
+                idle + 1
+            };
             if idle > 10_000_000 {
                 return false;
             }
@@ -807,7 +874,10 @@ impl Sim {
                     charged
                 } else {
                     let ceiling = self.now + self.linger_nanos;
-                    let next = self.next_due().unwrap_or(ceiling).clamp(self.now + 1, ceiling);
+                    let next = self
+                        .next_due()
+                        .unwrap_or(ceiling)
+                        .clamp(self.now + 1, ceiling);
                     next - self.now
                 }
             }
@@ -821,10 +891,14 @@ impl Sim {
 
     /// The earliest any component has something to hand back.
     fn next_due(&self) -> Option<u64> {
-        [self.pending.next_due(), self.idem.next_due(), self.raft.next_due()]
-            .into_iter()
-            .flatten()
-            .min()
+        [
+            self.pending.next_due(),
+            self.idem.next_due(),
+            self.raft.next_due(),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
     }
 
     /// What the core spent this tick, charged to the stage that spent it. A tick that got somewhere
@@ -845,7 +919,11 @@ impl Sim {
         let work = stages.total();
         // A tick that moved something but finished no stage still ran, and the floor is its whole
         // cost — charging it on top of a stage would price the same tick twice.
-        let floor = if progress && work == 0 { costs.tick_ns as u64 } else { 0 };
+        let floor = if progress && work == 0 {
+            costs.tick_ns as u64
+        } else {
+            0
+        };
         self.charged.intake_ns += stages.intake_ns;
         self.charged.judge_ns += stages.judge_ns;
         self.charged.propose_ns += stages.propose_ns;
@@ -874,7 +952,8 @@ impl Sim {
             if matches!(ack.outcome, AckOutcome::Rejected(LedgerError::Overloaded)) {
                 self.overloaded += 1;
             }
-            self.traffic.answered(&ack, matches!(ack.outcome, AckOutcome::Committed));
+            self.traffic
+                .answered(&ack, matches!(ack.outcome, AckOutcome::Committed));
         }
     }
 

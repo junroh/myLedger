@@ -1,0 +1,14 @@
+# Cache-line alignment is a hardware property and is selected once for the workspace.
+# Apple Silicon uses 128-byte cache lines. Other supported targets use the 64-byte default in
+# `ledger-base`; a verified non-Apple 128-byte ARM64 deployment needs its own target configuration.
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "ledger_cache_line_128"]
+
+[alias]
+# Short, project-local commands for the ledger workload and simulator tools.
+test-all = "test --workspace --quiet"
+fio = "run --release -p ledgerfio"
+sim = "run --release -p ledgersim"
+# Convenience aliases for the main local checks.
+fio-hold = "run --release -p ledgerfio -- run --workload hold-settle --duration 3s --accounts 100000"
+sim-check = "run --release -p ledgersim -- check --seeds 16"

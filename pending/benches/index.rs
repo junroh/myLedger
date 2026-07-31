@@ -91,7 +91,10 @@ fn stash_demand(options: &BenchOptions) {
                 let salt = (repeat as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
                 for index in 0..holds {
                     let key = TxId(u128::from(salt ^ (index as u64).wrapping_mul(STRIDE)) + 1);
-                    if table.insert_new(key, BlockAddr::from_raw(index as u64)).is_err() {
+                    if table
+                        .insert_new(key, BlockAddr::from_raw(index as u64))
+                        .is_err()
+                    {
                         homeless += 1;
                     }
                 }

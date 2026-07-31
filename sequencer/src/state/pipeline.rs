@@ -7,8 +7,10 @@ use crate::state::lane::LaneState;
 use std::mem::size_of;
 
 use ledger_base::ports::{Correlation, HoldData, IdemVerdict};
-use ledger_base::{AccountId, AcctHandle, Consumer, Footprint, LinkedChainId, Peak, Request, Seq,
-    Transfer, TransferKind};
+use ledger_base::{
+    AccountId, AcctHandle, Consumer, Footprint, LinkedChainId, Peak, Request, Seq, Transfer,
+    TransferKind,
+};
 
 /// Index into the work pool. Components see it only as an opaque correlation token.
 pub type SlotId = u32;
@@ -309,17 +311,26 @@ mod tests {
     /// been pinned.
     #[test]
     fn a_request_whose_dispatch_never_went_through_holds_no_pin() {
-        let mut item = WorkItem { kind: TransferKind::Settle, ..WorkItem::default() };
+        let mut item = WorkItem {
+            kind: TransferKind::Settle,
+            ..WorkItem::default()
+        };
         assert!(!item.holds_pin(), "nothing has been sent yet");
         item.sent = item.sent.with(DepFlags::PENDING);
-        assert!(item.holds_pin(), "the pending step went through, so a pin was taken");
+        assert!(
+            item.holds_pin(),
+            "the pending step went through, so a pin was taken"
+        );
 
         let inline = WorkItem {
             kind: TransferKind::SinglePhase,
             sent: DepFlags::NONE.with(DepFlags::PENDING),
             ..WorkItem::default()
         };
-        assert!(!inline.holds_pin(), "a kind that reads no hold never pins one");
+        assert!(
+            !inline.holds_pin(),
+            "a kind that reads no hold never pins one"
+        );
     }
 
     /// Why a watermark exists at all: a sizing answer taken from the current count reports whatever
@@ -332,7 +343,11 @@ mod tests {
         pool.release(first);
         pool.release(second);
         assert_eq!(pool.in_flight(), 0, "the pool drained");
-        assert_eq!(pool.peak_in_flight(), 2, "releasing a slot must not lower the peak");
+        assert_eq!(
+            pool.peak_in_flight(),
+            2,
+            "releasing a slot must not lower the peak"
+        );
     }
 
     /// A pool cannot report having held more than it has, which is what makes the peak comparable to

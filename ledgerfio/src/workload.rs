@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use ledger_base::{
-    Ack, AccountId, AckOutcome, Amount, FxHashMap, Prng, Transfer, TransferFlags, TxId,
+    AccountId, Ack, AckOutcome, Amount, FxHashMap, Prng, Transfer, TransferFlags, TxId,
 };
 
 pub const EXTERNAL_ACCOUNT: AccountId = AccountId(1);
@@ -246,7 +246,12 @@ impl Workload {
         let id = self.take_id();
         self.submitted_holds.insert(
             id,
-            OpenHold { id, debit, credit, remaining: self.transfer_amount },
+            OpenHold {
+                id,
+                debit,
+                credit,
+                remaining: self.transfer_amount,
+            },
         );
         Transfer {
             id,
@@ -260,7 +265,11 @@ impl Workload {
     }
 
     fn settle(&mut self, mut hold: OpenHold, partial: bool) -> Transfer {
-        let amount = if partial { (hold.remaining / 2).max(1) } else { hold.remaining };
+        let amount = if partial {
+            (hold.remaining / 2).max(1)
+        } else {
+            hold.remaining
+        };
         hold.remaining -= amount;
         let transfer = Transfer {
             id: self.take_id(),
@@ -321,7 +330,9 @@ impl Workload {
     fn other_user(&mut self, avoid: AccountId) -> AccountId {
         let candidate = self.random_user();
         if candidate == avoid {
-            return AccountId(FIRST_USER_ACCOUNT + (candidate.raw() + 1 - FIRST_USER_ACCOUNT) % self.accounts);
+            return AccountId(
+                FIRST_USER_ACCOUNT + (candidate.raw() + 1 - FIRST_USER_ACCOUNT) % self.accounts,
+            );
         }
         candidate
     }

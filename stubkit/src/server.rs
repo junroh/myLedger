@@ -35,7 +35,11 @@ impl Server {
         Self {
             base_nanos,
             tail_nanos,
-            service_nanos: if per_second == 0 { 0 } else { 1_000_000_000 / per_second },
+            service_nanos: if per_second == 0 {
+                0
+            } else {
+                1_000_000_000 / per_second
+            },
             free_at_nanos: 0,
             reads: 0,
             queued_nanos: 0,
@@ -56,7 +60,10 @@ impl Server {
     }
 
     pub fn stats(&self) -> ServerStats {
-        ServerStats { reads: self.reads, queued_nanos: self.queued_nanos }
+        ServerStats {
+            reads: self.reads,
+            queued_nanos: self.queued_nanos,
+        }
     }
 
     /// Forget what has been served, for a caller that measures one stretch of a run and set up first.
@@ -108,7 +115,10 @@ mod tests {
         for _ in 0..1_000 {
             last = device.serve(0, &mut prng);
         }
-        assert!(last > 9_000_000, "1000 reads of 10us each should reach 10ms, got {last}");
+        assert!(
+            last > 9_000_000,
+            "1000 reads of 10us each should reach 10ms, got {last}"
+        );
         assert!(device.stats().queued_nanos > 0);
     }
 }

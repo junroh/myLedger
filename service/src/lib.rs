@@ -61,7 +61,6 @@ impl StopToken {
     pub fn request(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
-
 }
 
 /// The running ledger. Starting it starts the reactor loop; the caller never drives ticks.

@@ -94,7 +94,10 @@ mod tests {
         ];
         for request in [None, Some(0), Some(usize::MAX)] {
             let placement = ThreadPolicy::apply(request);
-            assert!(known.contains(&placement), "unknown placement {placement:?}");
+            assert!(
+                known.contains(&placement),
+                "unknown placement {placement:?}"
+            );
         }
         assert_ne!(
             ThreadPolicy::apply(Some(usize::MAX)),

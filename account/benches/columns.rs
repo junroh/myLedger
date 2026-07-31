@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
-use ledger_base::{AccountId, AcctHandle, BudgetGroup, LinkedChainId, Effect, EffectKind, TxId};
+use ledger_base::{AccountId, AcctHandle, BudgetGroup, Effect, EffectKind, LinkedChainId, TxId};
 use ledger_benchkit::{BenchOptions, Samples, STRIDE};
 
 const LEDGER: u32 = 1;

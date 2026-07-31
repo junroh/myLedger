@@ -40,7 +40,10 @@ impl<T, D: Ord + Copy> LaneOrderer<T, D> {
         self.items += 1;
 
         self.pushes = self.pushes.wrapping_add(1);
-        if self.violate_every > 0 && self.pushes.is_multiple_of(self.violate_every) && queue.len() >= 2 {
+        if self.violate_every > 0
+            && self.pushes.is_multiple_of(self.violate_every)
+            && queue.len() >= 2
+        {
             let last = queue.len() - 1;
             queue.swap(last - 1, last);
         }

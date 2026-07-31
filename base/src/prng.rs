@@ -56,9 +56,14 @@ mod tests {
     #[test]
     fn an_exponential_draw_has_the_mean_it_was_asked_for_and_a_tail() {
         let mut prng = Prng::new(11);
-        let draws: Vec<u64> = (0..100_000).map(|_| prng.exponential_nanos(1_000)).collect();
+        let draws: Vec<u64> = (0..100_000)
+            .map(|_| prng.exponential_nanos(1_000))
+            .collect();
         let mean = draws.iter().sum::<u64>() as f64 / draws.len() as f64;
-        assert!((900.0..1_100.0).contains(&mean), "mean was {mean}, asked for 1000");
+        assert!(
+            (900.0..1_100.0).contains(&mean),
+            "mean was {mean}, asked for 1000"
+        );
         assert!(
             draws.iter().any(|&draw| draw > 5_000),
             "no draw reached five times the mean"

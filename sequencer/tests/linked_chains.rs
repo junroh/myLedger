@@ -4,9 +4,9 @@ use std::time::Duration;
 
 use harness::*;
 use ledger_base::{AckOutcome, LedgerError, TransferFlags};
-use ledger_stubkit::LatencyRange;
 use ledger_raft::EchoRaftConfig;
 use ledger_sequencer::LogKind;
+use ledger_stubkit::LatencyRange;
 
 /// Inside a chain a later leg may spend what an earlier leg brings in, which the speculative
 /// overlay alone would refuse.
@@ -18,7 +18,10 @@ fn a_later_leg_spends_what_an_earlier_leg_brings_in() {
 
     let acks = harness.run_chain(&[incoming, outgoing]);
 
-    assert!(acks.iter().all(|ack| ack.outcome == AckOutcome::Committed), "{acks:?}");
+    assert!(
+        acks.iter().all(|ack| ack.outcome == AckOutcome::Committed),
+        "{acks:?}"
+    );
     assert_eq!(harness.columns(ALICE), (FUNDING, FUNDING, 0, 0));
     assert_eq!(harness.columns(BOB), (0, FUNDING, 0, 0));
     harness.assert_consistent();
@@ -35,7 +38,11 @@ fn one_failing_leg_rolls_back_the_whole_chain() {
     let too_big = harness.linked_leg(ALICE, BOB, FUNDING * 10, true);
     let acks = harness.run_chain(&[good, too_big]);
 
-    assert!(acks.iter().all(|ack| matches!(ack.outcome, AckOutcome::Rejected(_))), "{acks:?}");
+    assert!(
+        acks.iter()
+            .all(|ack| matches!(ack.outcome, AckOutcome::Rejected(_))),
+        "{acks:?}"
+    );
     assert_eq!(harness.columns(ALICE), before);
     assert_eq!(harness.columns(BOB), (0, 0, 0, 0));
     harness.assert_consistent();
@@ -57,7 +64,10 @@ fn a_chain_resolves_a_hold_it_created_itself() {
     settle.flags = TransferFlags::POST_PENDING;
 
     let acks = harness.run_chain(&[hold, settle]);
-    assert!(acks.iter().all(|ack| ack.outcome == AckOutcome::Committed), "{acks:?}");
+    assert!(
+        acks.iter().all(|ack| ack.outcome == AckOutcome::Committed),
+        "{acks:?}"
+    );
     assert_eq!(harness.columns(ALICE), (100, FUNDING, 200, 0));
 
     let too_much = harness.resolve(hold.id, ALICE, BOB, 300, TransferFlags::POST_PENDING);
@@ -98,10 +108,18 @@ fn a_hold_still_in_flight_cannot_be_resolved_by_another_submission() {
     harness.submit(settle);
 
     let acks = harness.drain_acks(2, "acks stalled");
-    let outcome = |id| acks.iter().find(|ack| ack.tx_id == id).expect("ack").outcome;
+    let outcome = |id| {
+        acks.iter()
+            .find(|ack| ack.tx_id == id)
+            .expect("ack")
+            .outcome
+    };
     assert_eq!(outcome(hold.id), AckOutcome::Committed);
     assert!(
-        matches!(outcome(settle.id), AckOutcome::Rejected(LedgerError::PendingRefNotFound(_))),
+        matches!(
+            outcome(settle.id),
+            AckOutcome::Rejected(LedgerError::PendingRefNotFound(_))
+        ),
         "{acks:?}"
     );
     assert_eq!(harness.columns(ALICE), (0, FUNDING, 300, 0));
@@ -125,7 +143,11 @@ fn an_unterminated_chain_is_rejected_at_the_batch_boundary() {
     assert!(harness.logged(LogKind::CHAIN_ABORTED));
 
     let after = harness.transfer(ALICE, BOB, 100);
-    assert_eq!(harness.run(after).outcome, AckOutcome::Committed, "lane still gated");
+    assert_eq!(
+        harness.run(after).outcome,
+        AckOutcome::Committed,
+        "lane still gated"
+    );
     assert_eq!(harness.columns(ALICE), (100, FUNDING, 0, 0));
     harness.assert_consistent();
 }

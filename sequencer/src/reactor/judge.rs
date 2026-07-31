@@ -67,7 +67,8 @@ where
         // its own state stops saying a lookup is on the way. The record is not kept anywhere else: the
         // engine owns the copy that outlives this request.
         self.pipeline.set_record(slot, reply.found);
-        self.pending.admit_lookup(reply.pending_ref, reply.found.map(|found| found.remaining));
+        self.pending
+            .admit_lookup(reply.pending_ref, reply.found.map(|found| found.remaining));
         self.release_dep(slot, DepFlags::PENDING);
     }
 

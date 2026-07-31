@@ -73,9 +73,15 @@ pub fn prediction(plan: &Plan, prediction: &Prediction, verdict: Option<Verdict>
         prediction.metrics.proposed_batches,
         prediction.metrics.judged as f64 / prediction.metrics.proposed_batches.max(1) as f64
     );
-    println!("  estimate       the logic is the real reactor's. The per-stage costs are measured by");
-    println!("                 `ledgerfio run --cpu` at one working set on one machine — apply alone");
-    println!("                 costs 3.6ns over a thousand accounts and 21.2ns over eight million, so");
+    println!(
+        "  estimate       the logic is the real reactor's. The per-stage costs are measured by"
+    );
+    println!(
+        "                 `ledgerfio run --cpu` at one working set on one machine — apply alone"
+    );
+    println!(
+        "                 costs 3.6ns over a thousand accounts and 21.2ns over eight million, so"
+    );
     println!("                 another machine or another working set means measuring again and");
     println!("                 passing --cost-*. The components' latencies are declared inputs.");
 }
@@ -177,7 +183,11 @@ pub fn evidence(plan: &Plan, prediction: &Prediction) {
 /// real reactor's. What the storage below keeps of it is that storage's own answer.
 fn sizing(plan: &Plan, prediction: &Prediction) {
     let mb = |bytes: usize| bytes as f64 / 1e6;
-    let total: usize = prediction.footprints.iter().map(|(_, part)| part.bytes()).sum();
+    let total: usize = prediction
+        .footprints
+        .iter()
+        .map(|(_, part)| part.bytes())
+        .sum();
     println!(
         "  memory         {:.1}MB in the reactor and the account store (hash tables approximate)",
         mb(total)
@@ -186,10 +196,21 @@ fn sizing(plan: &Plan, prediction: &Prediction) {
         let parts: Vec<String> = footprint
             .parts()
             .iter()
-            .map(|part| format!("{}={:.1}MB peak {}", part.name, mb(part.bytes), part.peak_entries))
+            .map(|part| {
+                format!(
+                    "{}={:.1}MB peak {}",
+                    part.name,
+                    mb(part.bytes),
+                    part.peak_entries
+                )
+            })
             .collect();
         for (line, group) in parts.chunks(3).enumerate() {
-            let label = if line == 0 { format!("{component}:") } else { String::new() };
+            let label = if line == 0 {
+                format!("{component}:")
+            } else {
+                String::new()
+            };
             println!("                {label:11} {}", group.join("  "));
         }
     }
@@ -201,7 +222,12 @@ fn sizing(plan: &Plan, prediction: &Prediction) {
         .flat_map(|(_, footprint)| footprint.parts())
         .filter(|part| part.fill() >= 0.8)
         .map(|part| {
-            format!("{} at {:.0}% of {}", part.name, part.fill() * 100.0, part.capacity)
+            format!(
+                "{} at {:.0}% of {}",
+                part.name,
+                part.fill() * 100.0,
+                part.capacity
+            )
         })
         .collect();
     if !reached.is_empty() {
@@ -415,12 +441,7 @@ impl Coverage {
         println!(
             "           fences {} exempt {} lookups {} overlay evicted {} store reads {} \
              index overflows {}",
-            self.fences,
-            self.exempt,
-            self.lookups,
-            self.evicted,
-            self.store_reads,
-            self.overflowed
+            self.fences, self.exempt, self.lookups, self.evicted, self.store_reads, self.overflowed
         );
         println!(
             "           seq gaps {} stale answers {} quarantines {} refused commits {} \

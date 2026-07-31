@@ -9,7 +9,9 @@ pub struct Clock {
 
 impl Clock {
     pub fn new() -> Self {
-        Self { origin: Instant::now() }
+        Self {
+            origin: Instant::now(),
+        }
     }
 
     pub fn nanos(&self) -> u64 {

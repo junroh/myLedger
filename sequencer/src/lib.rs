@@ -35,4 +35,7 @@ use ledger_base::{layouts_are_sound, TypeLayout};
 /// Declared and checked at each struct; gathered here for reporting.
 pub const HOT_TYPES: &[TypeLayout] = &[state::pipeline::LAYOUT, state::lane::LAYOUT];
 
-const _: () = assert!(layouts_are_sound(HOT_TYPES), "a watched type broke its layout contract");
+const _: () = assert!(
+    layouts_are_sound(HOT_TYPES),
+    "a watched type broke its layout contract"
+);

@@ -17,7 +17,11 @@ pub struct Request {
 
 impl Request {
     pub const fn single(tx: Transfer, submitted_at_nanos: u64) -> Self {
-        Self { tx, submitted_at_nanos, end_of_batch: true }
+        Self {
+            tx,
+            submitted_at_nanos,
+            end_of_batch: true,
+        }
     }
 }
 

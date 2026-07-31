@@ -10,6 +10,18 @@ This covers refactors, renames and fixes noticed along the way, not just new fea
 measuring, and running the tools need no permission; changing a file does. When a question is being
 discussed, the answer is the reasoning, not a commit.
 
+## Agent working context
+
+`CLAUDE.md` is the canonical source for agent guidance. Keep project rules, architecture constraints,
+verification commands, and document conventions here; do not duplicate them in agent-specific files.
+When agent guidance needs to change, update this file and keep `AGENTS.md` as a pointer only.
+
+Before starting work, read this file and `docs/status.md`. Then read only the documents the task calls
+for: `docs/glossary.md` for terminology, `docs/request-flow.md` for pipeline changes,
+`docs/design-notes.md` for the relevant design decision, `docs/scenario-coverage.md` for supported
+behaviour, and `docs/tools.md` before choosing a measurement or simulation. `docs/status.md` is the
+source of truth for current work and outstanding gaps.
+
 ## Coding rules
 
 1. **DRY.** A rule lives in exactly one place. Exception: the four transfer kinds (single-phase / hold / settle / void) stay explicit branches in the S3-judge and S5-apply hot paths. Share the *delta rule*, not the branching.
@@ -99,9 +111,9 @@ them. These four rules are those bugs generalised.
 
 Cache layout is a build-time contract, not a convention:
 
-- Every watched type **declares how it sits against the cache line** and the build checks the claim: `LineFit::Inside` (fits in a line and is aligned so an array never crosses one), `LineFit::WholeLines` (starts on a line, occupies whole ones), or `LineFit::Straddles(reason)` — an exception that has to say why. Breaking a claim fails the build, and `ledgerfio layout` prints the claim next to the size.
+- Every watched type **declares how it sits against the cache line** and the build checks the claim: `LineFit::Inside` (fits in every supported line and is aligned so an array never crosses one), `LineFit::WholeLines` (starts on and occupies whole lines on the selected build target), or `LineFit::Straddles(reason)` — an exception that has to say why. Breaking a claim fails the build, and `ledgerfio layout` prints the claim next to the size.
 - Prefer `Inside` for small hot state: it cannot straddle and costs a fraction of a whole line per value. `WholeLines` is for random-access state too big for one line, and for cross-thread isolation (`CachePadded`). Exceptions are measured before being taken — see design notes §5.
-- `CACHE_LINE` and the `cache_aligned!` macro in `ledger-base` are the only place alignment is expressed. `repr(align(..))` accepts literals only, so it is written once inside the macro.
+- `CACHE_LINE` and the `cache_aligned!` macro in `ledger-base` are the only place alignment is expressed. The workspace Cargo configuration selects 128 bytes for Apple Silicon; x86 and generic ARM64 select 64 bytes unless a verified ARM64 deployment changes that central target configuration. `repr(align(..))` accepts literals only, so it is written once inside the macro.
 - `cache_aligned!` emits const assertions (`size_of <= CACHE_LINE`, `align_of == CACHE_LINE`). Adding a field that overflows the line **fails the build** instead of silently regressing throughput.
 - Each crate lists the hot types it owns in its own `HOT_TYPES` with a size budget; `ledgerfio layout` prints them all.
 - Field access stays local: hot structs keep private fields and expose semantic methods, so a layout change (e.g. AoS to SoA) touches its owning module only.
@@ -145,7 +157,7 @@ read from different runs. `--slo-p999` turns a run into a check (exit 1 on failu
 
 15. **Do not rebuild what exists.** Write it here only when it is the performance contract or a design invariant, and say which:
 
-- **Hand-rolled on purpose.** The cache padding and the layout claims: alignment is expressed in one macro at the target's own line size, and every claim is checked against all of `SUPPORTED_LINES`, so a claim that holds here holds on the other targets — which is the part a padding wrapper does not give; the `Clock` seam, because a test that waits on real time is not a test; the fixed-size log event ring, because logging may not allocate on the reactor's thread; the small buffer pool; and the stand-in machinery in `stubkit`, which exists to be deleted.
+- **Hand-rolled on purpose.** The cache padding and the layout claims: alignment is expressed in one macro at the target's own line size; `Inside` claims are checked against all of `SUPPORTED_LINES`, while deliberately padded `WholeLines` claims are checked against the selected target line. That preserves portable packed state without paying another target's padding cost — which is the part a padding wrapper does not give; the `Clock` seam, because a test that waits on real time is not a test; the fixed-size log event ring, because logging may not allocate on the reactor's thread; the small buffer pool; and the stand-in machinery in `stubkit`, which exists to be deleted.
 - **Replaced by a crate.** Latency quantiles (`hdrhistogram`, after the hand-rolled buckets were found to over-report p99.9 in the load driver's own runs), argument parsing (`lexopt`), signal handling (`signal-hook`, which registers through `sigaction` — the raw `signal()` it replaced can reset its own handler after the first signal), the hasher (`rustc-hash`, which is what the hand-written one was a copy of), and the load driver's JSON line (`serde`, so a new field cannot land in the wrong place). Consensus, io_uring and any wire format go the same way when those paths become real.
 - **Serialisation belongs to whoever has a wire.** `serde` is a dependency of the load driver, not of the crates it measures: the JSON shape is that tool's output format, not the ledger's.
 - **Weighed and refused.** A hardware profile for the simulator (`ns = cycles/freq + misses × dram_latency`, the shape the Python model uses): measuring its own inputs refuted the form, because the stages' misses overlap and the formula prices each at full latency. What replaces it is the measured curve of cost against working set, plus `--cost-*` for another machine and `--cost-scale` for one nobody can run. Design notes §10 has the numbers and the conditions.

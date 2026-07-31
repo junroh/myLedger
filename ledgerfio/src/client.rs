@@ -12,7 +12,11 @@ pub struct Client {
 
 impl Client {
     pub fn new(requests: Producer<Request>, acks: Consumer<Ack>) -> Self {
-        Self { requests, acks, clock: Clock::new() }
+        Self {
+            requests,
+            acks,
+            clock: Clock::new(),
+        }
     }
 
     /// A standalone transfer. A linked leg cannot go this way: a chain has to arrive as one

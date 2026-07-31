@@ -111,7 +111,11 @@ impl<T> Orderer<T> {
         // An exempt reply has no place to wait behind, and one that is its lane's next may leave at
         // once; anything either of them then waits is delivery, not order.
         let blocked = seq != UNORDERED && seq != entry.next;
-        let held = Held { ready_at, value, blocked };
+        let held = Held {
+            ready_at,
+            value,
+            blocked,
+        };
         if seq == UNORDERED {
             entry.exempt.push_back(held);
             self.held += 1;
@@ -185,7 +189,9 @@ impl<T> Orderer<T> {
             .rotation
             .iter()
             .filter(|lane| {
-                self.lanes.get(lane).is_some_and(|lane| lane.release_seq().is_some())
+                self.lanes
+                    .get(lane)
+                    .is_some_and(|lane| lane.release_seq().is_some())
             })
             .count();
         self.held.saturating_sub(releasable)
@@ -310,7 +316,10 @@ mod tests {
         orderer.expect(LANE, 5);
 
         orderer.fill(LANE, 5, 10, "second");
-        assert!(orderer.pop_ready(1_000).is_none(), "the later place left first");
+        assert!(
+            orderer.pop_ready(1_000).is_none(),
+            "the later place left first"
+        );
 
         orderer.fill(LANE, 4, 20, "first");
         assert_eq!(orderer.pop_ready(1_000), Some("first"));
@@ -341,7 +350,10 @@ mod tests {
         let mut orderer: Orderer<&str> = Orderer::new(0);
         orderer.expect(LANE, 1);
         orderer.fill(LANE, 1, 500, "first");
-        assert!(orderer.pop_ready(499).is_none(), "released before it was finished");
+        assert!(
+            orderer.pop_ready(499).is_none(),
+            "released before it was finished"
+        );
         assert_eq!(orderer.next_due(), Some(500));
         assert_eq!(orderer.pop_ready(500), Some("first"));
     }
@@ -372,7 +384,11 @@ mod tests {
         orderer.expect(LANE, 5);
         orderer.expect(LANE, 6);
         orderer.fill(LANE, 6, 0, "out of turn");
-        assert_eq!(orderer.pop_ready(1), Some("out of turn"), "the fault did not fire");
+        assert_eq!(
+            orderer.pop_ready(1),
+            Some("out of turn"),
+            "the fault did not fire"
+        );
     }
 
     /// An order-exempt reply keeps no place, so it never waits for one — and it does not disturb the

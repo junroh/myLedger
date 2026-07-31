@@ -151,7 +151,8 @@ where
             reads_hold || (ordered && self.lanes.get(debit_account).awaits_pending_reply());
         // Only an ordered reply is counted, because the counter is what decides whether a later request
         // must fence — and nothing needs to queue behind a reply that holds no place.
-        if ordered && needs_pending_reply && !self.lanes.get_mut(debit_account).has_reply_capacity() {
+        if ordered && needs_pending_reply && !self.lanes.get_mut(debit_account).has_reply_capacity()
+        {
             return Err(LedgerError::Overloaded);
         }
         let Some(slot) = self.pipeline.alloc() else {
@@ -251,8 +252,8 @@ where
     /// Decides what the pending path owes this request and does it. False means an external queue
     /// refused: nothing has been counted or pinned, so the retry is clean.
     fn take_pending_step(&mut self, slot: SlotId, item: &WorkItem) -> bool {
-        let needs_record = item.kind.needs_pending_lookup()
-            && !self.pending.hold_is_missing(item.tx.pending_ref);
+        let needs_record =
+            item.kind.needs_pending_lookup() && !self.pending.hold_is_missing(item.tx.pending_ref);
         let waiting = self.lanes.get(item.debit).awaits_pending_reply();
         match PendingStep::of(needs_record, waiting) {
             PendingStep::Lookup => {
@@ -269,7 +270,8 @@ where
                 self.pending.begin_lookup(item.tx.pending_ref);
                 // The answer has to reflect every decision the engine has already been given. Recorded
                 // now, because now is when "already" is defined.
-                self.pipeline.expect_applies(slot, self.pending.applies_sent());
+                self.pipeline
+                    .expect_applies(slot, self.pending.applies_sent());
                 if item.keeps_lane_place() {
                     self.lanes.get_mut(item.debit).expect_pending_reply();
                 }

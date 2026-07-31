@@ -17,9 +17,13 @@ const LEDGER: u32 = 1;
 fn main() {
     let accounts = account_count();
     let started = LedgerService::start(
-        ServiceConfig { log_to_stderr: true, ..ServiceConfig::default() },
+        ServiceConfig {
+            log_to_stderr: true,
+            ..ServiceConfig::default()
+        },
         open_accounts(accounts),
-        MemoryPending::start(MemoryPendingConfig::default()).expect("the default engine config is valid"),
+        MemoryPending::start(MemoryPendingConfig::default())
+            .expect("the default engine config is valid"),
         MemoryDedup::start(MemoryDedupConfig::default()),
         EchoRaft::start(EchoRaftConfig::default()),
     );
@@ -65,7 +69,10 @@ fn account_count() -> u64 {
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--accounts" {
-            return args.next().and_then(|value| value.parse().ok()).unwrap_or(DEFAULT_ACCOUNTS);
+            return args
+                .next()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(DEFAULT_ACCOUNTS);
         }
     }
     DEFAULT_ACCOUNTS
@@ -75,7 +82,11 @@ fn open_accounts(count: u64) -> MemoryAccounts {
     let mut accounts = MemoryAccounts::with_capacity(count as usize + 1);
     accounts.open(EXTERNAL, LEDGER, AccountFlags::NONE);
     for index in 0..count {
-        accounts.open(AccountId(FIRST_ACCOUNT + index), LEDGER, AccountFlags::CONSTRAINED);
+        accounts.open(
+            AccountId(FIRST_ACCOUNT + index),
+            LEDGER,
+            AccountFlags::CONSTRAINED,
+        );
     }
     accounts
 }

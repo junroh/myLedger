@@ -282,6 +282,10 @@ mod tests {
         assert_eq!(drops.load(Ordering::Relaxed), 1);
 
         drop((tx, rx));
-        assert_eq!(drops.load(Ordering::Relaxed), 3, "the ring dropped what was left");
+        assert_eq!(
+            drops.load(Ordering::Relaxed),
+            3,
+            "the ring dropped what was left"
+        );
     }
 }

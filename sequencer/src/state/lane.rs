@@ -33,7 +33,6 @@ pub struct LaneState {
 
 ledger_base::layout_claim!(LAYOUT: LaneState, size = 32, ledger_base::LineFit::Inside);
 
-
 impl LaneState {
     /// Capped so the counter cannot wrap and under-report, which would break lane ordering.
     pub const MAX_PENDING_REPLIES: u16 = u16::MAX;
@@ -141,13 +140,21 @@ impl LaneTable {
     pub fn footprint(&self, footprint: &mut Footprint) {
         let live = self.lanes.len();
         // One per account and no ceiling, so nothing to compare a peak against.
-        footprint.other("lane state", live, live, 0, self.lanes.capacity() * size_of::<LaneState>());
+        footprint.other(
+            "lane state",
+            live,
+            live,
+            0,
+            self.lanes.capacity() * size_of::<LaneState>(),
+        );
     }
 }
 
 impl LaneTable {
     pub fn with_capacity(capacity: usize) -> Self {
-        Self { lanes: Vec::with_capacity(capacity) }
+        Self {
+            lanes: Vec::with_capacity(capacity),
+        }
     }
 
     pub fn get(&self, handle: AcctHandle) -> &LaneState {
@@ -196,7 +203,13 @@ mod tests {
         let second = lane.issue_seq();
         assert_eq!((first, second), (1, 2));
 
-        assert_eq!(lane.accept_seq(second), Err(LedgerError::SeqGap { expected: 1, got: 2 }));
+        assert_eq!(
+            lane.accept_seq(second),
+            Err(LedgerError::SeqGap {
+                expected: 1,
+                got: 2
+            })
+        );
         assert_eq!(lane.last_seq(), 0, "a gap must not move the lane on");
         assert_eq!(lane.accept_seq(first), Ok(()));
         assert_eq!(lane.accept_seq(second), Ok(()));
@@ -213,12 +226,19 @@ mod tests {
         lane.issue_seq();
         lane.quarantine();
 
-        assert_eq!(lane.release_quarantine(), Err(LedgerError::QuarantineDraining));
+        assert_eq!(
+            lane.release_quarantine(),
+            Err(LedgerError::QuarantineDraining)
+        );
         assert!(lane.is_quarantined());
 
         lane.left();
         assert_eq!(lane.release_quarantine(), Ok(()));
         assert!(!lane.is_quarantined());
-        assert_eq!(lane.issue_seq(), 2, "issuance restarts from the last judged seq");
+        assert_eq!(
+            lane.issue_seq(),
+            2,
+            "issuance restarts from the last judged seq"
+        );
     }
 }

@@ -17,7 +17,11 @@ pub struct Samples {
 
 impl Samples {
     pub fn new(name: String, ops: u64) -> Self {
-        Self { name, ops, elapsed: Vec::new() }
+        Self {
+            name,
+            ops,
+            elapsed: Vec::new(),
+        }
     }
 
     pub fn add(&mut self, elapsed: Duration) {
@@ -53,7 +57,10 @@ pub struct BenchOptions {
 
 impl BenchOptions {
     pub fn from_args() -> Self {
-        let mut options = Self { repeat: 3, pin: None };
+        let mut options = Self {
+            repeat: 3,
+            pin: None,
+        };
         let args: Vec<String> = std::env::args().skip(1).collect();
         for index in 0..args.len() {
             let value = args.get(index + 1).and_then(|text| text.parse().ok());

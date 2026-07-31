@@ -3,9 +3,9 @@ mod harness;
 use std::time::Duration;
 
 use ledger_base::{AckOutcome, LedgerError};
-use ledger_stubkit::LatencyRange;
 use ledger_raft::EchoRaftConfig;
 use ledger_sequencer::{Capacity, ReactorConfig};
+use ledger_stubkit::LatencyRange;
 
 use harness::*;
 
@@ -17,7 +17,10 @@ fn a_full_slot_pool_refuses_new_requests() {
     let slots = 4;
     let mut harness = Harness::with_config(
         ReactorConfig {
-            capacity: Capacity { slots, ..ReactorConfig::default().capacity },
+            capacity: Capacity {
+                slots,
+                ..ReactorConfig::default().capacity
+            },
             ..ReactorConfig::default()
         },
         NoLatency::pending(),
@@ -42,7 +45,11 @@ fn a_full_slot_pool_refuses_new_requests() {
     assert_eq!(harness.reactor.metrics().slot_exhaustion as usize, refused);
 
     let after = harness.transfer(EXTERNAL, ALICE, 10);
-    assert_eq!(harness.run(after).outcome, AckOutcome::Committed, "slots never came back");
+    assert_eq!(
+        harness.run(after).outcome,
+        AckOutcome::Committed,
+        "slots never came back"
+    );
     harness.assert_consistent();
 }
 
@@ -79,6 +86,9 @@ fn a_client_that_stops_reading_pauses_intake() {
     });
 
     let acks = harness.drain_acks(queue * 2, "acks stalled once the client resumed");
-    assert!(acks.iter().all(|ack| ack.outcome == AckOutcome::Committed), "{acks:?}");
+    assert!(
+        acks.iter().all(|ack| ack.outcome == AckOutcome::Committed),
+        "{acks:?}"
+    );
     harness.assert_consistent();
 }

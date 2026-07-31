@@ -3,10 +3,10 @@ mod harness;
 use std::time::Duration;
 
 use ledger_base::{AckOutcome, LedgerError, TransferFlags};
-use ledger_stubkit::LatencyRange;
-use ledger_raft::EchoRaftConfig;
 use ledger_pending::MemoryPendingConfig;
+use ledger_raft::EchoRaftConfig;
 use ledger_sequencer::{ReactorConfig, SafetyPolicy};
+use ledger_stubkit::LatencyRange;
 
 use harness::*;
 
@@ -16,9 +16,15 @@ use harness::*;
 fn an_out_of_order_reply_quarantines_the_lane() {
     let harness = with_swapped_replies(3);
 
-    assert!(harness.reactor.metrics().seq_gaps > 0, "gap must be detected");
+    assert!(
+        harness.reactor.metrics().seq_gaps > 0,
+        "gap must be detected"
+    );
     assert_eq!(harness.reactor.quarantined(), &[ALICE]);
-    assert!(!harness.reactor.is_fail_stopped(), "one lane is not the component");
+    assert!(
+        !harness.reactor.is_fail_stopped(),
+        "one lane is not the component"
+    );
 }
 
 /// Quarantine is recoverable: once the lane has drained an operator can release it, and the account
@@ -28,7 +34,10 @@ fn a_drained_lane_can_be_released_and_used_again() {
     let mut harness = with_swapped_replies(3);
     harness.tick_until("lane never drained", |reactor| reactor.is_quiescent());
 
-    harness.reactor.release_quarantine(ALICE).expect("drained lane");
+    harness
+        .reactor
+        .release_quarantine(ALICE)
+        .expect("drained lane");
     assert!(harness.reactor.quarantined().is_empty());
 
     let tx = harness.transfer(ALICE, BOB, 10);
@@ -44,11 +53,20 @@ fn enough_quarantined_lanes_fail_stop_the_sequencer() {
     assert!(harness.reactor.is_fail_stopped());
 
     let refused = harness.transfer(BOB, ALICE, 1);
-    assert_eq!(harness.run(refused).outcome, AckOutcome::Rejected(LedgerError::FailStop));
+    assert_eq!(
+        harness.run(refused).outcome,
+        AckOutcome::Rejected(LedgerError::FailStop)
+    );
 
     harness.tick_until("never drained", |reactor| reactor.is_quiescent());
-    harness.reactor.clear_fail_stop().expect("nothing left in flight");
-    harness.reactor.release_quarantine(ALICE).expect("drained lane");
+    harness
+        .reactor
+        .clear_fail_stop()
+        .expect("nothing left in flight");
+    harness
+        .reactor
+        .release_quarantine(ALICE)
+        .expect("drained lane");
 
     let tx = harness.transfer(ALICE, BOB, 10);
     assert_eq!(harness.run(tx).outcome, AckOutcome::Committed);
@@ -78,8 +96,14 @@ fn a_request_that_needs_no_balance_check_overtakes_the_pending_path() {
     harness.submit(overtaking);
 
     let acks = harness.drain_acks(2, "acks stalled");
-    assert_eq!(acks[0].tx_id, overtaking.id, "the exempt request waited for the lookup");
-    assert!(acks.iter().all(|ack| ack.outcome == AckOutcome::Committed), "{acks:?}");
+    assert_eq!(
+        acks[0].tx_id, overtaking.id,
+        "the exempt request waited for the lookup"
+    );
+    assert!(
+        acks.iter().all(|ack| ack.outcome == AckOutcome::Committed),
+        "{acks:?}"
+    );
     assert_eq!(harness.reactor.metrics().fences, 0);
     // The hold, the settle and the transfer: every one of them debits an account with no balance to
     // protect, and the settle is the one that used to be ordered anyway.
@@ -114,7 +138,10 @@ fn an_answer_from_before_a_decision_the_engine_was_given_quarantines_the_lane() 
         harness.run(settle);
     }
 
-    assert!(harness.reactor.metrics().stale_answers > 0, "the stale answer was believed");
+    assert!(
+        harness.reactor.metrics().stale_answers > 0,
+        "the stale answer was believed"
+    );
     assert_eq!(harness.reactor.quarantined(), &[ALICE]);
     harness.assert_consistent();
 }
@@ -137,7 +164,10 @@ fn clearing_fail_stop_waits_for_consensus() {
         reactor.backpressure().batches_in_flight > 0
     });
 
-    assert_eq!(harness.reactor.clear_fail_stop(), Err(LedgerError::QuarantineDraining));
+    assert_eq!(
+        harness.reactor.clear_fail_stop(),
+        Err(LedgerError::QuarantineDraining)
+    );
 
     harness.drain_acks(1, "the batch never committed");
     harness.tick_until("never drained", |reactor| reactor.is_quiescent());
@@ -150,7 +180,9 @@ fn clearing_fail_stop_waits_for_consensus() {
 fn with_swapped_replies(fail_stop_after: usize) -> Harness {
     let mut harness = Harness::with_config(
         ReactorConfig {
-            safety: SafetyPolicy { quarantine_fail_stop: fail_stop_after },
+            safety: SafetyPolicy {
+                quarantine_fail_stop: fail_stop_after,
+            },
             ..ReactorConfig::default()
         },
         // Long enough that both replies are queued before either is delivered.

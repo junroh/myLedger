@@ -277,8 +277,7 @@ impl RunReport {
     fn print_pending(&self) {
         println!(
             "  pending       lookups={} overlay evicted={}",
-            self.metrics.pending_lookups,
-            self.metrics.holds_evicted
+            self.metrics.pending_lookups, self.metrics.holds_evicted
         );
         println!(
             "  chains        judged={} rejected={} aborted={} fences={} lane-gated={} exempt={}",
@@ -309,19 +308,32 @@ impl RunReport {
         println!(
             "  memory        {:.1}MB held{}",
             mb(total),
-            if exact { "" } else { " (hash tables from their bucket count, so approximate)" }
+            if exact {
+                ""
+            } else {
+                " (hash tables from their bucket count, so approximate)"
+            }
         );
         for (component, footprint) in &self.footprints {
             let parts: Vec<String> = footprint
                 .parts()
                 .iter()
                 .map(|part| {
-                    format!("{}={:.1}MB peak {}", part.name, mb(part.bytes), part.peak_entries)
+                    format!(
+                        "{}={:.1}MB peak {}",
+                        part.name,
+                        mb(part.bytes),
+                        part.peak_entries
+                    )
                 })
                 .collect();
             // Three to a line: the sequencer alone has eight parts, and one long line hides them.
             for (line, group) in parts.chunks(3).enumerate() {
-                let label = if line == 0 { format!("{component}:") } else { String::new() };
+                let label = if line == 0 {
+                    format!("{component}:")
+                } else {
+                    String::new()
+                };
                 println!("                {label:15} {}", group.join("  "));
             }
         }
@@ -333,7 +345,14 @@ impl RunReport {
             .iter()
             .flat_map(|(_, footprint)| footprint.parts())
             .filter(|part| part.fill() >= 0.8)
-            .map(|part| format!("{} at {:.0}% of {}", part.name, part.fill() * 100.0, part.capacity))
+            .map(|part| {
+                format!(
+                    "{} at {:.0}% of {}",
+                    part.name,
+                    part.fill() * 100.0,
+                    part.capacity
+                )
+            })
             .collect();
         if !reached.is_empty() {
             println!("                ceilings reached: {}", reached.join(", "));
@@ -372,7 +391,9 @@ impl RunReport {
         // nothing at all. One total would read as occupancy, which is the line below.
         println!(
             "  engine told   create={} reduce={} remove={}",
-            self.metrics.pending_creates, self.metrics.pending_reduces, self.metrics.pending_removes
+            self.metrics.pending_creates,
+            self.metrics.pending_reduces,
+            self.metrics.pending_removes
         );
         // What the writeback buffer is for, as a number. A record resolved before its block is
         // compacted never reaches the store, so what the store has to hold is holds *alive* rather than
@@ -381,7 +402,11 @@ impl RunReport {
         // the store is a disk.
         let traffic = self.pending_traffic;
         let share = |part: u64, whole: u64| {
-            if whole == 0 { 0.0 } else { part as f64 / whole as f64 * 100.0 }
+            if whole == 0 {
+                0.0
+            } else {
+                part as f64 / whole as f64 * 100.0
+            }
         };
         println!(
             "  engine log    appended={} ({:.1}MB) died in buffer={} ({:.0}%) carried on={} \
@@ -478,7 +503,11 @@ impl RunReport {
             self.totals.debits_pending,
             self.totals.credits_pending,
             self.overlay,
-            if self.identities_hold() { "ok" } else { "BROKEN" }
+            if self.identities_hold() {
+                "ok"
+            } else {
+                "BROKEN"
+            }
         );
         if let Some(target) = self.slo_p999 {
             println!(
@@ -601,7 +630,11 @@ mod tests {
             reject_kinds: BTreeMap::from([("InsufficientBalance", 6u64)]),
             latency: LatencySummary::from(&histogram),
             batch_latency: Some(LatencySummary::from(&histogram)),
-            metrics: Metrics { ticks: 42, seq_gaps: 0, ..Metrics::default() },
+            metrics: Metrics {
+                ticks: 42,
+                seq_gaps: 0,
+                ..Metrics::default()
+            },
             stages: StageTimes::default(),
             profiled: false,
             slo_p999: None,
@@ -642,7 +675,10 @@ mod tests {
             "the quantiles are out of order"
         );
         assert_eq!(
-            parsed["throughput_tps"].as_f64().expect("throughput").round(),
+            parsed["throughput_tps"]
+                .as_f64()
+                .expect("throughput")
+                .round(),
             (990.0 / 2.5f64).round()
         );
     }

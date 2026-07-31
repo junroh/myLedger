@@ -4,7 +4,7 @@ mod judge;
 
 use ledger_base::ports::{AccountPort, IdempotencyPort, PendingPort, RaftPort};
 use ledger_base::{
-    Ack, AccountId, AckOutcome, AcctHandle, Amount, Clock, Consumer, Effect, EffectKind, Footprint,
+    AccountId, AcctHandle, Ack, AckOutcome, Amount, Clock, Consumer, Effect, EffectKind, Footprint,
     LedgerError, LogSink, LogStream, Producer, Request, SystemClock,
 };
 
@@ -276,7 +276,10 @@ where
 
     /// The log sink counts what it had to drop, so the count is read here rather than kept twice.
     pub fn metrics(&self) -> Metrics {
-        Metrics { log_drops: self.log.dropped(), ..self.metrics }
+        Metrics {
+            log_drops: self.log.dropped(),
+            ..self.metrics
+        }
     }
 
     /// Zero unless the run asked for profiling.
@@ -480,13 +483,13 @@ where
 
     /// Both overlays are taken together: availability the lane promises, and the hold remainder the
     /// engine sets aside. One without the other leaks a promise nobody will give back.
-    pub(super) fn take_overlays(&mut self, effect: &Effect) {
+    pub fn take_overlays(&mut self, effect: &Effect) {
         self.lanes.reserve(effect);
         self.reserve_hold(effect);
     }
 
     /// The decision did not survive, so both are given back.
-    pub(super) fn give_back_overlays(&mut self, effect: &Effect) {
+    pub fn give_back_overlays(&mut self, effect: &Effect) {
         self.lanes.release(effect);
         self.compensate_hold(effect);
     }
@@ -494,10 +497,11 @@ where
     /// The decision committed, which is not symmetrical: the lane's promise is released, while the
     /// hold's reservation stops being speculative and what the hold has left now follows the write
     /// the engine is sent.
-    pub(super) fn settle_overlays(&mut self, effect: &Effect) {
+    pub fn settle_overlays(&mut self, effect: &Effect) {
         self.lanes.release(effect);
         if matches!(effect.kind, EffectKind::Settle | EffectKind::Void) {
-            self.pending.release_reservation(effect.pending_ref, effect.amount);
+            self.pending
+                .release_reservation(effect.pending_ref, effect.amount);
         }
     }
 

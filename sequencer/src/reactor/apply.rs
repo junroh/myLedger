@@ -99,7 +99,11 @@ where
                 // a follower replaying the same log stops in the same place, and this node has to
                 // be replaced.
                 if self.safety.seal_applies() {
-                    self.record(LogKind::APPLY_FAILED, self.metrics.committed, err.name().len() as u64);
+                    self.record(
+                        LogKind::APPLY_FAILED,
+                        self.metrics.committed,
+                        err.name().len() as u64,
+                    );
                 }
                 return;
             }

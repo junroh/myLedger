@@ -22,7 +22,16 @@ impl LogSink {
     /// Never blocks and never grows: if nobody is draining, the event is counted and dropped.
     /// Losing a log line must not slow the ledger down.
     pub fn record(&mut self, kind: u16, at_nanos: u64, a: u64, b: u64) {
-        if self.events.push(LogEvent { kind, at_nanos, a, b }).is_err() {
+        if self
+            .events
+            .push(LogEvent {
+                kind,
+                at_nanos,
+                a,
+                b,
+            })
+            .is_err()
+        {
             self.dropped += 1;
         }
     }
@@ -44,5 +53,11 @@ impl LogStream {
 
 pub fn log_channel(capacity: usize) -> (LogSink, LogStream) {
     let (sink, stream) = spsc::channel(capacity);
-    (LogSink { events: sink, dropped: 0 }, LogStream { events: stream })
+    (
+        LogSink {
+            events: sink,
+            dropped: 0,
+        },
+        LogStream { events: stream },
+    )
 }

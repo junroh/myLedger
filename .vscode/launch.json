@@ -1,0 +1,80 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "ledgerd: Run",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/ledgerd",
+      "args": [
+        "--accounts",
+        "1000"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopOnEntry": false,
+      "preLaunchTask": "cargo: build ledgerd"
+    },
+    {
+      "name": "ledgerd: Debug",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/debug/ledgerd",
+      "args": [
+        "--accounts",
+        "1000"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopOnEntry": true,
+      "preLaunchTask": "cargo: build ledgerd"
+    },
+    {
+      "name": "ledgerfio: Run workload",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/release/ledgerfio",
+      "args": [
+        "run",
+        "--workload",
+        "hold-settle",
+        "--duration",
+        "3s",
+        "--accounts",
+        "100000"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopOnEntry": false,
+      "preLaunchTask": "cargo: build ledgerfio"
+    },
+    {
+      "name": "ledgerfio: Layout",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/release/ledgerfio",
+      "args": [
+        "layout"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopOnEntry": false,
+      "preLaunchTask": "cargo: build ledgerfio"
+    },
+    {
+      "name": "ledgersim: Check",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/target/release/ledgersim",
+      "args": [
+        "check",
+        "--seeds",
+        "16"
+      ],
+      "cwd": "${workspaceFolder}",
+      "console": "integratedTerminal",
+      "stopOnEntry": false,
+      "preLaunchTask": "cargo: build ledgersim"
+    }
+  ]
+}
