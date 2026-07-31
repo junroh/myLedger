@@ -207,7 +207,7 @@ fn bookkeeping_that_stops_adding_up_seals_the_apply_path() {
         },
         ledger_sequencer::Transport { requests: request_rx, acks: ack_tx },
         Forgetful(accounts),
-        ledger_pending::MemoryPending::start(NoLatency::pending()),
+        ledger_pending::MemoryPending::start(NoLatency::pending()).expect("a test engine config"),
         ledger_idempotency::MemoryDedup::start(NoLatency::idem()),
         ledger_raft::EchoRaft::start(NoLatency::raft()),
     )

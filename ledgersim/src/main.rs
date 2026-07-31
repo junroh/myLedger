@@ -102,9 +102,11 @@ fn default_plan() -> Plan {
         poisson: true,
         batches_in_flight: 8,
         cost_percent: 100,
+        flush_blocks: ledger_pending::DEFAULT_FLUSH_BLOCKS,
+        resident_blocks: ledger_pending::DEFAULT_RESIDENT_BLOCKS,
+        resolve_after: 0,
         // What share of resolutions the pending engine answers from memory. Declared: how many entries
         // that takes is that component's own question.
-        pending_hit_percent: 80,
     }
 }
 
@@ -131,7 +133,6 @@ fn apply(options: &mut Options, key: &str, value: &str) -> Result<(), String> {
         "pending-us" => plan.pending_nanos = micros(value)?,
         "pending-tail-us" => plan.pending_tail_nanos = micros(value)?,
         "pending-rate" => plan.pending_rate = number(key, value)?,
-        "pending-hit" => plan.pending_hit_percent = number(key, value)?.min(100),
         "idem-us" => plan.idem_nanos = micros(value)?,
         "raft-us" => plan.raft_nanos = micros(value)?,
         "raft-tail-us" => plan.raft_tail_nanos = micros(value)?,
@@ -150,6 +151,9 @@ fn apply(options: &mut Options, key: &str, value: &str) -> Result<(), String> {
         "cost-propose" => plan.costs.propose_ns = number(key, value)? as f64,
         "cost-apply" => plan.costs.apply_ns = number(key, value)? as f64,
         "cost-scale" => plan.cost_percent = number(key, value)?.max(1),
+        "flush-blocks" => plan.flush_blocks = number(key, value)?.max(1) as usize,
+        "resident-blocks" => plan.resident_blocks = number(key, value)? as usize,
+        "resolve-after" => plan.resolve_after = number(key, value)? as usize,
         "slo-p999-us" => options.slo_nanos = Some(micros(value)?),
         other => return Err(format!("unknown option `--{other}`")),
     }
@@ -396,10 +400,9 @@ impl Solve {
             }
         };
         format!(
-            "pending engine {} at {}/s answering {}% from memory, consensus {}, dedup {}, client qd {}",
+            "pending engine {} at {}/s, consensus {}, dedup {}, client qd {}",
             latency(matches!(self, Self::Pending), plan.pending_nanos),
             plan.pending_rate,
-            plan.pending_hit_percent,
             latency(matches!(self, Self::Raft), plan.raft_nanos),
             latency(matches!(self, Self::Idem), plan.idem_nanos),
             plan.queue_depth
@@ -461,7 +464,6 @@ fn help() {
     println!("  --slo-p999-us <n>   the tail it has to hold (5000)");
     println!("  --solve <component> which latency is the unknown: pending, raft or idem (pending)");
     println!("  --pending-us <n>    the pending engine's answer time, when solving for another (1000)");
-    println!("  --pending-hit <pct> resolutions the pending engine answers from memory (80)");
     println!("  --pending-rate <n>  a candidate ceiling to check, 0 for no limit (0)");
     println!("  --raft-us <n>       consensus round trip (10000)");
     println!("  --qd <n>            the client's queue depth (20000)");
@@ -476,7 +478,6 @@ fn help() {
     println!("  --pending-us <n>    what the pending engine answers a command in (1000)");
     println!("  --pending-tail-us <n> mean of its tail, which is what reorders answers (200)");
     println!("  --pending-rate <n>  commands a second it can answer, 0 for no limit (0)");
-    println!("  --pending-hit <pct> resolutions it answers from memory (80)");
     println!("  --raft-tail-us <n>  mean of the consensus tail (3000)");
     println!("  --skew <n>          account concentration, 1 is uniform (1)");
     println!("  --arrivals <kind>   poisson or smooth (poisson)");
@@ -489,6 +490,10 @@ fn help() {
     println!("  --cost-propose <ns> per effect (5)");
     println!("  --cost-apply <ns>   per effect (135)");
     println!("  --cost-scale <pct>  every stage scaled, for a core this much slower (100)");
+    println!("  --resolve-after <n> holds committed since, before one is resolved: its age (0)");
+    println!("  --flush-blocks <n>  the engine's unwritten window, in blocks (1024)");
+    println!("  --resident-blocks <n>  written-and-still-readable window, in blocks (4096)");
+    println!("                      the last three decide the share of resolutions that cost an IO");
     println!("  --slo-p999-us <n>   the tail to hold; fails the run (exit 1) when it is worse");
     println!("  --sweep <knob=a,b>  run once per value of any option above, one row each");
 }
@@ -501,11 +506,17 @@ mod tests {
     fn a_short_sweep_of_seeds_holds_every_invariant() {
         let mut committed = 0;
         let mut served = 0;
+        let mut overflows = 0;
+        let mut store_reads = 0;
+        let mut stale = 0;
         for seed in 1..=16 {
             match super::check(seed, 200) {
                 Ok(report) => {
                     committed += report.metrics.committed;
                     served += u64::from(!report.halted);
+                    overflows += report.overflowed;
+                    store_reads += report.store_reads;
+                    stale += report.metrics.stale_answers;
                 }
                 Err(failure) => panic!(
                     "seed {} broke {:?} at step {} with {:?}",
@@ -515,7 +526,17 @@ mod tests {
         }
         // Without this the sweep could pass by exercising nothing at all.
         assert!(served >= 8, "only {served} of 16 seeds kept serving");
+        assert_eq!(overflows, 0, "the engine's index could not take a hold the log says exists");
         assert!(committed > 1_000, "the sweep only committed {committed} effects");
+        // The fetch path — the candidate walk and the fingerprint confirmation — only runs on a store
+        // read. Without this the sweep would report that every invariant held about a path it never
+        // entered, which is what it did until the windows were made narrow enough to leave memory.
+        assert!(store_reads > 0, "no seed reached the store, so the fetch path is untested");
+        // Not asserted here: sixteen seeds never draw the stale-answer fault, and raising its odds to
+        // make them would shift every other fault's draw to buy one assertion. The mechanism is asserted
+        // deterministically in the sequencer's `lane_ordering` tests, and a full `check --seeds 64` run
+        // reports how often it fired — which is what the coverage line is for.
+        let _ = stale;
     }
 
     /// The division of labour, stated as a test. A device with a tail finishes reads out of the order
@@ -530,7 +551,9 @@ mod tests {
             pending_tail_nanos: 4_000,
             pending_rate: 0,
             resident_holds: 0,
-            pending_hit_percent: 0,
+            // Wide windows: this test is about a device's tail reaching the lane, not about the store.
+            flush_blocks: ledger_pending::DEFAULT_FLUSH_BLOCKS,
+            resident_blocks: ledger_pending::DEFAULT_RESIDENT_BLOCKS,
             idem_nanos: 1_000,
             raft_nanos: 2_000,
             raft_tail_nanos: 1_000,
@@ -589,7 +612,8 @@ mod tests {
             pending_tail_nanos: 0,
             pending_rate: 0,
             resident_holds: 1 << 16,
-            pending_hit_percent: 100,
+            flush_blocks: ledger_pending::DEFAULT_FLUSH_BLOCKS,
+            resident_blocks: ledger_pending::DEFAULT_RESIDENT_BLOCKS,
             idem_nanos: 1_000,
             // A round trip long enough that several batches are outstanding together, which is what
             // lets a pair of them be answered in the wrong order.

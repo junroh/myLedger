@@ -5,7 +5,7 @@ use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{Ack, AckOutcome, Transfer};
 use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
-use ledger_pending::{MemoryPending, MemoryPendingConfig};
+use ledger_pending::{MemoryPending, MemoryPendingConfig, StoreModel};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, ReactorConfig};
 use ledger_service::{ClientEndpoint, LedgerService, ServiceConfig};
@@ -35,6 +35,7 @@ impl Runner {
             accounts: options.accounts,
             skew: options.skew,
             external_ratio: options.external_ratio,
+            resolve_after: options.resolve_after,
         };
         let mut workload = Workload::new(options.workload, shape, options.seed);
         let (service, endpoint) = Self::start_ledger(&options, &workload);
@@ -86,6 +87,8 @@ impl Runner {
                 ("pending engine", stopped.reactor.pending().footprint()),
                 ("consensus", stopped.reactor.raft().footprint()),
             ],
+            pending_traffic: stopped.reactor.pending().traffic(),
+            order_wait: stopped.reactor.pending().order_wait(),
         }
     }
 
@@ -105,10 +108,26 @@ impl Runner {
             },
             Self::open_accounts(workload),
             MemoryPending::start(MemoryPendingConfig {
-                latency: options.pending_latency,
                 violate_order_every: options.violate_order_every,
                 seed: options.seed ^ 0x9e37,
+                overlay_soft_limit: options.overlay_limit,
+                store: StoreModel {
+                    read_base_nanos: options.store_read.min.as_nanos() as u64,
+                    read_tail_nanos: (options.store_read.max.saturating_sub(options.store_read.min))
+                        .as_nanos() as u64,
+                    iops: options.store_iops,
+                    queue_depth: 128,
+                },
+                capacity: options.capacity,
+                index_budget_bytes: options.index_budget as usize,
                 ..MemoryPendingConfig::default()
+            })
+            .unwrap_or_else(|err| {
+                // Refused rather than discovered: every window in the engine is derived from these
+                // inputs, so a declaration that does not describe a workload would otherwise become a
+                // size nobody meant.
+                eprintln!("ledgerfio: the engine's declared capacity is not usable ({err:?})");
+                std::process::exit(2);
             }),
             MemoryDedup::start(MemoryDedupConfig {
                 latency: options.idem_latency,

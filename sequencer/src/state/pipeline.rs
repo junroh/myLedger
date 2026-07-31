@@ -2,9 +2,11 @@
 //! still waiting for.
 
 use std::collections::VecDeque;
+
+use crate::state::lane::LaneState;
 use std::mem::size_of;
 
-use ledger_base::ports::{Correlation, IdemVerdict};
+use ledger_base::ports::{Correlation, HoldData, IdemVerdict};
 use ledger_base::{AccountId, AcctHandle, Consumer, Footprint, LinkedChainId, Peak, Request, Seq,
     Transfer, TransferKind};
 
@@ -89,21 +91,43 @@ impl WorkItem {
     pub const fn is_judgeable(&self) -> bool {
         self.deps.is_empty()
     }
+
+    /// Whether this request holds a place in its lane's order. Both halves of the lane's outstanding-reply
+    /// count read it — taken at dispatch, given back when the reply arrives — because deriving the same
+    /// fact twice is how the two drift apart, and a drifted count breaks ordering silently.
+    pub const fn keeps_lane_place(&self) -> bool {
+        self.seq != LaneState::UNORDERED
+    }
 }
 
 /// Preallocated, so the pipeline never allocates per request.
 pub struct SlotPool {
     items: Vec<WorkItem>,
+    /// The hold a resolution is about, as the engine answered. It belongs to the request rather than to
+    /// a cache: the request asked for it, judges with it, and it dies with the slot — which is what
+    /// bounds this by work in flight. A copy kept past that would be a cache, and the engine owns the
+    /// one that exists. Beside the items rather than inside them, because a work item is padded to whole
+    /// cache lines and adding a record to it would cost a line on every request, resolution or not.
+    records: Vec<Answer>,
     free: Vec<SlotId>,
     /// The most slots ever held at once. What sizes the pool, since the count at any moment is
     /// whatever the run happened to have in flight when it was asked.
     peak: Peak,
 }
 
+/// What the engine answered this request, and what its answer had to be current with. Both die with the
+/// slot, which is what bounds them by work in flight.
+#[derive(Clone, Default)]
+struct Answer {
+    record: Option<HoldData>,
+    expects_applies: u64,
+}
+
 impl SlotPool {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             items: vec![WorkItem::default(); capacity],
+            records: vec![Answer::default(); capacity],
             free: (0..capacity as SlotId).rev().collect(),
             peak: Peak::default(),
         }
@@ -118,7 +142,29 @@ impl SlotPool {
     }
 
     pub fn release(&mut self, slot: SlotId) {
+        self.records[slot as usize] = Answer::default();
         self.free.push(slot);
+    }
+
+    /// What the engine answered about this request's hold. `None` until the reply arrives, and again
+    /// once the slot is released.
+    pub fn record(&self, slot: SlotId) -> Option<&HoldData> {
+        self.records[slot as usize].record.as_ref()
+    }
+
+    pub fn set_record(&mut self, slot: SlotId, record: Option<HoldData>) {
+        self.records[slot as usize].record = record;
+    }
+
+    /// How many committed decisions the engine had been sent when this request asked it for a record.
+    /// Its answer has to reflect all of them; the sequencer keeps the number itself, because a number the
+    /// engine supplied could not check the engine.
+    pub fn expect_applies(&mut self, slot: SlotId, applies_sent: u64) {
+        self.records[slot as usize].expects_applies = applies_sent;
+    }
+
+    pub fn expected_applies(&self, slot: SlotId) -> u64 {
+        self.records[slot as usize].expects_applies
     }
 
     pub fn get(&self, slot: SlotId) -> &WorkItem {
@@ -143,6 +189,7 @@ impl SlotPool {
     /// out the slots, so a peak on it would just be the pool's peak upside down.
     fn footprint(&self, footprint: &mut Footprint) {
         let bytes = self.items.capacity() * size_of::<WorkItem>()
+            + self.records.capacity() * size_of::<Answer>()
             + self.free.capacity() * size_of::<SlotId>();
         footprint.other(
             "work slots",
@@ -191,6 +238,22 @@ impl Pipeline {
 
     pub fn item(&self, slot: SlotId) -> &WorkItem {
         self.slots.get(slot)
+    }
+
+    pub fn record(&self, slot: SlotId) -> Option<&HoldData> {
+        self.slots.record(slot)
+    }
+
+    pub fn expect_applies(&mut self, slot: SlotId, applies_sent: u64) {
+        self.slots.expect_applies(slot, applies_sent);
+    }
+
+    pub fn expected_applies(&self, slot: SlotId) -> u64 {
+        self.slots.expected_applies(slot)
+    }
+
+    pub fn set_record(&mut self, slot: SlotId, record: Option<HoldData>) {
+        self.slots.set_record(slot, record);
     }
 
     pub fn item_mut(&mut self, slot: SlotId) -> &mut WorkItem {

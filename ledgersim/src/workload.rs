@@ -91,6 +91,10 @@ pub struct Traffic {
     /// Above 1, `u^skew` bunches accounts toward the low indices: the hot-account shape. Same formula
     /// as the load driver's `--skew`, so a number means the same thing in both.
     skew: f64,
+    /// How many committed holds wait ahead of one before it is resolved. Same meaning as the load
+    /// driver's `--resolve-after`: it is the age of the record a resolution reads, and so which of the
+    /// engine's windows answers it.
+    resolve_after: usize,
 }
 
 impl Traffic {
@@ -101,6 +105,7 @@ impl Traffic {
         strict: bool,
         remembered: usize,
         skew: f64,
+        resolve_after: usize,
     ) -> Self {
         Self {
             prng: Prng::new(seed),
@@ -112,6 +117,7 @@ impl Traffic {
             strict,
             ready: VecDeque::new(),
             skew: skew.max(1.0),
+            resolve_after,
         }
     }
 
@@ -195,6 +201,10 @@ impl Traffic {
         }
         let hold = if self.strict {
             // A client resolves a hold it was told committed, once. The queue is in commit order.
+            if self.ready.len() <= self.resolve_after {
+                // Not old enough yet: a client with a declared resolution age would send something else.
+                return Vec::new();
+            }
             match self.ready.pop_front() {
                 Some(hold) => hold,
                 // Nothing to resolve yet: a client would send something else.

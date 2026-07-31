@@ -29,7 +29,8 @@ client → intake ─ idempotency ─→ judge → propose → consensus → app
 
 - **S1** `prepare` validates the shape, resolves both accounts to handles, refuses a ledger
   mismatch or a quarantined lane, and gives the request its lane seq. A debit on an unconstrained
-  account takes no seq: nothing about judging it depends on the lane's earlier requests.
+  account takes no seq as long as it reads no hold: nothing about judging it depends on the lane's
+  earlier requests.
 - **S2** `dispatch` sends the idempotency lookup and moves on. Nothing waits. A full queue means the
   slot is deferred, not dropped: it keeps its seq, because dropping it would leave a permanent gap.
 - **S3** the idempotency reply clears the request's last dependency, so it is judged: seq continuity
@@ -48,16 +49,24 @@ A hold takes the short path — creating a hold reads nothing. Settling or voidi
 how much is left, which only the pending engine knows:
 
 ```
-S2  overlay has the hold?  ── yes ─→ judge from the overlay (no round trip)
-                           ── no  ─→ lookup → engine → reply → judge
+S2  resolves a hold?       ── yes ─→ lookup → engine → reply → the record lands in the slot → judge
+                           ── no  ─→ nothing to read
+    engine said not there? ── yes ─→ refuse it here; asking again gets the same answer
     lane already waiting?  ── yes ─→ fence (an ordering token that reads nothing)
 ```
 
-- The engine's **overlay** answers inline. It holds a copy of what the store last confirmed plus the
-  reservations no batch has committed yet, so a resolution is judged against the remainder as of
-  now, not as of the last commit.
-- A hold the engine has just been told to create is in the overlay already, so the common case —
-  settle a hold this ledger created — costs no round trip.
+- **Every resolution asks**, including of a hold this ledger created moments ago. The record is what a
+  hold *is* — its accounts, its ledger, its group — and that belongs to the engine. A copy of it here
+  would be the same fact under two owners with nothing to say which was true (rule 18), so the reply
+  carries the record to the request that asked, and it lives in that request's slot until the request
+  is answered. The round trip costs no IO: the engine answers from its own memory, and a run reports
+  that as `reads: memory=N store=0`.
+- The sequencer's **overlay** holds what it has *decided* and not handed over: the remainder it last
+  told the engine, and what proposed-but-uncommitted resolutions have taken of that. None of it is
+  anywhere else, so it is bounded by the requests in flight rather than by an eviction policy.
+- The two meet in `HoldView::compose`. When they disagree about the remainder the overlay wins: a
+  remainder only decreases, the sequencer's is taken the moment it decides, and the engine's answer can
+  have been in flight across that.
 - While a lane has a reply outstanding, every later request of that lane travels the pending path
   too, as a **fence**. Without it a request that reads nothing would overtake one that does, and the
   lane's order would be the reply order instead of the arrival order.
@@ -65,8 +74,9 @@ S2  overlay has the hold?  ── yes ─→ judge from the overlay (no round tr
   applies the budget-group rule. The amount is reserved in the overlay at judge time, so a second
   resolution cannot take the same money.
 - **S5** releases the reservation and tells the engine what changed: `Reduce` when something is
-  left, `Remove` when nothing is. The engine's copy follows those writes, so it never disagrees with
-  the store.
+  left, `Remove` when nothing is. The overlay's remainder follows those writes and nothing else writes
+  it. `Reduce` carries the hold's original size, read off the record in the slot before it is released,
+  so appending the new version costs the engine no read.
 
 ## Linked chain: judged as one
 

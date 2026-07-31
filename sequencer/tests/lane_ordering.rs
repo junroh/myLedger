@@ -54,9 +54,10 @@ fn enough_quarantined_lanes_fail_stop_the_sequencer() {
     assert_eq!(harness.run(tx).outcome, AckOutcome::Committed);
 }
 
-/// An unconstrained debit has no balance to protect, so it is not held behind an outstanding
-/// pending reply on the same lane: it overtakes, and no fence is spent on it. A resolution stays
-/// ordered, because its place decides which resolution of the hold wins.
+/// An unconstrained debit has no balance to protect, so nothing debiting it depends on what came
+/// before it on that lane: it overtakes an outstanding pending reply, and no fence is spent on it.
+/// A resolution is exempt on the same terms — the lane never protected it, the hold did — so all
+/// three requests here keep no place at all.
 #[test]
 fn a_request_that_needs_no_balance_check_overtakes_the_pending_path() {
     let mut harness = Harness::with_stubs(
@@ -80,8 +81,42 @@ fn a_request_that_needs_no_balance_check_overtakes_the_pending_path() {
     assert_eq!(acks[0].tx_id, overtaking.id, "the exempt request waited for the lookup");
     assert!(acks.iter().all(|ack| ack.outcome == AckOutcome::Committed), "{acks:?}");
     assert_eq!(harness.reactor.metrics().fences, 0);
-    assert!(harness.reactor.metrics().order_exempt > 0);
+    // The hold, the settle and the transfer: every one of them debits an account with no balance to
+    // protect, and the settle is the one that used to be ordered anyway.
+    assert_eq!(harness.reactor.metrics().order_exempt, 3);
     assert_eq!(harness.reactor.metrics().seq_gaps, 0);
+    assert_eq!(harness.reactor.metrics().stale_answers, 0);
+    harness.assert_consistent();
+}
+
+/// The other half of that trade. An exempt reply takes no seq, so nothing about its *order* can be
+/// checked — and the check that replaces it is about the data: an answer has to reflect every decision
+/// the engine had already been handed. An engine claiming otherwise is broken in the same way as one
+/// that reorders, so the lane is quarantined and the rest keeps serving.
+#[test]
+fn an_answer_from_before_a_decision_the_engine_was_given_quarantines_the_lane() {
+    let mut harness = Harness::with_stubs(
+        MemoryPendingConfig {
+            // Every second answer claims one decision short of what it had been given.
+            stale_answer_every: 2,
+            ..NoLatency::cold_pending()
+        },
+        NoLatency::raft(),
+    );
+    harness.fund(ALICE, FUNDING);
+    let (hold, _) = harness.hold(ALICE, BOB, 300);
+
+    // Resolutions until one of them is answered staly. Each is its own lookup, so the fault lands.
+    for _ in 0..4 {
+        let mut settle = harness.transfer(ALICE, BOB, 10);
+        settle.pending_ref = hold;
+        settle.flags = TransferFlags::POST_PENDING;
+        harness.run(settle);
+    }
+
+    assert!(harness.reactor.metrics().stale_answers > 0, "the stale answer was believed");
+    assert_eq!(harness.reactor.quarantined(), &[ALICE]);
+    harness.assert_consistent();
 }
 
 /// Consensus still owes answers, and those answers must be applied in order. Clearing the fail-stop

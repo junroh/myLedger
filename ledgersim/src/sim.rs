@@ -223,6 +223,9 @@ pub struct Plan {
     pub raft_tail_nanos: u64,
     /// Account concentration, the same shape as the load driver's `--skew`.
     pub skew: f64,
+    /// How old a hold is when it is resolved, in holds committed since. Zero resolves the oldest ready
+    /// hold at once, which keeps every read in the newest blocks and so measures the read path's absence.
+    pub resolve_after: usize,
     pub poisson: bool,
     /// Proposals consensus may have outstanding, from the real batch policy. Times the batch cap, this
     /// is how much work one round trip can hide.
@@ -230,9 +233,10 @@ pub struct Plan {
     /// What the same work would cost on a core nobody here has, as a percentage of this one. 100 is
     /// this machine, measured.
     pub cost_percent: u64,
-    /// How often the pending engine answers a resolution from memory, as a percentage. Against
-    /// the transaction rate this is what decides how many commands it is asked for.
-    pub pending_hit_percent: u64,
+    /// The engine's two memory windows in blocks, declared here because a prediction has to say which of
+    /// them it assumed: what a resolution costs depends entirely on which one answers it.
+    pub flush_blocks: usize,
+    pub resident_blocks: usize,
 }
 
 impl Plan {
@@ -255,6 +259,15 @@ pub struct Report {
     /// apply path. That is the right answer to those faults, and it also means the rest of this
     /// seed's steps explored nothing.
     pub halted: bool,
+    /// Holds the engine's index could not take. Has to be zero: the index is sized from what the
+    /// configuration declares and never grows, so anything here is a hold the log says exists and the
+    /// store does not have. Nothing inside the ledger can notice it yet — a write carries no reply — so
+    /// this is the only place it is caught.
+    pub overflowed: u64,
+    /// Reads that went to the store. Not an invariant — zero is a correct run — but a sweep whose total
+    /// is zero has not exercised the fetch path, and would say "every invariant held" about a path it
+    /// never entered.
+    pub store_reads: u64,
 }
 
 pub struct Prediction {
@@ -286,6 +299,10 @@ pub struct Prediction {
     pub order_wait_us: f64,
     pub order_wait_worst_us: f64,
     pub order_wait_deepest: usize,
+    /// Reads the engine had to take from its store, against the lookups it answered. This is the sizing
+    /// statement the two memory windows exist to make: at this resolution age and these windows, this
+    /// share of resolutions costs an IO.
+    pub store_reads: u64,
     /// The mean, in microseconds. Little's law is about the mean, not the median: a run held back by
     /// its queue depth answers `depth / mean`, and reading p50 there understates how long a slot is
     /// held whenever the tail is heavy.
@@ -370,6 +387,8 @@ struct Shape {
     queue: usize,
     /// Requests the client keeps unanswered.
     queue_depth: u64,
+    /// How old a hold is when it is resolved, in holds committed since.
+    resolve_after: usize,
     /// A client that only resolves holds it was told committed.
     strict: bool,
     mode: Mode,
@@ -471,6 +490,10 @@ pub fn explore(
             queue: 256,
             queue_depth: burst * 64,
             strict: false,
+            // A run of two thousand steps cannot age a hold by much, and `check`'s question is the
+            // mechanism rather than the age: what puts its seeds on the store path is the narrow windows
+            // `Timings::draw` gives them, not a queue of unresolved holds.
+            resolve_after: 0,
             mode: Mode::Explore,
             linger_nanos: CHECK_LINGER_NANOS,
             skew: 1.0,
@@ -509,6 +532,8 @@ pub fn explore(
             return Err(Box::new(Failure { seed, step: steps + step, broken, timings, faults }));
         }
     }
+    let overflowed = sim.pending.overflowed();
+    let store_reads = sim.pending.store_reads();
     let metrics = sim.reactor.metrics();
     if metrics.invariant_breaks > 0 {
         return Err(Box::new(Failure {
@@ -519,7 +544,16 @@ pub fn explore(
             faults,
         }));
     }
-    Ok(Report { seed, funded, submitted: sim.submitted, answered: sim.answered, metrics, halted })
+    Ok(Report {
+        seed,
+        funded,
+        submitted: sim.submitted,
+        answered: sim.answered,
+        metrics,
+        halted,
+        overflowed,
+        store_reads,
+    })
 }
 
 /// Predicts what a run costs against components that answer as slowly as the plan says. The audit
@@ -544,6 +578,7 @@ pub fn capacity(plan: Plan) -> Result<Prediction, Box<Failure>> {
             mode: Mode::Predict(plan.costs.scaled(plan.cost_percent)),
             linger_nanos: plan.linger_nanos,
             skew: plan.skew,
+            resolve_after: plan.resolve_after,
             poisson: plan.poisson,
             capacity: Capacity {
                 slots: depths.slots,
@@ -605,6 +640,7 @@ pub fn capacity(plan: Plan) -> Result<Prediction, Box<Failure>> {
         order_wait_us: order_wait.waited_nanos as f64 / order_wait.released.max(1) as f64 / 1_000.0,
         order_wait_worst_us: order_wait.worst_nanos as f64 / 1_000.0,
         order_wait_deepest: order_wait.deepest,
+        store_reads: sim.pending.store_reads(),
         metrics,
         footprints: vec![
             ("sequencer", sim.reactor.footprint()),
@@ -627,6 +663,7 @@ impl Sim {
             capacity,
             linger_nanos,
             skew,
+            resolve_after,
             poisson,
         } = shape;
         let mut store = MemoryAccounts::with_capacity(accounts as usize + 1);
@@ -685,6 +722,7 @@ impl Sim {
                 strict,
                 queue_depth as usize,
                 skew,
+                resolve_after,
             ),
             unsent: VecDeque::new(),
             now: 0,

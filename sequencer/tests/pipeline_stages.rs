@@ -69,41 +69,28 @@ fn a_failed_settle_gives_the_hold_remainder_back() {
     harness.assert_consistent();
 }
 
-/// A hold the engine has just been told to create is already in its overlay, so resolving it costs
-/// no lookup. These two counters are the hit ratio a run reports, so they must not drift.
+/// Every resolution fetches the record it is judged by, including of a hold this ledger created
+/// moments ago: the record is the engine's, and the sequencer keeps only what it has decided about
+/// the hold. A partial settle then commits on what came back.
 #[test]
-fn a_created_hold_is_resolved_without_a_lookup() {
+fn a_resolution_fetches_the_record_it_is_judged_by() {
     let mut harness = Harness::new();
-    harness.fund(ALICE, FUNDING);
-    let (hold, _) = harness.hold(ALICE, BOB, 300);
-
-    harness.resolve(hold, ALICE, BOB, 100, TransferFlags::POST_PENDING);
-    harness.resolve(hold, ALICE, BOB, 100, TransferFlags::POST_PENDING);
-
-    assert_eq!(harness.reactor.metrics().pending_lookups, 0);
-    assert_eq!(harness.reactor.metrics().pending_hits, 2);
-    assert_eq!(harness.reactor.metrics().fences, 0, "nothing waited on the pending path");
-}
-
-/// Once the overlay has dropped the hold, the same resolution has to fetch it — and then the
-/// fence applies again, because the lane is waiting on an external reply.
-#[test]
-fn a_hold_the_overlay_dropped_is_fetched_again() {
-    let mut harness = Harness::with_stubs(NoLatency::cold_pending(), NoLatency::raft());
     harness.fund(ALICE, FUNDING);
     let (hold, _) = harness.hold(ALICE, BOB, 300);
 
     let ack = harness.resolve(hold, ALICE, BOB, 100, TransferFlags::POST_PENDING);
     assert_eq!(ack.outcome, AckOutcome::Committed);
-    assert_eq!(harness.reactor.metrics().pending_lookups, 1);
-    assert_eq!(harness.reactor.metrics().pending_hits, 0);
-    assert_eq!(harness.columns(ALICE), (100, FUNDING, 200, 0));
+    harness.resolve(hold, ALICE, BOB, 100, TransferFlags::POST_PENDING);
+
+    assert_eq!(harness.reactor.metrics().pending_lookups, 2, "one each, and none shared");
+    assert_eq!(harness.columns(ALICE), (200, FUNDING, 100, 0));
     harness.assert_consistent();
 }
 
-/// Eviction may not drop a hold that dispatched requests are still going to read. With a policy
-/// that evicts everything it can on every round, a run of resolutions of one hold must still all
-/// commit: whichever of them is in flight keeps the hold in the overlay.
+/// Eviction may not drop what dispatched requests are still going to read. With a policy that evicts
+/// everything it can on every round, a run of resolutions of one hold must still all commit: the
+/// remainder the sequencer last told the engine is newer than any answer already in flight, so losing
+/// it would let one of those answers be believed and the hold spent twice.
 #[test]
 fn resolutions_in_flight_keep_their_hold_in_the_overlay() {
     let mut harness = Harness::with_stubs(NoLatency::cold_pending(), NoLatency::raft());
@@ -141,8 +128,7 @@ fn an_answer_of_not_there_is_not_asked_twice() {
             AckOutcome::Rejected(LedgerError::PendingRefNotFound(missing))
         );
     }
-    assert_eq!(harness.reactor.metrics().pending_lookups, 1, "the second asked again");
-    assert_eq!(harness.reactor.metrics().pending_hits, 0, "a hold that is not there is not a hit");
+    assert_eq!(harness.reactor.metrics().pending_lookups, 1, "the second was told from here");
     harness.assert_consistent();
 }
 

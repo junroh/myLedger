@@ -80,7 +80,8 @@ impl Load {
             MemoryPending::start(MemoryPendingConfig {
                 latency: LatencyRange::fixed(Duration::ZERO),
                 ..MemoryPendingConfig::default()
-            }),
+            })
+            .expect("a test engine config"),
             MemoryDedup::start(MemoryDedupConfig {
                 latency: LatencyRange::fixed(Duration::ZERO),
                 ..MemoryDedupConfig::default()

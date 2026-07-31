@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use ledger_base::ports::{
-    HoldData, HoldView, PendingCommand, PendingEffect, PendingFence, PendingLookup, PendingPort,
-    OverlayState, PendingReply,
+    OverlayState, PendingCommand, PendingEffect, PendingFence, PendingLookup, PendingPort,
+    PendingReply,
 };
 use ledger_base::{Amount, Footprint, Peak, TxId};
 
@@ -15,11 +15,21 @@ pub struct PendingChannel<P: PendingPort> {
     writes: VecDeque<PendingEffect>,
     limit: usize,
     peak: Peak,
+    /// Committed decisions handed over. A lookup dispatched now is behind every one of them — the queue
+    /// is one channel and a queued write blocks lookups — so an answer that reflects fewer is an engine
+    /// that has reordered its own queue.
+    applies_sent: u64,
 }
 
 impl<P: PendingPort> PendingChannel<P> {
     pub fn new(port: P, limit: usize, reserve: usize) -> Self {
-        Self { port, writes: VecDeque::with_capacity(reserve), limit, peak: Peak::default() }
+        Self {
+            port,
+            writes: VecDeque::with_capacity(reserve),
+            limit,
+            peak: Peak::default(),
+            applies_sent: 0,
+        }
     }
 
     pub fn lookup(&mut self, lookup: PendingLookup) -> bool {
@@ -34,7 +44,15 @@ impl<P: PendingPort> PendingChannel<P> {
         if !self.writes.is_empty() || self.port.send(PendingCommand::Apply(effect)).is_err() {
             self.writes.push_back(effect);
             self.peak.saw(self.writes.len());
+            return;
         }
+        self.applies_sent += 1;
+    }
+
+    /// Committed decisions the engine has been given. What a lookup dispatched now must be answered
+    /// against.
+    pub fn applies_sent(&self) -> u64 {
+        self.applies_sent
     }
 
     /// Committed decisions the engine has not taken yet. A backlog here is the engine being slower
@@ -55,6 +73,7 @@ impl<P: PendingPort> PendingChannel<P> {
                 break;
             }
             self.writes.pop_front();
+            self.applies_sent += 1;
             progress = true;
         }
         progress
@@ -83,18 +102,19 @@ impl<P: PendingPort> PendingChannel<P> {
         self.port.poll()
     }
 
-    /// The overlay, read and moved inline. The state is the engine's; the sequencer only
-    /// tells it what it decided.
-    pub fn overlay_state(&self, hold: TxId) -> OverlayState {
-        self.port.overlay_state(hold)
+    /// The inline half of the port, forwarded so the reactor reads one wrapper. Everything below this
+    /// line runs on the reactor's own thread and cannot refuse; everything above it is queued and can,
+    /// which is the difference the two contracts carry.
+    pub fn hold_is_missing(&self, hold: TxId) -> bool {
+        self.port.hold_is_missing(hold)
     }
 
     pub fn begin_lookup(&mut self, hold: TxId) {
         self.port.begin_lookup(hold);
     }
 
-    pub fn admit_lookup(&mut self, hold: TxId, found: Option<HoldData>) {
-        self.port.admit_lookup(hold, found);
+    pub fn admit_lookup(&mut self, hold: TxId, remaining: Option<Amount>) {
+        self.port.admit_lookup(hold, remaining);
     }
 
     pub fn pin(&mut self, hold: TxId) {
@@ -105,8 +125,8 @@ impl<P: PendingPort> PendingChannel<P> {
         self.port.unpin(hold);
     }
 
-    pub fn view(&self, hold: TxId) -> Option<HoldView> {
-        self.port.view(hold)
+    pub fn overlay(&self, hold: TxId) -> OverlayState {
+        self.port.overlay(hold)
     }
 
     pub fn reserve(&mut self, hold: TxId, amount: Amount, resolves: bool) {

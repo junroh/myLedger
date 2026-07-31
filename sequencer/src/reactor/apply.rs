@@ -104,7 +104,12 @@ where
                 return;
             }
             self.settle_overlays(effect);
-            if let Some(write) = effect.pending_effect() {
+            // Read before the slot is released: the hold's original size is on the record this request
+            // was answered with, and a partial settle has to write it again. Zero when there was no
+            // record — a resolution judged inside the chain that created the hold — and then the engine
+            // reads the version it appended moments ago.
+            let hold_amount = self.pipeline.record(slot).map_or(0, |record| record.amount);
+            if let Some(write) = effect.pending_effect(hold_amount) {
                 match write {
                     PendingEffect::Create { .. } => self.metrics.pending_creates += 1,
                     PendingEffect::Reduce { .. } => self.metrics.pending_reduces += 1,

@@ -79,6 +79,7 @@ name = "ledger-pending"
 version = "0.1.0"
 dependencies = [
  "ledger-base",
+ "ledger-benchkit",
  "ledger-stubkit",
 ]
 

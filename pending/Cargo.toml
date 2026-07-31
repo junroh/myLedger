@@ -3,6 +3,13 @@ name = "ledger-pending"
 version.workspace = true
 edition.workspace = true
 
+[[bench]]
+name = "index"
+harness = false
+
 [dependencies]
 ledger-base.workspace = true
 ledger-stubkit.workspace = true
+
+[dev-dependencies]
+ledger-benchkit.workspace = true

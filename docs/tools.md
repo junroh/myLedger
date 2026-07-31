@@ -17,7 +17,7 @@ trust. No results are quoted here — each tool prints its own, with the conditi
 second; it cannot say whether a 32-byte lane beats a padded one, whether padding a work item pays, or
 whether the hand-written queue still beats `rtrb`. Those decide how the code is written, and only a
 microbenchmark answers them. The numbers and the conditions they were taken under are in design notes
-§5 and §10.
+§5, §10, §11 and §12.
 
 **The load driver** is the only tool that measures the thing itself. Its numbers include everything
 the others model away: allocator behaviour, cache misses, the scheduler, real threads. It is also the
@@ -93,10 +93,34 @@ decides what the prediction is worth:
   matters as much as the latency: a component modelled as latency alone has unlimited parallelism, and
   against one of those even a very slow tier costs almost nothing, which is wrong rather than
   encouraging.
-- **A hit never reaches it.** The sequencer reads the resident view inline, so what the engine is asked
-  for is misses, fences and writes. The command rate it must sustain therefore follows the hit ratio
-  (`--pending-hit`), and writes put a floor under that rate which a perfect hit ratio does not remove.
-  There is one rate, not one per kind: a slow write path shows up as reads queueing behind it.
+- **The windows are declared, not set.** `--daily-arrivals`, `--flush-survivors`, `--flush-window` and
+  `--residency` are business inputs; the engine derives its block counts from them and refuses a
+  combination that does not describe a workload — residency shorter than the flush window, or a
+  retention-end survivor share larger than the flush-window one. The refusal is at startup, with exit 2,
+  because every size in the engine follows from these and a nonsense declaration would otherwise become a
+  window nobody meant. `--index-budget` is the same idea for the index.
+- **The simulator declares the same two things**, as `--resolve-after`, `--flush-blocks` and
+  `--resident-blocks`, and its capacity report answers the question they exist for: at this age and these
+  windows, what share of resolutions costs an IO. With the default windows that share is zero at the
+  design's target rate; with four blocks each it is 95% at age zero and 100% at age five thousand.
+- **`check` draws narrow windows on purpose.** Three seeds in four get windows of a few blocks, so records
+  leave memory inside a two-thousand-step run and the fetch path — the candidate walk, the fingerprint
+  confirmation against a record, replies completing in the device's order rather than the lane's — runs
+  while the faults are on. The sweep test asserts the store was reached, because before this the sweep
+  reported that every invariant held about a path it never entered.
+- **A hold needs an age before any of this is exercised.** `--resolve-after <n>` resolves a hold once *n*
+  more have been created behind it, so its record is read back at a declared age rather than moments after
+  it was written. Without it a workload has only two settings — resolve at once, or never — and the engine
+  answers everything from its newest blocks, which is not a measurement of the read path but of its
+  absence. The age decides which window answers: `hold-settle` at age 0 answers every read from unwritten
+  blocks and 99% of records never reach the store; at 100,000 nothing dies in the buffer and every read
+  comes from residency; at 900,000 every read is a store read. Those three regimes are the three zones,
+  and they are what `engine reads` prints.
+- **Every resolution reaches it.** The record a resolution is judged by is the engine's, so what it is
+  asked for is one command per resolution, plus fences and writes — the command rate follows the traffic
+  and nothing on the sequencer's side reduces it. What the engine's own memory saves is the IO *below*
+  that command, which is `--store-read` and `--store-iops`, reported as `reads: memory=N store=M`. There
+  is one rate, not one per kind: a slow write path shows up as reads queueing behind it.
 - **The tail is what makes answers finish out of order**, and that is a cost of its own: an answer that
   is ready waits for an earlier one on its lane, so the wait is the queue depth times a latency, which no
   per-command bound covers. The run reports it as `order wait`, separately from the engine, because the
@@ -104,11 +128,10 @@ decides what the prediction is worth:
   for the other. Concentrating accounts (`--skew`) multiplies the fences and deepens that wait.
 - **Consensus** has a tail too (`--raft-tail-us`), and answers in commit order regardless: a batch that
   would finish early waits for the one in front of it.
-- **What the engine is asked for** follows the hit ratio, not the transaction rate. The report prints the
-  hit ratio it measured next to the command rate, so the knob is checked rather than assumed. How many
-  entries a cache needs to reach that ratio is the engine's own question, and the resident view the
-  sequencer reads inline is not the same thing as a cache inside the engine — the model treats them as
-  one layer on purpose.
+- **What the engine is asked for** follows the traffic: one command per resolution, plus fences and
+  writes. Nothing on the sequencer's side takes a command away, because the record a resolution is judged
+  by is the engine's. Whether the engine answers from its own memory or reads the store is the layer below
+  — reported as `reads: memory=N store=M`, and priced by `--store-read`.
 
 ## What a harness must not assume
 

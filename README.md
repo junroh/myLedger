@@ -101,6 +101,7 @@ guarantees, so the test can decide whether the replacement is equivalent.
 
 ## Documents
 
+- `docs/status.md` — what is built and verified, and what is not, with why each gap is still open
 - `docs/tools.md` — the five tools that measure and check this code, and which question each answers
 - `docs/request-flow.md` — what happens to one transfer, stage by stage, and where each failure is caught
 - `docs/glossary.md` — one name per concept, and how it maps to the code

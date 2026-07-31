@@ -98,7 +98,10 @@ fn print_layout() {
         "{:<14} {:>6} {:>6} {:>9} {:>8}  line fit",
         "type", "size", "align", "per 128B", "per 64B"
     );
-    let hot_types = ledger_base::HOT_TYPES.iter().chain(ledger_sequencer::HOT_TYPES);
+    let hot_types = ledger_base::HOT_TYPES
+        .iter()
+        .chain(ledger_sequencer::HOT_TYPES)
+        .chain(ledger_pending::HOT_TYPES);
     for layout in hot_types {
         println!(
             "{:<14} {:>6} {:>6} {:>9} {:>8}  {}",
@@ -149,7 +152,9 @@ fn print_help() {
     println!();
     println!("external components (simulated, us or min:max):");
     println!("  --raft-rtt <us>             (900:1400) consensus round trip: the latency floor");
-    println!("  --pending-latency <us>      (100:800) hold lookup; settle and void pay it, and their lane waits");
+    println!("  --store-read <us>           (0) what a block read costs the engine: the disk it has not got");
+    println!("  --store-iops <n>            (0) reads a second that store can serve, 0 for no ceiling");
+    println!("  --overlay-limit <n>         (1M) ceiling on the sequencer's own hold decisions; in flight bounds it");
     println!("  --idem-latency <us>         (1:5) dedup; every request pays it");
     println!("  --violate-order-every <n>   (0) return every nth lane reply out of order");
     println!("  --raft-fail-every <n>       (0) refuse every nth batch");
@@ -157,6 +162,18 @@ fn print_help() {
     println!("workload shape:");
     println!("  --skew <f>                  (1.0 uniform) higher concentrates traffic on few accounts");
     println!("  --external-ratio <0.3|30%>  (0) share of debits on the unconstrained clearing account");
+    println!("  --resolve-after <n>         (0) resolve a hold once n more exist: its age, and so which");
+    println!("                              engine window answers it — 0 resolves each one at once");
+    println!();
+    println!("what the engine is sized for (it derives every window from these):");
+    println!("  --daily-arrivals <n>        (1m) transfers a day; scales both memory windows");
+    println!("  --retention-days <n>        (2) how long a hold may live: with the share below, the index");
+    println!("  --survivor-share <50%>      (50%) still unresolved when retention ends: sizes the index");
+    println!("  --flush-survivors <50%>     (50%) still unresolved when their block is flushed: sizes");
+    println!("                              residency, and `died in buffer` measures the same thing");
+    println!("  --flush-window <hours>      (1) how long a record may go unwritten: a recovery bound");
+    println!("  --residency <hours>         (24) how long it stays readable in memory: a latency bound");
+    println!("  --index-budget <bytes>      (1073741824) refuse a declaration needing a larger index");
     println!();
     println!("measuring:");
     println!("  --sweep <knob=v1,v2>        run once per value and print one row each");

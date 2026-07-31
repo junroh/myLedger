@@ -6,8 +6,8 @@ pub mod raft;
 pub use account::{AccountFlags, AccountPort, AccountRecord, LedgerTotals};
 pub use idempotency::{IdemReply, IdemRequest, IdemVerdict, IdempotencyPort};
 pub use pending::{
-    HoldData, HoldView, PendingCommand, PendingEffect, PendingFence, PendingLookup, PendingPort,
-    OverlayState, PendingReply,
+    HoldData, HoldView, OverlayState, PendingCommand, PendingEffect, PendingFence, PendingLookup,
+    PendingOverlay, PendingPort, PendingReply,
 };
 pub use raft::{RaftCommit, RaftOutcome, RaftPort, RaftProposal};
 

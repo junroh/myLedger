@@ -46,15 +46,110 @@ dependency comes from one place: the balance check. An account the ledger does n
 so a single-phase transfer or a hold debiting it depends on nothing that came before it. Those
 requests take no seq, are not continuity-checked, and never fence.
 
-A settle or void is never exempt, whatever it debits: its order against other resolutions of the
-same hold decides which one wins, and it consumes external data, which is exactly what
-contract-1 detection is for. So the lane still orders every resolution, and the exemption covers
-only the kinds that read nothing.
+A settle or void **is** exempt when its debit account is unconstrained, and the reason it took a
+measurement to get there is that the argument for it was always sound and never priced. What the lane
+buys for a resolution is **not** safety. Double resolution is prevented per
+*hold*, by the pending overlay: `view` reports the committed remainder minus what
+proposed-but-uncommitted resolutions have already taken, `resolved` refuses a second one outright, and
+a resolution judged with no hold data at all is rejected rather than accepted. What the lane buys is
+two other things — which of two concurrent resolutions of one hold wins, and a place in the seq order
+for a reply that carries external data, which is what contract-1 detection watches. So the exemption
+covers only the kinds that read nothing.
 
 Measured with `ledgerfio run --workload hold-settle --external-ratio 30`, where many debits land on one
 clearing account: the exemption raises throughput and cuts fences by most of their count. Without it a
 busy suspense account serialises everything behind it, which is the cost of promising an order nobody
-asked for.
+asked for. That measures the exemption as it is implemented — over the kinds that read nothing. The
+sentence above about resolutions has no measurement behind it; it is an argument, which is why the next
+section revisits it.
+
+### Order exemption: the hold is the serialisation unit
+
+**Built 2026-07-31.** A resolution debiting an unconstrained account is exempt too, so the rule is one
+clause — the lane exists to protect a balance, so no balance constraint means no lane.
+
+What decides it is a product. Order-wait is a lane's queue depth times a read's latency, and the speed
+the engine owes is per read, so the product is the term that contract cannot cover: a lane deep enough
+turns a bounded read into an unbounded wait. Exemption reduces it to one read, because an exempt
+request still waits for its own answer — it just waits for nothing else. Hot *constrained* accounts
+keep the product, so this narrows the risk rather than removing it.
+
+**The depth is now measured, and it was an argument before.** Two knobs were missing to see it:
+`--resolve-after`, which gives a hold an age so its resolution actually reads a record rather than one
+written moments ago, and reporting the engine's own orderer at all — it computed the wait and nothing
+published it. With both, at holds resolved nine hundred thousand old:
+
+| workload | replies arriving behind their lane | deepest lane |
+|---|---|---|
+| uniform accounts | 5% | 5 |
+| `--skew 8` | 55% | 7,443 |
+| `--skew 64` | 90% | 20,044 |
+| `--external-ratio 30` | 99.9% | 13,281 |
+| `--external-ratio 70` | 99.9% | 19,584 |
+
+The first row is why this looked like a non-problem: spread over two hundred thousand accounts a lane is
+five deep, and five times a read is nothing. The last two are the case exemption covers — one
+unconstrained clearing account, every resolution debiting it in one lane, that lane thirteen to twenty
+thousand deep. At a real read latency that product is the unbounded wait, and it is the *depth* that
+carries it, not the latency. The skew rows are the residue exemption does not touch: those debits are
+constrained user accounts, so they keep their lane by the rule that is left.
+
+Two cautions about reading that table. The mean wait *falls* as concentration rises, because the runs
+differ in what else they are doing — at `--skew 64` a third of submissions are rejected — so depth is the
+comparable column and the wait is not. And the first version of this measurement was wrong: the number
+published as lane depth was the orderer's total held across all lanes, which read as twenty thousand deep
+when the deepest lane was five, and most of the wait it attributed to ordering was the worker's own loop
+and the reactor's backpressure. Order-wait and delivery-wait are now split at fill — a reply arriving
+behind an unfilled earlier place is the lane's, one arriving as its lane's head is not — because only the
+first is what exemption removes.
+
+Two things are given up. Arrival order stops deciding which of two concurrent resolutions of one hold
+wins; that only bites when both together exceed the remainder, and exactly one still wins either way.
+The real cost is detection: an exempt reply takes no seq, so an engine that answers with something stale
+is no longer caught by the order check. **The replacement is built with it**, and it is a check on the
+data rather than on the order: the sequencer counts the committed decisions it has handed over, records
+that count on the request when it dispatches the lookup, and the engine's reply carries how many it had
+applied when it answered. Fewer than the request was dispatched behind means the engine answered from
+state older than its own queue. The lane is quarantined for it, as for a seq gap — the component is
+broken and our state is intact — and it is counted as `stale_answers` so a run can say which of the two
+checks fired.
+
+Three things make that cheap. The count fits in the padding `PendingReply` already had, so a reply is
+still 128 bytes. The expectation is the *sequencer's* own number, never one the engine supplied — a value
+the component produced could not check the component. And it lives beside the slot with the record, so it
+dies with the request rather than being kept anywhere.
+
+It is also strictly stronger than what it replaces, which is worth stating plainly: the order check
+notices a reply arriving out of turn, and this notices an answer that is *wrong* however punctually it
+arrived. Both are exercised by faults the component owns — `violate_order_every` and
+`stale_answer_every` — and the second is drawn in `check` too, where it interacts with the rest.
+
+**What it bought, measured.** `hold-settle --resolve-after 900000`, five seconds, two hundred thousand
+accounts:
+
+| | replies arriving behind their lane | deepest lane |
+|---|---|---|
+| all debits constrained | 4.9% | 5 |
+| `--external-ratio 30` | **0 of 4,936,038** | 0 |
+| `--external-ratio 70` | **0 of 3,927,407** | 0 |
+
+The first row is unchanged and must be: those debits are constrained, and the exemption does not reach
+them. The other two were 99.9% at depths of thirteen and twenty thousand.
+
+**And the arithmetic this was aimed at was wrong.** The plan said order-wait is `lane depth x read
+latency`, which assumes a lane's reads are serialised. They are not — the store is asked for many at once
+and the lane serialises only the *release* of the answers — so it is `lane depth / store queue depth x
+read latency`. Measured before the change with a 200-400us store: deepest lane 286, queue depth 128, so
+about 670us predicted against 464us measured, where the old form would have said 86ms. The concurrency
+divides it. Note also that depth is not independent of the device: the same store that makes reads slow
+caps throughput, so the deepest lane fell from 13,281 with a free store to 286 with a slow one. What the
+exemption removes is the ordering coupling; what no ordering change can remove is the device's own
+ceiling, and with every resolution cold that ceiling is what a run measures.
+
+**Weighed and refused.** Exempting a resolution only when its hold is already answerable inline. It
+targets the same collapse for less, but it makes ordering depend on cache state, so the guarantee
+becomes "two resolutions are ordered only if the second one missed the cache" — a contract that cannot
+be stated to a client. A rule that holds always or never is worth more than a rule that holds usually.
 
 ### Why the fence is conditional, with the price of the alternative
 
@@ -72,6 +167,34 @@ So the fence stays conditional, and the reason is worth stating precisely: a fen
 when the lane already has a reply outstanding, which means the request was going to wait for lane
 order anyway. It adds no latency that was not already there. Making it unconditional turns that
 into a constant, and the speed contract is about the tail.
+
+### The engine's side of contract 1: places reserved in command order
+
+Reordering is the engine's work and checking is the sequencer's, so the structure that keeps a lane in
+order lives in the engine. It reserves a **place** when a command is taken off the queue and fills it when
+the work behind it finishes. Releasing in the order things finished would be the device's order, not the
+lane's — which is the whole reason a read that completes out of order needs this at all.
+
+**The engine cannot know a lane's numbering.** It sees only a subsequence of a lane's seqs: a hold or a
+single-phase transfer never travels this path. So a run of commands begins wherever the fence rule makes
+it begin, and the first place reserved after a lane falls quiet is what defines it. A structure that
+assumed a lane starts at one waits forever for seqs that never arrive — found the direct way, by two
+existing tests hanging.
+
+**An order-exempt reply keeps no place**, so it leaves as soon as its own work is done, and it needs a
+queue of its own: several can be outstanding on one lane and they all carry the same absent seq, so a
+map keyed by seq would let each overwrite the last. That was a lost reply, not a slow one.
+
+**The fault makes two places trade contents.** Breaking the contract on purpose is how the sequencer's
+gap detection is tested, and the temptation is to write a reply into someone else's place — which loses
+the place and hangs the lane instead of testing it. Trading means both replies still leave, each in the
+other's turn, and what the sequencer sees is an arrival out of order.
+
+It lives beside the engine rather than in `stubkit` because contract 1 is the engine's to keep.
+`stubkit`'s simpler queue stays for the dedup stand-in, which answers every command where it dequeues it
+and so never needs a place at all. And what remains of `MemoryPending`'s invented latency is now a test
+fault rather than a model: the index, the buffer and the block store do real work, so a delay on top of
+them would count the same time twice.
 
 ## 2. Hold overlay, commit, and pending apply
 
@@ -108,19 +231,100 @@ Two ordering rules make this safe:
 A missing hold is deliberately not cached: the hold may simply not have been applied to the
 store yet, and caching its absence would reject every later settle of it forever.
 
-### The overlay is a copy plus the reservations, and it starts at create
+### Correction: the overlay is not where a record belongs
 
-Two different things live in one entry: a copy of what the store last confirmed about a hold, and
-the reservations no batch has committed yet. The copy is why judging needs no round trip; the
-reservations exist nowhere else, because the store only learns a decision when its batch commits.
-Splitting them would gain nothing — judging reads `committed_remaining - reserved`, one subtraction.
+The subsection above is how this was built, and it is wrong about one thing. The source design's overlay
+is `tx_id -> live | resolved` — a **state**, a few megabytes, bounded by requests in flight, excluded from
+the checkpoint. It holds no payload. What holds payloads is the engine's own memory tier, on the engine's
+thread, and "immediate" in the design means **no IO** rather than no round trip.
 
-Because the copy is just a value the ledger already decided, a hold the engine is told to create
-goes straight into the overlay: paying a lookup afterwards would be asking to be told what was already
-committed. Measured on `hold-settle`: every resolution took a lookup before, none after, and the report's
-hit ratio shows it. Holds in a budget group are the exception — membership
-and the group's remainder are the store's to report, and judging a group needs both, so those
-still take the lookup path.
+The copy got into the overlay because the overlay was built while the engine was a stub: a hash map
+behind a queue, with no memory of its own. There was no tier to read from, so a reactor-side copy was the
+only way to answer inline. Once the engine had an index, a writeback buffer and a block store, that copy
+became an unnamed cache in the wrong place — and it is what made the layering hard to talk about, because
+"overlay" then meant two things.
+
+**The layering, stated once.**
+
+| | thread | for | bounded by |
+|---|---|---|---|
+| overlay | reactor | consistency: reservations taken at propose, released at apply | requests in flight |
+| memory tier | engine | answering a lookup with no IO | a day of residency |
+| write staging | engine | not writing records that die young | an hour before flush |
+| block store | engine | the rest of the retention window | thirty-two days |
+
+**Two windows, not one.** The source design's hot buffer conflates them and derives its size as
+`peak x writeback`. They are independent: a record is *written* after an hour — which is what bounds
+recovery, because anything unflushed is memory-only and has to be in the checkpoint — and stays
+*readable in memory* for a day, which is what keeps IO off the resolutions that happen within a day. And
+because a flush carries only survivors, a day of residency is not a day of arrivals: it is the current
+hour in full plus the survivors of the previous twenty-three, which is a fraction of it.
+
+**What was measured, and two ways of reading it wrong.** Disabling the reactor-side payload made no
+difference at the design's target rate: p50, p90, p99 and p99.9 all inside run-to-run variation, with
+tens of thousands of lookups and hundreds of thousands of fences occurring. It showed a difference only
+in a saturated run, where the client's queue depth is the limit and so the run is not about the ledger.
+
+The first misreading was mine twice over. A saturated run said the payload was worth about a tenth of
+p50, and I took that as the number. Then, arguing it away, I predicted fence amplification would fall
+with the arrival rate — it does not: it is flat at about nine fences per lookup from the target rate to
+saturation, because the client sends in batches and what latches a lane is the burst, not the rate. And
+then a single rate-limited run showed a fourteen-fold tail improvement from removing the payload, which
+did not reproduce. Three readings, three corrections; the conclusion that survived is the one where
+repeats agreed.
+
+**And then a fourth correction, about what the measurement was for.** Having established that the copy
+cost nothing, I recommended keeping it and renaming it, on the grounds that a neutral measurement does not
+buy a refactor. That was wrong, and the argument against it is not a number: the same fact under two
+owners with nothing to say which is true is what rule 18 forbids, and the rule's one escape — a paired
+write and an invariant check — is unavailable here, because checking agreement means reading the record the
+copy exists to avoid reading. So the copy went. The measurement's job was to say the round trip was
+affordable, not to say whether the copy was allowed.
+
+### The overlay holds decisions, and the record it is judged against comes from the engine
+
+An entry is what the sequencer has decided about a hold and not handed over: the remainder it last told
+the engine, what proposed-but-uncommitted resolutions have taken of that, and whether one of them took
+all of it. Judging reads `committed_remaining - reserved`, one subtraction. None of it is anywhere else,
+because the store only learns a decision when its batch commits.
+
+It used to hold a copy of the record as well — the accounts, the ledger, the group and its totals — so
+that a resolution could be judged without asking anything. That is gone, and **rule 18 is what decided
+it, not a measurement.** The rule allows a local copy of a fact that lives elsewhere on one condition:
+one call sets both and an invariant check proves they agree. This copy had neither, and it could not have
+had them, because proving agreement means reading the record the copy exists to avoid reading. Two owners
+for one fact with nothing to say which is true is the shape every integrity bug in this code has had.
+
+The measurement is what made the change free rather than what asked for it: at the design's target rate,
+removing the copy moved no quantile outside run-to-run variation (`docs/design-notes.md` §2's correction
+has the three ways I misread that experiment first). So the round trip was affordable, and the rule
+decided.
+
+What replaced it: a lookup's reply carries the record to the slot of the request that asked, where it
+lives until that request is answered — which is what bounds it by work in flight, and is why it sits
+beside `WorkItem` rather than inside it (a work item is padded to whole cache lines and has no room).
+
+**And "bounded by work in flight" was not true until it was measured.** A created hold was given an entry
+at once, to carry its remainder and to invalidate any earlier answer of "not there". For a hold resolved
+soon that entry costs nothing; for one resolved late it lives as long as the hold. With
+`--resolve-after 900000` the overlay reached a hundred megabytes and nine hundred thousand entries, none
+of which answered anything — the remainder they carried was what the record already said, and no decision
+had been taken about a hold nobody had resolved. So an entry is created only when something is already
+there to correct, and the same run then holds twenty thousand entries: bounded by requests in flight, as
+claimed, rather than by holds outstanding. The claim came first and the measurement corrected it, which is
+the order this document exists to record.
+`HoldView::compose` puts the two halves together at judge time. Where they disagree about the remainder
+the overlay wins, because a remainder only ever decreases: the sequencer's reading is taken the moment it
+decides, and the engine's can have been in flight across that. The same rule the other way round is why
+an answer of "not there" is dropped when the hold has since been created — otherwise every later
+resolution of a hold that exists would be refused.
+
+Two consequences worth stating. The apply path reads the hold's original size off that same record before
+the slot is released, so a partial settle still costs the engine no read to append the new version — bar
+a resolution judged inside the chain that created the hold, which has no record and sends zero, and then
+the engine reads the version it appended moments ago from its own buffer. And the reactor no longer has a
+hit ratio to report: every resolution asks, and whether the engine answered from memory or from the store
+is the engine's number (`reads: memory=N store=M`), which is where it belonged.
 
 The pending engine's design document records the insert at propose too, so a hold is visible to a
 lookup the moment it is proposed. That is not safe as written: a resolution in a *later* batch could
@@ -139,19 +343,22 @@ sequencer, and what the hold has left follows from the `Apply` the engine is sen
 owner — otherwise a resolution judged inside the chain that created the hold would give back a
 reservation it never took, and the remainder would grow.
 
-Eviction has to leave alone every entry a dispatched request is still going to read. Without that, a
-lookup is answered, the entry is evicted before the judge gets to it, and a resolution is refused
-for a hold that exists. So the entry is pinned when the sequencer decides a request will read it —
-whether it sent a lookup or found the hold already there — and unpinned when that request is
-answered. Answering is the right place to unpin, because every request reaches it, including the
-ones that are rejected; unpinning where the judge reads would leak a pin on every rejection.
+Eviction has to leave alone every entry a dispatched request is still going to read. The failure it
+prevents changed with the copy: it used to be a lookup answered, the entry evicted, and a resolution
+refused for a hold that exists. Now the record is in the slot, so what eviction would lose is the
+*remainder* — and losing that lets an answer already in flight be believed, which is an overdraft rather
+than a false reject. So the entry is created when the lookup is sent, pinned when the sequencer decides a
+request will read it, and unpinned when that request is answered. Answering is the right place to unpin,
+because every request reaches it, including the ones that are rejected; unpinning where the judge reads
+would leak a pin on every rejection.
 
 An answer of "not there" is kept rather than thrown away. A write always reaches the store before a
 later lookup (that is what the write queue is for), so the answer cannot be stale, and keeping it
-means a second resolution of the same missing hold costs no second round trip. The engine's own
-design document splits that answer in two — a hold that was resolved or expired versus one that
-never existed. The stub cannot tell them apart, because it keeps no history of what it removed, so
-it answers with one negative state; the split belongs with the segment expiry that is not built.
+means a second resolution of the same missing hold costs no second round trip — the one resolution that
+needs no record at all. The engine's own design document splits that answer in two — a hold that was
+resolved or expired versus one that never existed. The stub cannot tell them apart, because it keeps no
+history of what it removed, so it answers with one negative state; the split belongs with the segment
+expiry that is not built.
 
 ## 3. Linked groups need two mechanisms the design did not spell out
 
@@ -274,6 +481,7 @@ Summary of the decisions. The sizes are build-checked claims, not measurements:
 | `LaneState` | 32 | at random, several times per request | sized and aligned to divide the line |
 | `WorkItem` | 128 | at random, several times per request | padded to whole lines |
 | `AccountRecord` | 40 | at random, twice per effect | left packed; footprint beats straddling |
+| `Bucket` (hold index) | 32 | at random, twice per lookup | sized and aligned to divide the line — see §11 |
 | `Transfer`, `Request`, `Ack`, `Effect` | 64-112 | streamed in order | size watched, no alignment |
 | SPSC head and tail | one line each | across threads | `CachePadded`, to stop false sharing |
 
@@ -486,3 +694,230 @@ few percent of throughput, so the two numbers come from different runs.
 Latency is split where it can be measured without touching the request path: the client owns
 the end-to-end stamp, and the reactor times propose-to-commit once per batch. There is no
 per-request phase breakdown, because that would need clock reads per request on the hot path.
+
+## 11. The hold index: a bounded probe, and what identifies a slot
+
+The store finds a hold by transaction id, and the structure that does it was chosen for a bounded probe
+rather than a fast average: two candidate buckets of four ways each, so a lookup compares at most eight
+fingerprints and reads at most one record. A generic hash table reaches a similar average with a probe
+that has no bound, and the bound is the whole point — the tail is what the engine owes the sequencer.
+Cuckoo hashing does not remove the unbounded part; it moves it from the lookup to the insert, where a
+displaced entry cascades until it finds room. Everything below is about paying for that move.
+
+**The slot is eight bytes.**
+
+```text
+ 63          48 47        47 46                                    0
+| fingerprint  | ambiguous | address (segment | block | index)      |
+```
+
+Sixteen bits of fingerprint, one bit saying whether that fingerprint is shared, and forty-seven bits of
+address. Four ways make a thirty-two-byte bucket, which divides both supported line sizes, so a probe is
+one line per bucket — two random reads, whatever the load factor. That is the property the whole choice
+exists for.
+
+**A fingerprint does not identify a key, and correctness does not rest on it.** Sixteen bits over the
+design's live set puts roughly a hundred thousand pairs of keys on the same fingerprint *and* the same
+bucket. So the ambiguity is **detected** instead of assumed: a hold the store has never held is the one
+moment uniqueness can be checked for free, so `insert_new` looks, and if anything already in those
+buckets shares the fingerprint it marks both slots. An unmarked slot is known to be the only one with
+its fingerprint there, so finding it reads nothing; a marked one is told apart by reading a record. At
+scale that is a few thousandths of one percent of holds.
+
+This is what lets the path that applies committed decisions read nothing at all. Apply is in order, so a
+read there is an IO nothing can hide — and identifying a slot was the last read on it.
+
+**The cap on a cascade is a latency budget, not a tuning dial.** A hop is a random bucket read, so the
+cap is the worst an insert may cost in cache misses, and an insert sits on the apply path. It is a
+hundred and twenty-eight, measured: at the target load factor a cascade that long always finds a home,
+and the longest observed stops well short of the cap, which is what says the cap is not the binding
+constraint. A cascade also refuses to kick back into the bucket it just came from — one that oscillates
+spends its budget without exploring anything.
+
+**Ninety percent is the target, and the ten percent left empty is not waste.** It is the headroom that
+absorbs a lifetime distribution drifting and a mass expiry falling behind. Going to ninety-five saves a
+twentieth of the index and costs twice the cascade, and still leaves entries that cannot be placed at
+all. The source design's own ninety-percent target is the measured one.
+
+**The table never grows.** Its size is derived from what the configuration declares — arrivals, worst-case
+survivor fraction, retention — so growth would mean the declared worst case has been passed, which is a
+business change and not an event a data structure should paper over. An insert that cannot be placed is
+therefore reported, not absorbed: the remedy is a configuration change and a rolling restart, and the
+index is a derived structure that is rebuilt on the way back up anyway. What makes that safe is that the
+limit is visible long before it is reached — the load factor against what the table was sized for, and
+the longest cascade against the cap, both move well before an insert can fail. `ledgerfio` prints both.
+
+Reproduce with `cargo bench -p ledger-pending --bench index`, which reports lookup hits and misses
+against load factor and size, the relocations per insert with the worst chain, how many entries a table
+filled to a given load factor with a given cap cannot place, and the same lookup against the hash table
+this replaced.
+
+### Weighed and refused, and one conclusion that moved twice
+
+**A stash.** The standard way to absorb an insert that cannot be placed: a small array scanned when the
+buckets miss. It was measured rather than argued, and it does not work here. At a thirty-two-hop cap the
+design's scale would need hundreds of thousands of stashed entries, which is no longer a few cache lines
+in L1 but megabytes scanned linearly — the miss bound collapses. At a hundred and twenty-eight hops there
+is nothing for it to hold. Either way it is the wrong instrument.
+
+**A sixty-four-bit fingerprint (a sixteen-byte slot).** It buys one thing that a shorter fingerprint
+cannot: the home bucket sits inside the fingerprint, so a rehash needs no keys and growing the table is a
+pass over slots rather than over every record. That mattered while growth was thought to be a path the
+engine takes. It is not: growth only follows a business change, which is slow and observable, and the
+remedy is a restart. With growth gone, the wider slot buys nothing and costs twice the index.
+
+The slot width moved twice, and the reasons are worth keeping because each reversal came from a
+correction rather than a preference. Eight bytes first, chosen by pricing the lookup path only. Sixteen
+after the apply path was priced and its identifying read showed up. Back to eight once that read was
+removed by detection rather than by probability — and once it was clear that the growth cost which had
+justified the wider slot belongs to a planned migration, not to an emergency.
+
+One arithmetic error is worth recording with it. The wider fingerprint was first defended with a
+per-lookup collision probability, which is the wrong quantity: what matters is whether *any* pair of live
+keys collides, which is a birthday problem over the live set, and at the design's scale that is a coin
+flip rather than a vanishing chance. The mechanism that replaced the argument — detect at insert, verify
+only where marked — is exact, and needs no probability at all.
+
+## 12. Records live on blocks, and blocks are written once
+
+An address is `(segment, block, index)` packed into the forty-eight bits a slot has spare: six bits of
+segment, thirty-six of block, six of index. The source design packs the same three into forty because
+its slot is a byte smaller and spends the difference on a narrower block field. A block is four
+kilobytes — the unit one read fetches, and so the unit the speed contract is written against — and a
+record is eighty bytes packed, which puts fifty-one on a block. The design's sixty-four per block needs
+its 128-byte record halved by compression; uncompressed that figure is thirty-two. The intra-block
+index is six bits wide either way, because sixty-four is what the format allows.
+
+The bytes are little-endian by declaration, not by inheritance. The moment blocks leave this process
+they are a format, and a format that borrows the machine's byte order is not one.
+
+**A partial resolution appends a new version and the index is repointed.** Blocks are never rewritten.
+The alternative — changing a record where it lies — costs a read before every write on a path that has
+none today, and it gives up the one property everything else rests on: that an address never moves,
+which is what lets an index entry and a group's offset chain be trusted. What it costs instead is
+space: the old version sits there until its segment expires. Partial resolutions are a minority of
+traffic, and this is what append-only means.
+
+**The space comes back only with segment expiry, and expiry is not built.** So the record blocks grow
+with holds *created*, not holds *alive* — a run that creates and resolves the same hold count over and
+over keeps every version. The load driver says so in the same breath as the dedup map and the log,
+because a total that looks like a steady state and is not is worse than no total.
+
+**Growing the index reads the keys back.** A home bucket comes from the whole hash, so doubling the
+table changes it, and a slot carries only a fingerprint — the records are the only thing that knows a
+key. That makes growth the safety net rather than the plan: a deployment sizes the table once, and the
+cost of being wrong about it is a pass over the records rather than a lost hold.
+
+Reproduce with `cargo bench -p ledger-pending --bench index`, which reports lookup hits and misses
+against load factor and size, the relocations per insert with the worst chain, and the same lookup
+against the hash table this replaced.
+
+### The writeback buffer, and why it has to compact
+
+Records are written into a buffer of recent blocks first, and a block leaves it by being compacted:
+only what the index still points at is carried on, packed with the survivors of earlier blocks. The
+alternative — writing each block out whole — makes the store grow with holds *created* rather than holds
+*alive*, which is the figure the whole capacity estimate rests on. The load driver showed the difference
+plainly before the buffer existed: a run that created and resolved the same holds left every record
+behind.
+
+**A record is alive exactly when the index points at it.** Nothing else is tracked: a resolved hold has
+no entry, and a superseded version's entry has moved to the newer one. Both tests are address
+comparisons against the two candidate buckets, so compaction reads nothing it does not already have in
+hand. This is what makes append-only affordable — the garbage identifies itself.
+
+**The window is a count of blocks, not a duration.** The engine has no clock and should not grow one for
+this; the source design's own ceiling for the buffer is bytes, and its one-hour figure is that divided
+by a rate. A count is also what a test can fill.
+
+**And there are two windows, not one.** This was the last place the two were still the same event: a
+record left memory *by being written*, so "on the store and still readable" did not exist as a state. They
+answer different questions and so they have different lengths:
+
+| | length | what it bounds | what it costs |
+|---|---|---|---|
+| flush window | an hour | recovery — what is unwritten is memory-only and has to be in the checkpoint | an hour of arrivals, in full |
+| residency | a day | latency — a resolution inside it costs no IO | a day of *survivors*, because what is resident has been compacted |
+
+A day of arrivals would be tens of gigabytes; a day of survivors is a fortieth of that at the shares these
+runs measure, which is what makes the second window affordable at all. Making the flush window a day
+instead would save writes and is the wrong trade: it is recovery time, and the checkpoint has to carry
+everything that has not been written.
+
+**Both lengths and both shares are configuration, not constants** (`PendingCapacity`), and every size in
+the engine is derived from them rather than set beside them — a block count configured next to the inputs
+could disagree with them, and then the sizing rule would live in two places. The arithmetic is one line
+each: the buffer is an hour of arrivals, residency is a day of arrivals times the share that survives the
+flush window.
+
+**The declared share is checkable rather than trusted.** `survives_flush_window` is a declaration about a
+workload, and `died in buffer` measures the same quantity while the run happens, so the report puts the
+consequence of the declaration next to what the traffic did. On `partial-settle` the default declares half
+survive and the run measures six percent, which says the window is oversized for that workload by more
+than a factor of eight — the kind of statement a constant could not make about itself.
+
+**Survivors are packed together, not one block per flush.** If a tenth of a block's records survive,
+writing them out as their own block would multiply the space that tenth occupies by ten. So survivors
+accumulate into a store block that is written when it is full, which is also what makes the writes
+sequential.
+
+**Compaction moves addresses, and that is why the location token has a fallback.** A survivor's index
+entry follows it — free, because the address is the key to the slot — but a token the sequencer is
+holding now points at a block that no longer exists. It matches no slot, and the resolution falls back
+to the probe. The fallback was built for staleness across a flush before there were flushes; this is the
+case it was for.
+
+### Two ways to read, and which one the traffic actually uses
+
+A lookup submits a read and harvests it later, so a store with a latency does not stop the engine's loop;
+the place its reply will take was already reserved when the command was dequeued, which is what keeps the
+lane in order while completions arrive in the device's. What comes back has to be checked against the key
+before it is believed — the index matches fingerprints, so a fetch can return somebody else's hold, and
+the walk continues to the next candidate rather than answering "not there". Answering absent there would
+reject a hold that exists, a few times in every ten thousand cold resolutions.
+
+Applying a committed decision reads synchronously instead. It has to: apply is in order, and on a virtual
+clock a wait that only time can end never ends. So a store that models a device charges its rate gate
+without holding the caller — which prices the IO and leaves that path's latency unmodelled, and is the
+reason apply-path reads are counted on their own.
+
+**A committed write should carry what the engine would otherwise read back.** A partial resolution has
+to write the record again — append-only — so it needs the whole record, and the engine used to read the
+old version for it. But the request already has it: the record it was answered with lives in its slot
+until it is answered, so the decision carries the hold's original size along with the new remainder and
+what it consumed, and the engine appends without reading. A resolution judged inside the chain that
+created the hold was never answered with a record, so that one still reads — an optimisation with a
+fallback, like the location token. Nothing exercises that fallback outside a unit test: no workload here
+creates a hold and partially settles it inside one chain, so its cost is unmeasured, which is stated
+rather than assumed to be nil.
+
+What it did not remove is the floor. A resolution that follows a partial one arrives with a stale
+location: the record moved when the new version was appended, and the sequencer cannot know where, because
+the address is assigned on the engine's thread. So the slot is found by probing, and a probe's
+fingerprint has to be confirmed against a record — which is a store read when the hold is cold. That
+residue is the verification the wider fingerprint would remove, weighed in §11 and deferred; it now has a
+measurement behind it. Reproduce with `ledgerfio run --workload partial-settle`.
+
+**The load driver reaches neither store path, and the reason changed.** It used to be that a hold cold
+enough to have left the buffer was still in the sequencer's overlay if anything was resolving it, so the
+engine was asked only to write to it — the lookup path was quiet because the sequencer was answering
+instead. That is gone: every resolution now asks the engine. And store reads are still zero on every
+workload here, because residency answers them: on `partial-settle`, of twenty-one million reads about
+eight million were of unwritten blocks and thirteen million of blocks already on the store and still in
+memory, with none reaching the store itself — this while residency ran at its full window and pushed
+records out of memory, so the window was not merely oversized. What that says is that reads concentrate in
+the recent part of the window, which is the assumption the day-long residency was chosen on, now measured
+rather than assumed.
+
+So the fetch path is still exercised only by a store with a latency and a residency window small enough to
+miss — the engine's own tests, and `--store-read` with the windows a deployment would declare. A speed
+contract written about lookups is measuring a path that a correctly sized residency keeps empty; what it
+should be written about is what happens when residency is wrong. Re-run with
+`ledgerfio run --workload partial-settle --duration 10s`.
+
+What the buffer cannot show yet is latency, because the store underneath it is memory: a flush moves
+bytes from one allocation to another. What it can show is counts, and those are the ones that matter
+first — how much of what was written never had to be written out, and how many reads went past the
+buffer. `ledgerfio` reports both, and the first is the number the source design's own inputs disagree
+about: its settle-age distribution implies almost everything is resolved within a day, while its
+survivor fraction implies half of it lives for the full retention. A run now says which.

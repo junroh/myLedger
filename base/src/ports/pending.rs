@@ -28,12 +28,30 @@ pub enum PendingEffect {
         ledger: u32,
         budget: BudgetGroup,
     },
+    /// Append-only means a changed remainder is a new record, so this carries the whole record rather
+    /// than a delta: everything but the hold's original size is on the effect already, and that one field
+    /// comes from the record this request was answered with. Zero means there was none — a resolution
+    /// judged inside the chain that created the hold — and the engine reads the old version instead.
     Reduce {
         pending_ref: TxId,
+        debit_account: AccountId,
+        credit_account: AccountId,
+        /// The hold's original size, or zero when the sequencer could not supply it.
+        amount: Amount,
         remaining: Amount,
+        /// What this resolution took, for the group's total. Carried because the engine would otherwise
+        /// have to read the old remainder back to subtract it.
+        consumed: Amount,
+        ledger: u32,
+        budget: BudgetGroup,
     },
     Remove {
         pending_ref: TxId,
+        /// The group this hold belonged to, and what it takes out of it. Carried so the store needs no
+        /// record to keep a group's total: the decision already knows both, and reading one back would
+        /// be an IO on the path that applies committed effects in order.
+        budget: BudgetGroup,
+        released: Amount,
     },
 }
 
@@ -62,6 +80,11 @@ pub struct PendingReply {
     pub seq: Seq,
     pub pending_ref: TxId,
     pub found: Option<HoldData>,
+    /// Committed decisions the engine had applied when it answered. The sequencer knows how many it had
+    /// sent when it asked, and fewer than that means the engine answered from state older than its own
+    /// queue — a data check where the lane's order used to be the check. It fits in the padding this
+    /// struct already had, so it costs nothing per reply.
+    pub applied: u64,
 }
 
 /// One channel, because order matters: a lookup issued after a hold was removed must not see the
@@ -73,21 +96,22 @@ pub enum PendingCommand {
     Apply(PendingEffect),
 }
 
-/// Whether the engine's overlay can answer about a hold without a round trip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OverlayState {
-    /// Nothing known yet: the sequencer must ask for it.
-    Absent,
-    /// A lookup is already in flight, so a later request only needs to be ordered behind it.
-    LookupSent,
-    /// Answerable inline.
-    Ready,
-    /// The engine looked and the hold is not there. Asking again would get the same answer, because
-    /// a write always reaches the store before a later lookup.
-    Missing,
+/// What the sequencer has decided about a hold and not handed over yet. It exists nowhere else: the
+/// store only learns a decision when its batch commits. Everything a hold *is* — its accounts, its
+/// ledger, its group — comes from the record instead, because that is where it lives.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct OverlayState {
+    /// The remainder the sequencer last told the engine this hold has. `None` when it has told it
+    /// nothing, which makes the record's own remainder the newest there is.
+    pub remaining: Option<Amount>,
+    /// How much of that remainder proposed-but-uncommitted resolutions have taken.
+    pub taken: Amount,
+    /// Whether one of them consumed the hold entirely.
+    pub resolved: bool,
 }
 
-/// What the judge needs about a hold, with uncommitted reservations already deducted.
+/// What the judge needs about a hold: the record the engine answered with, with the sequencer's own
+/// uncommitted decisions already folded in.
 #[derive(Debug, Clone, Copy)]
 pub struct HoldView {
     pub debit_account: AccountId,
@@ -102,26 +126,49 @@ pub struct HoldView {
     pub resolved: bool,
 }
 
-/// Two ways in. The overlay answers inline, because the judge cannot continue without knowing how
-/// much of a hold is left; it carries a copy of what the store last confirmed plus the uncommitted
-/// reservations against it, which exist nowhere else. Everything else is a queue: the sequencer
-/// sends and moves on, a full queue is backpressure, and replies come back in each lane's seq order.
-pub trait PendingPort {
-    /// Takes `&mut self` because the engine may update its own overlay from what it is told — a
-    /// hold it has just been asked to create needs no lookup to be known.
-    fn send(&mut self, command: PendingCommand) -> Result<(), PendingCommand>;
-    fn poll(&self) -> Option<PendingReply>;
+impl HoldView {
+    /// The one place the two halves meet. The record cannot be older than the overlay: a remainder only
+    /// ever decreases, so the smaller of two observations of it is the newer one — and the sequencer's is
+    /// taken the moment it decides, while the engine's answer can have been in flight across that.
+    pub fn compose(record: &HoldData, overlay: OverlayState) -> Self {
+        let committed = overlay.remaining.unwrap_or(record.remaining).min(record.remaining);
+        Self {
+            debit_account: record.debit_account,
+            credit_account: record.credit_account,
+            ledger: record.ledger,
+            budget: record.budget,
+            budget_members: record.budget_members,
+            budget_remaining: record.budget_remaining,
+            remaining: committed - overlay.taken,
+            resolved: overlay.resolved,
+        }
+    }
+}
 
-    fn overlay_state(&self, hold: TxId) -> OverlayState;
-    /// Records that a lookup is on the way.
+/// The **inline** contract, and the reason there are two: the judge cannot continue without knowing
+/// what a hold has left, and that part is the sequencer's own — reservations taken at propose and
+/// released at apply, which no store has been told about yet. So this half runs on the caller's own
+/// thread, answers immediately, and cannot refuse. It is bounded by the requests in flight, and it
+/// holds no copy of a record: the record belongs to the engine, and the reply carries it to the
+/// request that asked.
+pub trait PendingOverlay {
+    /// The engine looked and the hold is not there. Asking again would get the same answer, because a
+    /// write always reaches the store before a later lookup — so this is the one thing a resolution can
+    /// be told without a round trip.
+    fn hold_is_missing(&self, hold: TxId) -> bool;
+    /// A lookup is on the way, so this hold needs somewhere for its pins to go.
     fn begin_lookup(&mut self, hold: TxId);
-    /// Takes the answer, `None` included: an answer of "not there" is as good as any other.
-    fn admit_lookup(&mut self, hold: TxId, found: Option<HoldData>);
-    fn view(&self, hold: TxId) -> Option<HoldView>;
+    /// Takes the answer's remainder, `None` meaning the hold is not there. The record itself goes to
+    /// the request that asked for it.
+    fn admit_lookup(&mut self, hold: TxId, remaining: Option<Amount>);
+    /// A hold the engine has just been told to create has all of itself left, and any earlier answer of
+    /// "not there" is now wrong.
+    fn created(&mut self, hold: TxId, amount: Amount);
+    fn overlay(&self, hold: TxId) -> OverlayState;
 
-    /// A request that will read this hold is in flight, so the engine must keep it whatever its
-    /// eviction policy says. Balanced by `unpin` when that request is answered — otherwise a hold
-    /// evicted between the answer and the judgment would reject a resolution of a hold that exists.
+    /// A request that will read this hold is in flight, so its decisions must be kept whatever the
+    /// eviction policy says. Balanced by `unpin` when that request is answered — otherwise a remainder
+    /// dropped between the answer and the judgment would let a stale record be believed.
     fn pin(&mut self, hold: TxId);
     fn unpin(&mut self, hold: TxId);
 
@@ -133,7 +180,21 @@ pub trait PendingPort {
     /// Give the reservation back after a failed commit.
     fn compensate(&mut self, hold: TxId, amount: Amount, resolves: bool);
 
-    /// Eviction by the engine's own policy, driven from the reactor's tick.
+    /// Eviction of what nothing in flight still needs, driven from the reactor's tick.
     fn maintain(&mut self) -> usize;
     fn overlay_len(&self) -> usize;
+}
+
+/// The **queued** contract: the sequencer sends and moves on, a full queue is backpressure rather
+/// than a lost command, and replies come back later in each lane's seq order. Everything that has to
+/// reach the store — a write, a lookup, a fence — travels this way, which is what keeps them in order
+/// relative to each other.
+///
+/// It carries the inline half rather than replacing it: one component answers both, and which
+/// contract a call belongs to says whether it can fail and whether it crosses a thread.
+pub trait PendingPort: PendingOverlay {
+    /// Takes `&mut self` because the sequencer's own overlay follows what it sends: a hold it has just
+    /// been told to create has all of itself left, and one it has removed is gone.
+    fn send(&mut self, command: PendingCommand) -> Result<(), PendingCommand>;
+    fn poll(&self) -> Option<PendingReply>;
 }

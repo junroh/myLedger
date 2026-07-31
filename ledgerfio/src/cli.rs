@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use ledger_pending::PendingCapacity;
 use ledger_stubkit::LatencyRange;
 
 use crate::workload::WorkloadKind;
@@ -17,9 +18,20 @@ pub struct Options {
     /// accounts, which is what puts several requests on one lane and makes fences appear.
     pub skew: f64,
     /// Fraction of transfers debiting the unconstrained clearing account instead of a user. That
-    /// account needs no balance check, but it is still one lane: this is what shows that an
-    /// unconstrained debit is not order-exempt here.
+    /// account needs no balance check and so keeps no place in its lane: this is the knob that shows
+    /// what order exemption is worth, because without it every resolution on that one account queues
+    /// behind the others.
     pub external_ratio: f64,
+    /// How old a hold is when it is resolved, in holds created since. This is what decides which of the
+    /// engine's windows a resolution lands in — and with it whether a read costs an IO, so it is the knob
+    /// the whole read path is measured against.
+    pub resolve_after: usize,
+    /// What the business declares, and from which the engine derives every size it has. Held as the
+    /// engine's own type rather than as loose fields, so the defaults are its defaults and the sizing
+    /// rule stays in one place.
+    pub capacity: PendingCapacity,
+    /// The most the index may occupy. A declaration whose worst case needs more is refused at the start.
+    pub index_budget: u64,
     /// Length of the measured phase. Funding the accounts happens first and is not measured.
     pub duration: Duration,
     /// Target submissions per second, or 0 to submit as fast as the ledger accepts. Use a rate
@@ -49,7 +61,16 @@ pub struct Options {
     pub raft_round_trip: LatencyRange,
     /// Simulated hold lookup latency. Only settle and void pay it, plus whatever shares their
     /// lane while they are outstanding.
-    pub pending_latency: LatencyRange,
+    /// What a block read costs the pending engine, base and tail. This is the disk the engine does not
+    /// have: everything above the block store is real code doing real work, so an invented delay belongs
+    /// only where the missing device would be. Zero is the exact store, which every other answer is
+    /// measured against.
+    pub store_read: LatencyRange,
+    /// Reads a second the store can serve, zero for no ceiling.
+    pub store_iops: u64,
+    /// Holds the engine's overlay may keep before idle ones are evicted. Small enough and a resolution
+    /// has to ask the engine, which is the only way a run reaches the fetch path at all.
+    pub overlay_limit: usize,
     /// Simulated dedup latency. Every request pays it.
     pub idem_latency: LatencyRange,
     /// Make the pending engine return every nth lane reply out of order, to prove the sequencer
@@ -81,6 +102,9 @@ impl Default for Options {
             accounts: 100_000,
             skew: 1.0,
             external_ratio: 0.0,
+            resolve_after: 0,
+            capacity: PendingCapacity::default(),
+            index_budget: 1 << 30,
             duration: Duration::from_secs(3),
             rate: 0,
             in_flight: 20_000,
@@ -95,10 +119,11 @@ impl Default for Options {
                 Duration::from_micros(900),
                 Duration::from_micros(1_400),
             ),
-            pending_latency: LatencyRange::new(
-                Duration::from_micros(100),
-                Duration::from_micros(800),
-            ),
+            // Zero: the default run measures the engine as built, and the store it was built on is
+            // memory. Asking for a device's timing is what the knob is for.
+            store_read: LatencyRange::fixed(Duration::ZERO),
+            store_iops: 0,
+            overlay_limit: 1 << 20,
             idem_latency: LatencyRange::new(Duration::from_micros(1), Duration::from_micros(5)),
             violate_order_every: 0,
             raft_fail_every: 0,
@@ -197,6 +222,14 @@ impl Cli {
             "accounts" => options.accounts = Self::count(value)?,
             "skew" => options.skew = Self::ratio(value)?.max(1.0),
             "external-ratio" => options.external_ratio = Self::ratio(value)?,
+            "resolve-after" => options.resolve_after = Self::count(value)? as usize,
+            "daily-arrivals" => options.capacity.daily_arrivals = Self::count(value)?,
+            "retention-days" => options.capacity.retention_days = Self::count(value)?,
+            "survivor-share" => options.capacity.worst_survivor_share = Self::ratio(value)?,
+            "flush-survivors" => options.capacity.survives_flush_window = Self::ratio(value)?,
+            "flush-window" => options.capacity.flush_window_hours = Self::count(value)?,
+            "residency" => options.capacity.residency_hours = Self::count(value)?,
+            "index-budget" => options.index_budget = Self::count(value)?,
             "duration" => options.duration = Self::duration(value)?,
             "rate" => options.rate = Self::count(value)?,
             "in-flight" => options.in_flight = Self::count(value)?,
@@ -208,7 +241,9 @@ impl Cli {
             "batch-linger" => options.batch_linger = Self::duration(value)?,
             "raft-in-flight" => options.raft_in_flight = Self::count(value)? as usize,
             "raft-rtt" => options.raft_round_trip = Self::latency(value)?,
-            "pending-latency" => options.pending_latency = Self::latency(value)?,
+            "store-read" => options.store_read = Self::latency(value)?,
+            "store-iops" => options.store_iops = Self::count(value)?,
+            "overlay-limit" => options.overlay_limit = Self::count(value)? as usize,
             "idem-latency" => options.idem_latency = Self::latency(value)?,
             "violate-order-every" => options.violate_order_every = Self::count(value)? as u32,
             "raft-fail-every" => options.raft_fail_every = Self::count(value)?,

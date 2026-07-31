@@ -2,7 +2,7 @@ use ledger_base::ports::{AccountPort, IdempotencyPort, PendingPort, RaftPort};
 use ledger_base::Clock;
 
 use super::Reactor;
-use ledger_base::ports::{IdemReply, IdemVerdict, PendingReply};
+use ledger_base::ports::{HoldView, IdemReply, IdemVerdict, PendingReply};
 use ledger_base::{AckOutcome, Amount, Effect, EffectKind, LedgerError, TransferKind, TxId};
 
 use crate::log_kind::LogKind;
@@ -48,13 +48,26 @@ where
 
     pub fn on_pending(&mut self, reply: PendingReply) {
         let slot = reply.correlation.raw();
-        let lane = self.pipeline.item(slot).debit;
-        self.lanes.get_mut(lane).pending_reply_arrived();
+        let item = *self.pipeline.item(slot);
+        if item.keeps_lane_place() {
+            self.lanes.get_mut(item.debit).pending_reply_arrived();
+        }
+        // The engine answered from state older than a decision it had already been handed. For a request
+        // that keeps a place in its lane the seq check would have caught a reordering; for one that keeps
+        // none — a resolution on an unconstrained account — this is the check that replaces it, and it is
+        // stronger: it is about the data rather than the order in which it arrived.
+        if reply.applied < self.pipeline.expected_applies(slot) {
+            self.on_stale_answer(item.lane, item.debit);
+        }
         if reply.pending_ref.is_absent() {
             self.release_dep(slot, DepFlags::PENDING);
             return;
         }
-        self.pending.admit_lookup(reply.pending_ref, reply.found);
+        // The record goes to the request that asked for it, and the engine is told the answer arrived so
+        // its own state stops saying a lookup is on the way. The record is not kept anywhere else: the
+        // engine owns the copy that outlives this request.
+        self.pipeline.set_record(slot, reply.found);
+        self.pending.admit_lookup(reply.pending_ref, reply.found.map(|found| found.remaining));
         self.release_dep(slot, DepFlags::PENDING);
     }
 
@@ -85,7 +98,7 @@ where
         let item = *self.pipeline.item(slot);
         match self
             .accept(&item)
-            .and_then(|_| self.build_effect(&item, None))
+            .and_then(|_| self.build_effect(slot, &item, None))
         {
             Ok(effect) => {
                 self.take_overlays(&effect);
@@ -109,10 +122,10 @@ where
             // lane would show a gap for the requests behind it.
             let outcome = self
                 .accept(&item)
-                .and_then(|_| self.build_effect(&item, Some(&scratch)));
+                .and_then(|_| self.build_effect(slot, &item, Some(&scratch)));
             match (failure, outcome) {
                 (None, Ok(effect)) => {
-                    self.hold_this_chain_decided(&effect, &mut budgets, &mut scratch);
+                    self.hold_this_chain_decided(slot, &effect, &mut budgets, &mut scratch);
                     effects.push(effect);
                 }
                 (None, Err(err)) => failure = Some(err),
@@ -138,17 +151,18 @@ where
     /// it resolves of a budget group, and the scratch shows it to the legs behind it.
     fn hold_this_chain_decided(
         &mut self,
+        slot: SlotId,
         effect: &Effect,
         budgets: &mut BudgetCoverage,
         scratch: &mut LinkedScratch,
     ) {
         if !effect.budget.is_absent() {
-            if let Some(hold) = self.pending.view(effect.pending_ref) {
+            if let Some(record) = self.pipeline.record(slot) {
                 budgets.note(
                     effect.budget,
                     effect.amount,
-                    hold.budget_members,
-                    hold.budget_remaining,
+                    record.budget_members,
+                    record.budget_remaining,
                 );
             }
         }
@@ -224,6 +238,7 @@ where
     /// earlier legs of the same chain decided.
     pub(super) fn build_effect(
         &self,
+        slot: SlotId,
         item: &WorkItem,
         chain: Option<&LinkedScratch>,
     ) -> Result<Effect, LedgerError> {
@@ -231,9 +246,18 @@ where
         match item.kind {
             TransferKind::SinglePhase => self.direct_effect(item, EffectKind::Post, extra),
             TransferKind::Hold => self.direct_effect(item, EffectKind::Hold, extra),
-            TransferKind::Settle => self.resolving_effect(item, EffectKind::Settle, chain),
-            TransferKind::Void => self.resolving_effect(item, EffectKind::Void, chain),
+            TransferKind::Settle => self.resolving_effect(slot, item, EffectKind::Settle, chain),
+            TransferKind::Void => self.resolving_effect(slot, item, EffectKind::Void, chain),
         }
+    }
+
+    /// The hold a resolution is judged by, from the two places it comes from: the record the engine
+    /// answered this very request with, and what the sequencer has decided about that hold since. Rule
+    /// 18 is why it is not one place — the record is the engine's, and a second copy here would be the
+    /// same fact under two owners.
+    fn hold_view(&self, slot: SlotId, hold: TxId) -> Option<HoldView> {
+        let record = self.pipeline.record(slot)?;
+        Some(HoldView::compose(record, self.pending.overlay(hold)))
     }
 
     pub(super) fn direct_effect(
@@ -272,13 +296,14 @@ where
     /// Settle and void share every check; only the amount they consume differs.
     pub(super) fn resolving_effect(
         &self,
+        slot: SlotId,
         item: &WorkItem,
         kind: EffectKind,
         chain: Option<&LinkedScratch>,
     ) -> Result<Effect, LedgerError> {
         let hold = chain
             .and_then(|scratch| scratch.hold(item.tx.pending_ref))
-            .or_else(|| self.pending.view(item.tx.pending_ref))
+            .or_else(|| self.hold_view(slot, item.tx.pending_ref))
             .ok_or(LedgerError::PendingRefNotFound(item.tx.pending_ref))?;
         if hold.resolved {
             return Err(LedgerError::PendingRefAlreadyResolved);

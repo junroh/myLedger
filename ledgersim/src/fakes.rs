@@ -7,12 +7,14 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use ledger_base::ports::{
-    HoldData, HoldView, IdemReply, IdemRequest, IdemVerdict, IdempotencyPort, OverlayState,
+    IdemReply, IdemRequest, IdemVerdict, IdempotencyPort, OverlayState,
     PendingCommand, PendingEffect, PendingPort, PendingReply, RaftCommit, RaftOutcome, RaftPort,
-    RaftProposal,
+    RaftProposal, PendingOverlay,
 };
 use ledger_base::{Amount, FxHashMap, Prng, TxId};
-use ledger_pending::HoldOverlay;
+use ledger_pending::{
+    HoldOverlay, PendingEngine, DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS,
+};
 use ledger_stubkit::{LaneOrderer, Server, ServerStats};
 
 /// How fast each component answers, and how much it keeps. Nothing here misbehaves — a slow component
@@ -32,9 +34,12 @@ pub struct Timings {
     pub pending_rate: u64,
     /// Holds the overlay may keep. What `check` varies, so eviction and pinning are exercised.
     pub resident_holds: usize,
-    /// How often the pending engine can answer a resolution from memory, as a percentage. This is
-    /// the black-box way to say it: how many entries a cache needs is that component's own question.
-    pub pending_hit_percent: u64,
+    /// The engine's two memory windows, in blocks. `check` makes them small on purpose: with a real
+    /// deployment's windows almost every resolution is answered from memory, so the fetch path — the
+    /// candidate walk, the fingerprint confirmation, replies completing in the device's order rather
+    /// than the lane's — would never run under fault injection, which is the one place it should.
+    pub flush_blocks: usize,
+    pub resident_blocks: usize,
     pub idem_nanos: u64,
     pub raft_nanos: u64,
     /// The mean of consensus's tail. A fixed round trip makes every batch equally late, which is the
@@ -48,6 +53,9 @@ pub struct Timings {
 pub struct Faults {
     /// Answer every nth lane reply early, breaking contract 1 on purpose.
     pub violate_order_every: u32,
+    /// Answer every nth lookup as if the engine had applied less than it was given. The other way to
+    /// break contract 1, and the only one that can be caught for a reply holding no place in its lane.
+    pub stale_answer_every: u32,
     /// Refuse every nth batch.
     pub fail_every: u64,
     /// Answer every nth pair of batches in the wrong order.
@@ -68,8 +76,13 @@ impl Timings {
             pending_tail_nanos: pick(3) * step_nanos,
             pending_rate: 0,
             resident_holds: if pick(3) == 0 { 0 } else { 1 << 16 },
-            // `check` is about the mechanism, so every hold is admitted and eviction decides the rest.
-            pending_hit_percent: 100,
+            // Windows small enough that records leave memory during a two-thousand-step run, so the seeds
+            // cover the fetch path — the candidate walk, the fingerprint confirmation, and replies
+            // completing in the device's order — while the faults are on. A deployment's windows would
+            // answer everything from memory, which is the right answer there and no coverage here. One
+            // seed in four keeps them wide, so the memory path is still exercised too.
+            flush_blocks: if pick(4) == 0 { DEFAULT_FLUSH_BLOCKS } else { 1 + pick(3) as usize },
+            resident_blocks: if pick(4) == 0 { DEFAULT_RESIDENT_BLOCKS } else { pick(3) as usize },
             idem_nanos: pick(3) * step_nanos,
             raft_nanos: (1 + pick(4)) * step_nanos,
             raft_tail_nanos: pick(3) * step_nanos,
@@ -83,10 +96,11 @@ impl From<&crate::sim::Plan> for Timings {
             pending_nanos: plan.pending_nanos,
             pending_tail_nanos: plan.pending_tail_nanos,
             pending_rate: plan.pending_rate,
+            flush_blocks: plan.flush_blocks,
+            resident_blocks: plan.resident_blocks,
             // Eviction is not what a capacity run is asking about, so the overlay is given room and the
             // hit ratio is set outright.
             resident_holds: 1 << 20,
-            pending_hit_percent: plan.pending_hit_percent,
             idem_nanos: plan.idem_nanos,
             raft_nanos: plan.raft_nanos,
             raft_tail_nanos: plan.raft_tail_nanos,
@@ -102,6 +116,7 @@ impl Faults {
         let mut pick = |n: u64| prng.next_u64() % n;
         Self {
             violate_order_every: if pick(4) == 0 { 2 + pick(6) as u32 } else { 0 },
+            stale_answer_every: if pick(5) == 0 { 2 + pick(8) as u32 } else { 0 },
             fail_every: if pick(3) == 0 { 3 + pick(8) } else { 0 },
             reorder_every: if pick(5) == 0 { 2 + pick(6) } else { 0 },
             inbox_depth: if pick(3) == 0 { 2 + pick(8) as usize } else { 64 + pick(256) as usize },
@@ -122,19 +137,21 @@ pub struct PendingFake(Rc<RefCell<PendingState>>);
 
 struct PendingState {
     overlay: HoldOverlay,
-    store: FxHashMap<TxId, HoldData>,
+    /// The engine's own store, shared with the real one: a simulation that kept its own copy would
+    /// be exercising something else.
+    store: PendingEngine,
     inbox: VecDeque<(u64, PendingCommand)>,
     /// Each held result carries when the device finished it, so what the lane's order cost can be
     /// told apart from what the device cost.
     orderer: LaneOrderer<(u64, PendingReply), u64>,
+    /// Claim to have applied less than it has, every nth answer.
+    stale_answer_every: u32,
+    answers: u64,
     ready: VecDeque<PendingReply>,
     now: u64,
-    /// How often a resolution can be answered from memory. Applied when a hold is created, since that is
-    /// where the engine would decide to keep it.
-    hit_percent: u64,
-    /// The engine, as the sequencer sees it: a service with a latency, a tail and a rate. A resident hit
-    /// never reaches it — the sequencer reads the overlay inline — so what arrives here is misses,
-    /// fences and writes.
+    /// The engine, as the sequencer sees it: a service with a latency, a tail and a rate. Every
+    /// resolution arrives here, because the record it judges by is the engine's; what the engine's own
+    /// memory saves is IO below this, which is `ledgerfio`'s store model rather than one number here.
     engine: Server,
     prng: Prng,
     order_wait: OrderWait,
@@ -160,12 +177,13 @@ impl PendingFake {
     pub fn new(timings: Timings, faults: Faults, seed: u64) -> Self {
         Self(Rc::new(RefCell::new(PendingState {
             overlay: HoldOverlay::new(64, timings.resident_holds, 64),
-            store: FxHashMap::default(),
+            store: PendingEngine::with_windows(timings.flush_blocks, timings.resident_blocks),
             inbox: VecDeque::new(),
             orderer: LaneOrderer::new(faults.violate_order_every),
+            stale_answer_every: faults.stale_answer_every,
+            answers: 0,
             ready: VecDeque::new(),
             now: 0,
-            hit_percent: timings.pending_hit_percent,
             engine: Server::new(
                 timings.pending_nanos,
                 timings.pending_tail_nanos,
@@ -186,6 +204,20 @@ impl PendingFake {
             return Some(state.now);
         }
         state.earliest
+    }
+
+    /// Inserts the engine's index could not take. A hold the log says exists and the store does not have,
+    /// which nothing inside the ledger can notice yet: a write has no reply to carry the news back on. So
+    /// the simulation checks it from outside.
+    pub fn overflowed(&self) -> u64 {
+        self.0.borrow().store.traffic().overflowed
+    }
+
+    /// Reads the fake's engine had to take from its store. The number that says whether a sweep covered
+    /// the fetch path at all — the candidate walk and the fingerprint confirmation only run there, and a
+    /// run whose windows answered everything from memory has tested neither.
+    pub fn store_reads(&self) -> u64 {
+        self.0.borrow().store.traffic().store_reads
     }
 
     pub fn engine(&self) -> ServerStats {
@@ -219,10 +251,11 @@ impl PendingFake {
                 // after it either way, and the engine's queue is what the write actually costs.
                 PendingCommand::Apply(effect) => {
                     state.engine_time();
-                    state.write(effect);
+                    state.store.write(effect);
                 }
                 PendingCommand::Lookup(lookup) => {
-                    let found = state.store.get(&lookup.pending_ref).copied();
+                    let found = state.store.lookup(lookup.pending_ref);
+                    let applied = state.claimed_applies();
                     let at = state.engine_time();
 
                     state.emit(
@@ -232,6 +265,7 @@ impl PendingFake {
                             seq: lookup.seq,
                             pending_ref: lookup.pending_ref,
                             found,
+                            applied,
                         },
                         at,
                     );
@@ -239,6 +273,7 @@ impl PendingFake {
                 // A fence reads nothing, but it is still a command the engine has to answer, and it
                 // leaves in its lane's order — which is what makes it wait behind a read there.
                 PendingCommand::Fence(fence) => {
+                    let applied = state.claimed_applies();
                     let at = state.engine_time();
                     state.emit(
                         PendingReply {
@@ -247,6 +282,7 @@ impl PendingFake {
                             seq: fence.seq,
                             pending_ref: TxId::ABSENT,
                             found: None,
+                            applied,
                         },
                         at,
                     )
@@ -276,10 +312,16 @@ impl PendingState {
         self.orderer.push(reply.lane, at, (at, reply));
     }
 
-    /// Whether the engine keeps this hold in memory. Drawn, so the hit ratio is what was asked for
-    /// rather than whatever an eviction policy happens to produce.
-    fn keeps_it(&mut self) -> bool {
-        self.hit_percent >= 100 || self.prng.next_u64() % 100 < self.hit_percent
+    /// What this answer says the engine had applied. Truthful unless the fault is on.
+    fn claimed_applies(&mut self) -> u64 {
+        let applied = self.store.applied();
+        self.answers += 1;
+        let stale = self.stale_answer_every > 0
+            && self.answers.is_multiple_of(u64::from(self.stale_answer_every));
+        if stale {
+            return applied.saturating_sub(1);
+        }
+        applied
     }
 
     /// What the engine's own work costs, whatever the command is.
@@ -288,72 +330,17 @@ impl PendingState {
         self.engine.serve(now, &mut self.prng)
     }
 
-    fn write(&mut self, effect: PendingEffect) {
-        match effect {
-            PendingEffect::Create {
-                tx_id,
-                debit_account,
-                credit_account,
-                amount,
-                ledger,
-                budget,
-            } => {
-                self.store.insert(
-                    tx_id,
-                    HoldData {
-                        debit_account,
-                        credit_account,
-                        amount,
-                        remaining: amount,
-                        ledger,
-                        budget,
-                        budget_members: 0,
-                        budget_remaining: 0,
-                    },
-                );
-            }
-            PendingEffect::Reduce { pending_ref, remaining } => {
-                if let Some(hold) = self.store.get_mut(&pending_ref) {
-                    hold.remaining = remaining;
-                }
-            }
-            PendingEffect::Remove { pending_ref } => {
-                self.store.remove(&pending_ref);
-            }
-        }
-    }
-
     /// The overlay follows what the store is told, exactly as the real engine does.
     fn note(&mut self, command: PendingCommand) {
         let PendingCommand::Apply(effect) = command else {
             return;
         };
         match effect {
-            PendingEffect::Create {
-                tx_id,
-                debit_account,
-                credit_account,
-                amount,
-                ledger,
-                budget,
-            } if budget.is_absent() && self.keeps_it() => self.overlay.admit(
-                tx_id,
-                HoldData {
-                    debit_account,
-                    credit_account,
-                    amount,
-                    remaining: amount,
-                    ledger,
-                    budget,
-                    budget_members: 0,
-                    budget_remaining: 0,
-                },
-            ),
-            PendingEffect::Reduce { pending_ref, remaining } => {
+            PendingEffect::Create { tx_id, amount, .. } => self.overlay.created(tx_id, amount),
+            PendingEffect::Reduce { pending_ref, remaining, .. } => {
                 self.overlay.note_remaining(pending_ref, remaining)
             }
-            PendingEffect::Remove { pending_ref } => self.overlay.forget(pending_ref),
-            _ => {}
+            PendingEffect::Remove { pending_ref, .. } => self.overlay.forget(pending_ref),
         }
     }
 }
@@ -375,21 +362,27 @@ impl PendingPort for PendingFake {
     fn poll(&self) -> Option<PendingReply> {
         self.0.borrow_mut().ready.pop_front()
     }
+}
 
-    fn overlay_state(&self, hold: TxId) -> OverlayState {
-        self.0.borrow().overlay.state(hold)
+impl PendingOverlay for PendingFake {
+    fn hold_is_missing(&self, hold: TxId) -> bool {
+        self.0.borrow().overlay.hold_is_missing(hold)
     }
 
     fn begin_lookup(&mut self, hold: TxId) {
         self.0.borrow_mut().overlay.begin_lookup(hold);
     }
 
-    fn admit_lookup(&mut self, hold: TxId, found: Option<HoldData>) {
-        self.0.borrow_mut().overlay.admit_lookup(hold, found);
+    fn admit_lookup(&mut self, hold: TxId, remaining: Option<Amount>) {
+        self.0.borrow_mut().overlay.admit_lookup(hold, remaining);
     }
 
-    fn view(&self, hold: TxId) -> Option<HoldView> {
-        self.0.borrow().overlay.view(hold)
+    fn created(&mut self, hold: TxId, amount: Amount) {
+        self.0.borrow_mut().overlay.created(hold, amount);
+    }
+
+    fn overlay(&self, hold: TxId) -> OverlayState {
+        self.0.borrow().overlay.overlay(hold)
     }
 
     fn pin(&mut self, hold: TxId) {

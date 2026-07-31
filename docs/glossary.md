@@ -39,7 +39,7 @@ group. The two meet only where a chain resolves a group, which is the coverage c
 | **quarantine** | isolating one lane after a gap. | `LaneState::quarantine`, `Safety` |
 | **fail-stop** | halting the sequencer when the fault is not confined to one lane. | `Safety::fail_stop`, `LedgerError::FailStop` |
 | **fence** | an ordering token on the pending path for a request that needs no hold data. | `PendingFence`, `Metrics::fences` |
-| **order exemption** | a request whose debit account is unconstrained and which reads no hold: it keeps no place in the lane order, so it never fences. | `LaneState::UNORDERED`, `Metrics::order_exempt` |
+| **order exemption** | a request whose debit account is unconstrained: it keeps no place in the lane order, so it never fences and nothing queues behind it. One clause, because the lane exists to protect a balance. A resolution is included, and what it gives up is covered by **stale answer**. | `LaneState::UNORDERED`, `WorkItem::keeps_lane_place`, `Metrics::order_exempt` |
 
 ## The judging view
 
@@ -47,7 +47,9 @@ group. The two meet only where a chain resolves a group, which is the coverage c
 |---|---|---|
 | **committed** | the durable four columns. | `AccountRecord` |
 | **speculative overlay** | availability already promised to proposed-but-uncommitted requests. Reducing deltas only. | `LaneState::speculative` |
-| **pending overlay** | a copy of each hold's committed remainder plus what proposed-but-uncommitted resolutions have taken from it. Owned by the pending engine, read inline. | `HoldOverlay`, `OverlayState`, `PendingPort::view` |
+| **pending overlay** | what the sequencer has decided about a hold and not handed over: the remainder it last told the engine, and what proposed-but-uncommitted resolutions have taken of that. Never a copy of a record — see **hold record**. Bounded by requests in flight. | `HoldOverlay`, `OverlayState`, `PendingOverlay::overlay` |
+| **hold record** | what a hold *is*: its two accounts, its ledger, its group and the group's totals. The engine owns it; a lookup carries it to the request that asked, which keeps it in its slot until it is answered. | `HoldData`, `SlotPool::record` |
+| **hold view** | the two put together, which is what the judge decides on. The overlay wins on the remainder, because a decision cannot be older than an answer that was in flight across it. | `HoldView::compose` |
 | **chain scratch** | availability a linked chain's own earlier legs bring in, visible only inside that chain. | `LinkedScratch` |
 
 ## Stages and pipeline
@@ -60,10 +62,37 @@ group. The two meet only where a chain resolves a group, which is the coverage c
 | **propose** | S4: hand a batch to consensus. | `Reactor::propose`, `Batcher` |
 | **apply** | S5: apply committed effects in order. | `Reactor::apply`, `AccountPort::apply` |
 | **effect** | what the leader decided, replicated and applied without re-deciding. | `Effect` |
-| **lookup** | asking the pending engine for a hold its overlay does not have. | `PendingLookup`, `begin_lookup`, `admit_lookup`, `OverlayState::LookupSent` |
+| **stale answer** | a reply reflecting fewer committed decisions than the engine had already been handed. The data check that stands in for the lane's order on a request keeping no place in it; treated as a contract-1 violation. | `Metrics::stale_answers`, `PendingReply::applied` |
+| **lookup** | asking the pending engine for the record a resolution is judged by. Every resolution sends one, bar those of a hold the engine has already said is not there. | `PendingLookup`, `begin_lookup`, `admit_lookup`, `hold_is_missing` |
 | **pin** | keeping an overlay entry while a dispatched request is still going to read it, whatever the eviction policy says. | `PendingPort::pin`, `unpin` |
 | **log event** | a diagnostic record. Not the ledger's durable log, which is consensus. | `LogEvent`, `LogSink`, `LogKind` |
 | **client queue depth** | requests the client has sent and not had answered. `fio` calls it iodepth; throughput is depth over latency, so it bounds what the client can ask for, not what the ledger can do. Always say whose depth — the sequencer's slots and a component's inbox are different bounds. | `Plan::queue_depth`, `ledgersim capacity --qd` |
 | **slots** | requests the sequencer can hold at once. Has to cover the queue depth, or the excess is refused as overload. | `Capacity::slots` |
 | **inbox depth** | commands a component holds before refusing. Refusing is what makes the sequencer defer a dispatch. | `Faults::inbox_depth`, `Capacity::pending_write_backlog` |
 | **proposals in flight** | batches consensus may have outstanding. Times the batch cap, the work one round trip hides. Not the client's queue depth. | `BatchPolicy::in_flight`, `--batches-in-flight` |
+
+## Inside the pending engine
+
+The engine's own structures, which nothing outside it names. The sequencer knows two contracts and
+neither mentions any of these.
+
+| term | means | in code |
+|---|---|---|
+| **inline contract** | the half of the pending port answered on the caller's thread, immediately, and unable to refuse. It is the overlay and nothing else: the sequencer's own decisions, which need no round trip because they are already here. | `PendingOverlay` |
+| **queued contract** | the other half: send and move on, a full queue is backpressure, replies come back in each lane's seq order. | `PendingPort`, `PendingCommand`, `PendingReply` |
+| **hold index** | where a hold is, by transaction id. Fingerprints and addresses only, so a shared fingerprint has to be told apart by reading a record — and the index says when that is necessary. | `HoldTable`, `Candidates` |
+| **ambiguity bit** | a slot saying its fingerprint is shared with another live key in the same bucket. Set when the second of the pair is inserted, which is the one moment it can be noticed for free. | `insert_new`, `HoldTable::ambiguous` |
+| **cascade cap** | the most relocations one insert may make. A hop is a random read and an insert is on the apply path, so this is a latency budget rather than a dial. | `MAX_HOPS` |
+| **declared maximum** | the live holds the configuration says the worst case reaches: arrivals x worst-case survivor fraction x retention. The index is sized from it and never grows. | `LOAD_TARGET`, `DEFAULT_SLOTS` |
+| **record** | what a hold is, on a block: its key and the hold, packed and little-endian. | `encode`, `decode`, `RECORD_BYTES` |
+| **block** | what one read fetches, and so the unit the speed contract is written against. Written once, never rewritten. | `BLOCK_BYTES`, `BlockStore` |
+| **address** | segment, block, and which record of the block, in the bits an index slot has spare. | `BlockAddr` |
+| **location token** | where the engine last said a hold's record was, carried back with the decision so applying it needs no record read. Opaque, leader-local, and always safe to be stale — a token that matches no slot falls back to the probe. | `HoldLocation`, `PendingEffect::Remove::location` |
+| **record log** | the block being filled and the sealed ones behind it. Append-only: a changed remainder is a new record, not an edited one. | `RecordLog` |
+| **block store** | what answers for blocks. Bytes, so that memory today and a file or a volume later need no change above it. | `BlockStore`, `MemBlockStore` |
+| **writeback buffer** | the recent blocks not written to the store yet. A record resolved while its block is here never reaches the store. Its length is the **flush window**, which bounds recovery. | `RecordLog`, `flush_blocks` |
+| **residency** | blocks already written to the store and kept in memory anyway, so a resolution inside the window costs no IO. Independent of the flush window in both directions: a day long where flushing is an hour, and holding only survivors, because what is resident has been compacted. | `RecordLog::resident`, `resident_blocks` |
+| **window** | how many blocks the buffer holds before its oldest is compacted. A count, not a duration — the engine has no clock. | `DEFAULT_WINDOW_BLOCKS` |
+| **compaction** | carrying a block's survivors on and dropping the rest. A record is alive exactly when the index points at it. | `PendingEngine::compact`, `HoldTable::points_at` |
+| **orderer** | the engine's side of contract 1: replies leave in the order their commands arrived, however they finished. | `Orderer`, `OrderWait` |
+| **place** | a reply's spot in its lane, reserved when the command is dequeued and filled when the work finishes. | `Orderer::expect`, `Orderer::fill` |

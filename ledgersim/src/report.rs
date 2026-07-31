@@ -4,7 +4,6 @@
 
 use std::mem::size_of;
 
-use ledger_base::ports::HoldData;
 use ledger_base::Effect;
 
 use crate::sim::{Failure, Plan, Prediction, Report};
@@ -120,9 +119,10 @@ pub fn evidence(plan: &Plan, prediction: &Prediction) {
         share(charge.apply_ns),
         share(charge.tick_ns)
     );
-    // An arrival rate, not a served one. Hits are not here — the sequencer reads those inline, so what
-    // the pending engine is asked for is misses, fences and writes. Both numbers are computed, not
-    // assumed: the rate follows the traffic, and the concurrency follows from it and the latency.
+    // An arrival rate, not a served one: every resolution is here, because the record it is judged by
+    // is the engine's. What the engine's own memory saves is the IO below this, not a command. Both
+    // numbers are computed, not assumed: the rate follows the traffic, and the concurrency follows from
+    // it and the latency.
     let asked = rate_of(prediction.pending_commands, prediction);
     let in_flight = asked * plan.pending_nanos as f64 / 1e9;
     if plan.pending_rate > 0 {
@@ -154,10 +154,11 @@ pub fn evidence(plan: &Plan, prediction: &Prediction) {
         );
     }
     let lookups = prediction.metrics.pending_lookups;
-    let hits = prediction.metrics.pending_hits;
     println!(
-        "  pending path   lookups={lookups} overlay hits={hits} ({:.0}% hit) evicted={} fences={}",
-        hits as f64 / (hits + lookups).max(1) as f64 * 100.0,
+        "  pending path   lookups={lookups} store reads={} ({:.0}% of them cost an IO) \
+         overlay evicted={} fences={}",
+        prediction.store_reads,
+        prediction.store_reads as f64 / lookups.max(1) as f64 * 100.0,
         prediction.metrics.holds_evicted,
         prediction.metrics.fences
     );
@@ -229,16 +230,19 @@ fn sizing(plan: &Plan, prediction: &Prediction) {
         prediction.metrics.committed,
         effect_bytes
     );
-    // By kind and never summed: a create is a record the engine must keep, a reduce may cost nothing
-    // or a new version, and a remove may free space or write a tombstone. One total would read as an
-    // occupancy this tool has no way to predict.
+    // By kind and never summed: a create is a record the engine must keep, a reduce appends a new
+    // version, and a remove frees nothing until a segment expires. One total would read as an
+    // occupancy this tool has no way to predict. Priced at the record the engine actually writes, not
+    // at the struct the port passes around — those were the same size by accident once, and a figure
+    // that moves when a port field is added was never measuring the store.
     println!(
-        "  engine told    create={} ({:.1}MB of hold records) reduce={} remove={} — at {} accounts, \
+        "  engine told    create={} reduce={} remove={} ({:.1}MB of records written) — at {} accounts, \
          what the engine keeps of that is its own layout's answer",
         prediction.metrics.pending_creates,
-        mb(prediction.metrics.pending_creates as usize * size_of::<HoldData>()),
         prediction.metrics.pending_reduces,
         prediction.metrics.pending_removes,
+        mb((prediction.metrics.pending_creates + prediction.metrics.pending_reduces) as usize
+            * ledger_pending::RECORD_BYTES),
         plan.accounts
     );
 }
@@ -371,8 +375,10 @@ pub struct Coverage {
     chains_rejected: u64,
     fences: u64,
     exempt: u64,
+    overflowed: u64,
+    store_reads: u64,
+    stale_answers: u64,
     lookups: u64,
-    hits: u64,
     evicted: u64,
     gaps: u64,
     quarantines: u64,
@@ -390,8 +396,10 @@ impl Coverage {
         self.chains_rejected += m.linked_chains_rejected;
         self.fences += m.fences;
         self.exempt += m.order_exempt;
+        self.overflowed += report.overflowed;
+        self.store_reads += report.store_reads;
+        self.stale_answers += report.metrics.stale_answers;
         self.lookups += m.pending_lookups;
-        self.hits += m.pending_hits;
         self.evicted += m.holds_evicted;
         self.gaps += m.seq_gaps;
         self.quarantines += m.quarantines;
@@ -405,12 +413,23 @@ impl Coverage {
             self.committed, self.rejected, self.duplicates, self.chains, self.chains_rejected
         );
         println!(
-            "           fences {} exempt {} lookups {} overlay hits {} evicted {}",
-            self.fences, self.exempt, self.lookups, self.hits, self.evicted
+            "           fences {} exempt {} lookups {} overlay evicted {} store reads {} \
+             index overflows {}",
+            self.fences,
+            self.exempt,
+            self.lookups,
+            self.evicted,
+            self.store_reads,
+            self.overflowed
         );
         println!(
-            "           seq gaps {} quarantines {} refused commits {} intake pauses {}",
-            self.gaps, self.quarantines, self.commit_failures, self.intake_pauses
+            "           seq gaps {} stale answers {} quarantines {} refused commits {} \
+             intake pauses {}",
+            self.gaps,
+            self.stale_answers,
+            self.quarantines,
+            self.commit_failures,
+            self.intake_pauses
         );
     }
 }

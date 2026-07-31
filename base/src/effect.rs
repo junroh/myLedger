@@ -92,7 +92,11 @@ impl Effect {
         }
     }
 
-    pub const fn pending_effect(&self) -> Option<PendingEffect> {
+    /// The write the pending engine is owed, if any. A partial resolution has to write the record again,
+    /// and every field of it is here except the hold's original size — which is one node's own overlay to
+    /// supply, not something a replicated effect can carry. Zero is always allowed and costs the engine a
+    /// read.
+    pub const fn pending_effect(&self, hold_amount: Amount) -> Option<PendingEffect> {
         match self.kind {
             EffectKind::Post => None,
             EffectKind::Hold => Some(PendingEffect::Create {
@@ -105,10 +109,20 @@ impl Effect {
             }),
             EffectKind::Settle if self.remaining_after > 0 => Some(PendingEffect::Reduce {
                 pending_ref: self.pending_ref,
+                debit_account: self.debit_account,
+                credit_account: self.credit_account,
+                amount: hold_amount,
                 remaining: self.remaining_after,
+                consumed: self.amount,
+                ledger: self.ledger,
+                budget: self.budget,
             }),
             EffectKind::Settle | EffectKind::Void => Some(PendingEffect::Remove {
                 pending_ref: self.pending_ref,
+                budget: self.budget,
+                // What this resolution takes is what the hold had left: a void takes the remainder and
+                // a settle that leaves nothing took all of it.
+                released: self.amount,
             }),
         }
     }

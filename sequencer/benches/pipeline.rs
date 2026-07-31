@@ -46,7 +46,8 @@ impl PipelineBench {
             MemoryPending::start(MemoryPendingConfig {
                 latency: LatencyRange::fixed(Duration::ZERO),
                 ..Default::default()
-            }),
+            })
+            .expect("a bench engine config"),
             MemoryDedup::start(MemoryDedupConfig {
                 latency: LatencyRange::fixed(Duration::ZERO),
                 ..Default::default()

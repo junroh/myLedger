@@ -393,9 +393,25 @@ where
         progress
     }
 
+    /// The engine answered from state older than a decision it had already been handed. The same kind of
+    /// fault as a seq gap — an external component is broken and our own state is intact — so it gets the
+    /// same treatment. Counted separately because it is the check that stands in for the lane's order on
+    /// requests that keep no place in it, and a run has to be able to say which of the two fired.
+    pub fn on_stale_answer(&mut self, lane: AccountId, handle: AcctHandle) {
+        self.metrics.stale_answers += 1;
+        self.record(LogKind::SEQ_GAP, lane.raw(), 0);
+        self.quarantine_lane(lane, handle);
+    }
+
     pub fn on_seq_gap(&mut self, lane: AccountId, handle: AcctHandle, seq: u64) {
         self.metrics.seq_gaps += 1;
         self.record(LogKind::SEQ_GAP, lane.raw(), seq);
+        self.quarantine_lane(lane, handle);
+    }
+
+    /// What a broken component costs a lane, whichever check found it: the lane stops serving and the
+    /// rest keeps going, and enough lanes at once means the component rather than the lane.
+    fn quarantine_lane(&mut self, lane: AccountId, handle: AcctHandle) {
         // One fact in two places: the flag the hot path reads and the list that decides fail-stop.
         self.lanes.get_mut(handle).quarantine();
         if self.safety.quarantine(lane) {

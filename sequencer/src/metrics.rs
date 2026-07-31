@@ -46,19 +46,22 @@ pub struct Metrics {
     pub propose_deferred: u64,
     /// Requests refused because every work slot was in use.
     pub slot_exhaustion: u64,
-    /// Idle hold entries dropped to stay under the soft limit.
+    /// Idle overlay entries dropped to stay under the soft limit.
     pub holds_evicted: u64,
+    /// Answers from the engine that reflected fewer committed decisions than it had already been handed.
+    /// The data check that stands in for the lane's order on a request keeping no place in it: anything
+    /// but zero is the engine having reordered its own queue, and the lane is quarantined for it.
+    pub stale_answers: u64,
     /// Times the sequencer's own bookkeeping stopped adding up. Anything but zero means the node
     /// sealed its apply path and has to be replaced.
     pub invariant_breaks: u64,
     /// State-transition records lost because nobody drained the log stream. Not zero means the
     /// forensics for a gap or a quarantine may be missing.
     pub log_drops: u64,
-    /// Hold lookups sent because the engine's overlay did not have the hold.
+    /// Records fetched from the engine: one per resolution, bar those of a hold the engine has already
+    /// said is not there. Whether the engine answered from memory or had to read the store is its own
+    /// number, not one the sequencer can see.
     pub pending_lookups: u64,
-    /// Resolutions the overlay answered without a lookup. With `pending_lookups` this is the hit
-    /// ratio the pending engine actually delivered.
-    pub pending_hits: u64,
     /// Committed decisions handed to the pending engine, by kind. Kept apart because what each costs
     /// the engine is a different question: a create is a record it must store, a reduce is an update
     /// that may cost nothing or a new version, and a remove may free space or write a tombstone.
@@ -109,10 +112,10 @@ impl Metrics {
             propose_deferred,
             slot_exhaustion,
             holds_evicted,
+            stale_answers,
             invariant_breaks,
             log_drops,
             pending_lookups,
-            pending_hits,
             pending_creates,
             pending_reduces,
             pending_removes,

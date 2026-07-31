@@ -19,7 +19,7 @@ fn main() {
     let started = LedgerService::start(
         ServiceConfig { log_to_stderr: true, ..ServiceConfig::default() },
         open_accounts(accounts),
-        MemoryPending::start(MemoryPendingConfig::default()),
+        MemoryPending::start(MemoryPendingConfig::default()).expect("the default engine config is valid"),
         MemoryDedup::start(MemoryDedupConfig::default()),
         EchoRaft::start(EchoRaftConfig::default()),
     );

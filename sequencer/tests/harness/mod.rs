@@ -134,7 +134,7 @@ impl<C: Clock> Harness<C> {
             config,
             Transport { requests: request_rx, acks: ack_tx },
             accounts,
-            MemoryPending::start(pending),
+            MemoryPending::start(pending).expect("a test engine config"),
             MemoryDedup::start(NoLatency::idem()),
             EchoRaft::start(raft),
             clock,

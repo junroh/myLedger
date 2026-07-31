@@ -2,7 +2,7 @@ use ledger_base::ports::{AccountPort, IdempotencyPort, PendingPort, RaftPort};
 use ledger_base::Clock;
 
 use super::Reactor;
-use ledger_base::ports::{IdemRequest, OverlayState, PendingFence, PendingLookup};
+use ledger_base::ports::{IdemRequest, PendingFence, PendingLookup};
 use ledger_base::{LedgerError, LinkedChainId, Request, TransferFlags};
 
 use crate::state::lane::LaneState;
@@ -12,7 +12,8 @@ use crate::state::pipeline::{DepFlags, SlotId, SlotPool, WorkItem};
 /// nothing, so it is stated on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PendingStep {
-    /// Nobody has the hold: fetch it.
+    /// Fetch the record this request is judged by. Every resolution does, because the record is the
+    /// engine's: the sequencer keeps only what it has decided about the hold, never what the hold is.
     Lookup,
     /// Read nothing, but take a place in the lane's queue, or this request would overtake the
     /// replies already outstanding on that lane.
@@ -22,13 +23,13 @@ pub(super) enum PendingStep {
 }
 
 impl PendingStep {
-    /// `hold` is what the overlay knows about the hold this request resolves, and `None` when the
-    /// request resolves nothing.
-    pub(super) fn of(hold: Option<OverlayState>, lane_waiting: bool) -> Self {
-        match hold {
-            Some(OverlayState::Absent) => Self::Lookup,
-            _ if lane_waiting => Self::Fence,
-            _ => Self::Inline,
+    /// `needs_record` is true for a resolution whose hold the engine has not already said is missing —
+    /// the one answer that needs no record.
+    pub(super) fn of(needs_record: bool, lane_waiting: bool) -> Self {
+        match (needs_record, lane_waiting) {
+            (true, _) => Self::Lookup,
+            (false, true) => Self::Fence,
+            (false, false) => Self::Inline,
         }
     }
 }
@@ -131,19 +132,26 @@ where
             return Err(LedgerError::AccountQuarantined(request.tx.debit_account));
         }
 
-        // A request has a place in its lane's order when its judgment can depend on the lane's
-        // earlier requests. That is true of a resolution, whatever it debits, because its order
-        // against other resolutions of the same hold decides the outcome; and of any debit on a
-        // constrained account, because the balance it reads is what earlier requests changed.
-        // Anything else — an unconstrained debit that reads no hold — keeps no place: no seq, no
-        // continuity check, no fence.
+        // A request has a place in its lane's order when its judgment can depend on the lane's earlier
+        // requests, and that comes from one thing: the balance. An account the ledger does not constrain
+        // has no balance to protect, so nothing debiting it depends on what came before — no seq, no
+        // continuity check, no fence, and no place for a later request to queue behind.
+        //
+        // A resolution used to be ordered whatever it debited. What the lane bought it was never safety:
+        // double resolution is prevented per *hold*, by the overlay's reservation and its `resolved`
+        // flag, and a resolution judged with no record at all is rejected rather than accepted. What the
+        // lane bought was which of two concurrent resolutions of one hold wins — and one still wins
+        // either way. What it cost was a lane thirteen thousand deep on a clearing account, measured with
+        // `--external-ratio 30 --resolve-after 100000`. Design notes §1 carries both halves.
         let reads_hold = tx_kind.needs_pending_lookup();
-        let ordered = reads_hold || self.accounts.record(debit_account).is_constrained();
+        let ordered = self.accounts.record(debit_account).is_constrained();
         // A request that has a place in the lane keeps it: while the lane waits on the pending
         // path, this one waits there too, or it would overtake what is ahead of it.
         let needs_pending_reply =
             reads_hold || (ordered && self.lanes.get(debit_account).awaits_pending_reply());
-        if needs_pending_reply && !self.lanes.get_mut(debit_account).has_reply_capacity() {
+        // Only an ordered reply is counted, because the counter is what decides whether a later request
+        // must fence — and nothing needs to queue behind a reply that holds no place.
+        if ordered && needs_pending_reply && !self.lanes.get_mut(debit_account).has_reply_capacity() {
             return Err(LedgerError::Overloaded);
         }
         let Some(slot) = self.pipeline.alloc() else {
@@ -243,12 +251,10 @@ where
     /// Decides what the pending path owes this request and does it. False means an external queue
     /// refused: nothing has been counted or pinned, so the retry is clean.
     fn take_pending_step(&mut self, slot: SlotId, item: &WorkItem) -> bool {
-        let hold = item
-            .kind
-            .needs_pending_lookup()
-            .then(|| self.pending.overlay_state(item.tx.pending_ref));
+        let needs_record = item.kind.needs_pending_lookup()
+            && !self.pending.hold_is_missing(item.tx.pending_ref);
         let waiting = self.lanes.get(item.debit).awaits_pending_reply();
-        match PendingStep::of(hold, waiting) {
+        match PendingStep::of(needs_record, waiting) {
             PendingStep::Lookup => {
                 let lookup = PendingLookup {
                     correlation: SlotPool::correlation(slot),
@@ -261,7 +267,12 @@ where
                     return false;
                 }
                 self.pending.begin_lookup(item.tx.pending_ref);
-                self.lanes.get_mut(item.debit).expect_pending_reply();
+                // The answer has to reflect every decision the engine has already been given. Recorded
+                // now, because now is when "already" is defined.
+                self.pipeline.expect_applies(slot, self.pending.applies_sent());
+                if item.keeps_lane_place() {
+                    self.lanes.get_mut(item.debit).expect_pending_reply();
+                }
                 self.metrics.pending_lookups += 1;
             }
             PendingStep::Fence => {
@@ -278,12 +289,6 @@ where
             }
             PendingStep::Inline => self.pipeline.item_mut(slot).clear_dep(DepFlags::PENDING),
         }
-        // Only now that nothing can fail: a dispatch a full queue refused is retried, and counting
-        // above would do it twice. The pin belongs to the caller, beside where the step is recorded
-        // as sent.
-        if hold == Some(OverlayState::Ready) {
-            self.metrics.pending_hits += 1;
-        }
         true
     }
 }
@@ -292,44 +297,21 @@ where
 mod tests {
     use super::*;
 
-    /// The whole rule of the pending path: fetch what nobody has, take a place in the lane when the
-    /// lane is waiting, and otherwise stay inside the reactor. A request that resolves nothing never
-    /// looks anything up, however busy its lane is — it only queues for order.
+    /// The whole rule of the pending path: a resolution fetches the record it is judged by, whatever
+    /// its lane is doing, because that record is the engine's and this request has none. Everything
+    /// else reads nothing and only needs a place in its lane's order when the lane is waiting — which
+    /// includes the one resolution that needs no record, of a hold the engine has already said is
+    /// not there.
     #[test]
     fn the_pending_step_follows_the_hold_and_the_lane() {
         let waiting = true;
         let idle = false;
+        let needs_record = true;
 
-        assert_eq!(
-            PendingStep::of(Some(OverlayState::Absent), idle),
-            PendingStep::Lookup
-        );
-        assert_eq!(
-            PendingStep::of(Some(OverlayState::Absent), waiting),
-            PendingStep::Lookup
-        );
+        assert_eq!(PendingStep::of(needs_record, idle), PendingStep::Lookup);
+        assert_eq!(PendingStep::of(needs_record, waiting), PendingStep::Lookup);
 
-        assert_eq!(
-            PendingStep::of(Some(OverlayState::Ready), idle),
-            PendingStep::Inline
-        );
-        assert_eq!(
-            PendingStep::of(Some(OverlayState::Ready), waiting),
-            PendingStep::Fence
-        );
-
-        // An answer is on its way, so this request rides behind it rather than asking again.
-        assert_eq!(
-            PendingStep::of(Some(OverlayState::LookupSent), waiting),
-            PendingStep::Fence
-        );
-        // The engine already said the hold is not there: asking again would get the same answer.
-        assert_eq!(
-            PendingStep::of(Some(OverlayState::Missing), idle),
-            PendingStep::Inline
-        );
-
-        assert_eq!(PendingStep::of(None, idle), PendingStep::Inline);
-        assert_eq!(PendingStep::of(None, waiting), PendingStep::Fence);
+        assert_eq!(PendingStep::of(!needs_record, idle), PendingStep::Inline);
+        assert_eq!(PendingStep::of(!needs_record, waiting), PendingStep::Fence);
     }
 }

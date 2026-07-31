@@ -1,3 +1,5 @@
+use std::collections::VecDeque;
+
 use ledger_base::{
     Ack, AccountId, AckOutcome, Amount, FxHashMap, Prng, Transfer, TransferFlags, TxId,
 };
@@ -68,6 +70,10 @@ pub struct Shape {
     pub skew: f64,
     /// Fraction of transfers debiting the unconstrained clearing account.
     pub external_ratio: f64,
+    /// How old a hold is when it is resolved, counted in holds created since. Zero resolves each one as
+    /// soon as its commit is acked, which is what every workload did before this existed — and why a
+    /// record was never asked for after it had been written.
+    pub resolve_after: usize,
 }
 
 /// Generates the request stream and tracks which holds exist, so settles and voids
@@ -82,7 +88,10 @@ pub struct Workload {
     rng: Prng,
     next_id: u128,
     submitted_holds: FxHashMap<TxId, OpenHold>,
-    ready_holds: Vec<OpenHold>,
+    /// Committed holds waiting to be resolved, oldest first. A queue rather than a stack because the
+    /// oldest is the one whose record may have moved out of memory, which is the case worth reaching.
+    ready_holds: VecDeque<OpenHold>,
+    resolve_after: usize,
     open_chain_leg: Option<AccountId>,
 }
 
@@ -93,12 +102,13 @@ impl Workload {
             accounts: shape.accounts.max(2),
             skew: shape.skew.max(1.0),
             external_ratio: shape.external_ratio.clamp(0.0, 1.0),
+            resolve_after: shape.resolve_after,
             transfer_amount: 1_000,
             funding_amount: 1_000_000_000,
             rng: Prng::new(seed),
             next_id: 1,
             submitted_holds: FxHashMap::default(),
-            ready_holds: Vec::new(),
+            ready_holds: VecDeque::new(),
             open_chain_leg: None,
         }
     }
@@ -127,20 +137,30 @@ impl Workload {
         match self.kind {
             WorkloadKind::SinglePhase => self.post(),
             WorkloadKind::HotLane => self.hot_post(),
-            WorkloadKind::HoldSettle => match self.ready_holds.pop() {
+            WorkloadKind::HoldSettle => match self.due_hold() {
                 Some(hold) => self.settle(hold, false),
                 None => self.hold(),
             },
-            WorkloadKind::PartialSettle => match self.ready_holds.pop() {
+            WorkloadKind::PartialSettle => match self.due_hold() {
                 Some(hold) => self.settle(hold, true),
                 None => self.hold(),
             },
-            WorkloadKind::VoidHeavy => match self.ready_holds.pop() {
+            WorkloadKind::VoidHeavy => match self.due_hold() {
                 Some(hold) => self.void(hold),
                 None => self.hold(),
             },
             WorkloadKind::Linked => self.chain_leg(),
         }
+    }
+
+    /// The oldest hold, once enough have been created behind it. Until then the workload keeps creating,
+    /// which is what gives a hold an age at all: with no queue to wait in, every record is read back
+    /// moments after it was written and no window past the first is ever tested.
+    fn due_hold(&mut self) -> Option<OpenHold> {
+        if self.ready_holds.len() <= self.resolve_after {
+            return None;
+        }
+        self.ready_holds.pop_front()
     }
 
     /// True while a linked chain is half-submitted: the batch must not end here.
@@ -155,7 +175,7 @@ impl Workload {
             return;
         };
         if ack.outcome == AckOutcome::Committed {
-            self.ready_holds.push(hold);
+            self.ready_holds.push_back(hold);
         }
     }
 
@@ -252,7 +272,9 @@ impl Workload {
             flags: TransferFlags::POST_PENDING,
         };
         if hold.remaining > 0 {
-            self.ready_holds.push(hold);
+            // Back to the end of the queue, so a partly settled hold ages again before its next
+            // resolution — which is the case that reads a record the previous settle moved.
+            self.ready_holds.push_back(hold);
         }
         transfer
     }

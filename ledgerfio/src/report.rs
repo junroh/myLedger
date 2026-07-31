@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::mem::size_of;
 use std::time::Duration;
 
-use ledger_base::ports::{HoldData, LedgerTotals};
+use ledger_base::ports::LedgerTotals;
 use ledger_base::{Amount, Effect, Footprint};
 use ledger_sequencer::{Metrics, StageTimes};
 use serde::Serialize;
@@ -61,7 +61,6 @@ struct JsonReport<'a> {
     cpu_per_op_ns: f64,
     commit_wait_us: f64,
     pending_lookups: u64,
-    overlay_hit_ratio: f64,
     passed: bool,
     rejects: &'a BTreeMap<&'static str, u64>,
 }
@@ -123,6 +122,11 @@ pub struct RunReport {
     /// What each component was holding when the run stopped, in the order a request meets them. Kept
     /// per component because "how much RAM" has no answer and "how much RAM for which structure" does.
     pub footprints: Vec<(&'static str, Footprint)>,
+    /// Where the engine's records went and where its reads came from.
+    pub pending_traffic: ledger_pending::LogTraffic,
+    /// What keeping each lane in seq order cost on top of the reads. Its own field because it is the
+    /// engine's orderer's number, not the log's.
+    pub order_wait: ledger_pending::OrderWait,
 }
 
 impl RunReport {
@@ -150,15 +154,6 @@ impl RunReport {
         self.metrics.commit_wait_nanos as f64 / batches / 1_000.0
     }
 
-    /// Share of resolutions the pending engine answered without a lookup.
-    pub fn overlay_hit_ratio(&self) -> f64 {
-        let asked = self.metrics.pending_lookups + self.metrics.pending_hits;
-        if asked == 0 {
-            return 0.0;
-        }
-        self.metrics.pending_hits as f64 / asked as f64
-    }
-
     /// Everything a run has to satisfy to count as passing: the latency target, both accounting
     /// identities, and no contract-1 violation.
     pub fn passed(&self) -> bool {
@@ -170,6 +165,10 @@ impl RunReport {
             && self.identities_hold()
             && self.metrics.seq_gaps == 0
             && self.metrics.invariant_breaks == 0
+            // An insert the index could not take is a hold the log says exists and the store does not
+            // have. The engine cannot stop the node for it yet — a write has no reply to carry the news
+            // back on — so the least this tool can do is refuse to call the run a pass.
+            && self.pending_traffic.overflowed == 0
             && !self.fail_stop
     }
 
@@ -277,10 +276,8 @@ impl RunReport {
 
     fn print_pending(&self) {
         println!(
-            "  pending       lookups={} overlay hits={} ({:.1}% hit) evicted={}",
+            "  pending       lookups={} overlay evicted={}",
             self.metrics.pending_lookups,
-            self.metrics.pending_hits,
-            self.overlay_hit_ratio() * 100.0,
             self.metrics.holds_evicted
         );
         println!(
@@ -342,10 +339,14 @@ impl RunReport {
             println!("                ceilings reached: {}", reached.join(", "));
         }
         // A property of the design, not of this run, and the reason a total here is not a steady
-        // state: the two structures that grow fastest have nothing to bound them yet.
+        // state: the structures that grow fastest have nothing to bound them yet. The engine's record
+        // blocks are append-only by choice — a hold whose remainder changed is written again rather
+        // than in place — so their space comes back only when a segment expires, and expiry is not
+        // built. Until it is, the blocks grow with holds created rather than holds alive.
         println!(
-            "                unbounded so far: the dedup map has no expiry and the log no compaction, \
-             so both grow with the run instead of settling"
+            "                unbounded so far: the dedup map has no expiry and the log no compaction, so \
+             both grow with the run; the engine's blocks drop what died in the buffer and keep every \
+             survivor, because segment expiry is not built"
         );
         // The log is append-only and this design has no snapshot or compaction, so what it appended is
         // what it would occupy. Priced at the effect's in-memory size because there is no wire format
@@ -367,16 +368,83 @@ impl RunReport {
                 self.metrics.commit_failures
             );
         }
-        // By kind, never summed: a create is a record the engine must keep, a reduce may cost nothing
-        // or a new version, and a remove may free space or write a tombstone. One total would read as
-        // occupancy.
+        // By kind, never summed: a create is a record, a reduce appends a version, and a remove writes
+        // nothing at all. One total would read as occupancy, which is the line below.
         println!(
-            "  engine told   create={} ({:.1}MB of hold records) reduce={} remove={} — what reduce and \
-             remove cost is the engine's layout, which is not built",
-            self.metrics.pending_creates,
-            mb(self.metrics.pending_creates as usize * size_of::<HoldData>()),
-            self.metrics.pending_reduces,
-            self.metrics.pending_removes
+            "  engine told   create={} reduce={} remove={}",
+            self.metrics.pending_creates, self.metrics.pending_reduces, self.metrics.pending_removes
+        );
+        // What the writeback buffer is for, as a number. A record resolved before its block is
+        // compacted never reaches the store, so what the store has to hold is holds *alive* rather than
+        // holds created — the difference the source design's capacity estimate rests on, and the one
+        // its own inputs disagree about. Reads are split the same way: only the last kind is an IO once
+        // the store is a disk.
+        let traffic = self.pending_traffic;
+        let share = |part: u64, whole: u64| {
+            if whole == 0 { 0.0 } else { part as f64 / whole as f64 * 100.0 }
+        };
+        println!(
+            "  engine log    appended={} ({:.1}MB) died in buffer={} ({:.0}%) carried on={} \
+             left memory={}",
+            traffic.appended,
+            mb(traffic.appended as usize * ledger_pending::RECORD_BYTES),
+            traffic.died_in_buffer,
+            share(traffic.died_in_buffer, traffic.appended),
+            traffic.flushed,
+            traffic.left_memory
+        );
+        // Where each read was answered from, which is what says whether either window is earning its
+        // size. `unwritten` is the flush window's, `resident` is the residency window's, and only the
+        // last kind is an IO once the store is a disk.
+        println!(
+            "  engine reads  unwritten={} resident={} store={} ({:.1}% of reads, apply {}, peak depth {})",
+            traffic.buffer_reads,
+            traffic.resident_reads,
+            traffic.store_reads,
+            share(
+                traffic.store_reads,
+                traffic.buffer_reads + traffic.resident_reads + traffic.store_reads
+            ),
+            traffic.apply_store_reads,
+            traffic.inflight_peak
+        );
+        // A read that finished on time and then waited for an earlier read on its lane is a speed problem
+        // no per-read bound covers, and it is the product — lane depth times read latency — rather than
+        // either term. Printed only when a lane ever waited, because zero is the answer whenever reads
+        // are answered from memory, and a line of zeroes reads as if it were not measured.
+        let wait = self.order_wait;
+        if wait.released > 0 {
+            println!(
+                "  engine order  {} of {} replies arrived behind their lane ({:.1}%), mean {:.0}us \
+                 worst {:.0}us, deepest lane {} | delivery mean {:.0}us",
+                wait.held_for_order,
+                wait.released,
+                share(wait.held_for_order, wait.released),
+                wait.order_nanos as f64 / wait.held_for_order.max(1) as f64 / 1_000.0,
+                wait.order_worst_nanos as f64 / 1_000.0,
+                wait.deepest_lane,
+                wait.delivery_nanos as f64 / wait.released.max(1) as f64 / 1_000.0
+            );
+        }
+        // The table is sized once and never grows, so these are what say whether the sizing still holds.
+        // Both move before an insert can fail: the load factor against what it was sized for, and the
+        // longest cascade against the cap that bounds an insert.
+        let load = if traffic.index_slots == 0 {
+            0.0
+        } else {
+            traffic.index_live as f64 / traffic.index_slots as f64
+        };
+        println!(
+            "  engine index  {} of {} slots (load {:.3} of {:.2} target)  worst cascade {} of {}  \
+             ambiguous={} overflowed={}",
+            traffic.index_live,
+            traffic.index_slots,
+            load,
+            ledger_pending::LOAD_TARGET,
+            traffic.worst_cascade,
+            128,
+            traffic.ambiguous,
+            traffic.overflowed
         );
     }
 
@@ -485,7 +553,6 @@ impl RunReport {
             cpu_per_op_ns: self.cpu_per_op_nanos(),
             commit_wait_us: self.commit_wait_micros(),
             pending_lookups: self.metrics.pending_lookups,
-            overlay_hit_ratio: self.overlay_hit_ratio(),
             passed: self.passed(),
             rejects: &self.reject_kinds,
         };
@@ -544,6 +611,8 @@ mod tests {
             fail_stop: false,
             placement: "performance-qos",
             footprints: Vec::new(),
+            pending_traffic: ledger_pending::LogTraffic::default(),
+            order_wait: ledger_pending::OrderWait::default(),
         }
     }
 
