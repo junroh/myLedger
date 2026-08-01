@@ -67,7 +67,27 @@ mod sys {
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+mod sys {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+
+    pub fn pin_current(cpu: usize) -> bool {
+        if cpu >= usize::BITS as usize {
+            return false;
+        }
+        let mask = (1usize).checked_shl(cpu as u32).unwrap_or(0);
+        if mask == 0 {
+            return false;
+        }
+        unsafe { SetThreadAffinityMask(GetCurrentThread(), mask as usize) != 0 }
+    }
+
+    pub fn prefer_performance_cores() -> bool {
+        false
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod sys {
     pub fn pin_current(_cpu: usize) -> bool {
         false
