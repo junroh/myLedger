@@ -492,13 +492,11 @@ impl RunReport {
         let behind = self.pending_traffic.days_behind;
         if self.metrics.holds_expired + self.metrics.expiry_refused > 0 || behind > 0 {
             println!(
-                "  retention     {} holds released for outliving it, {} refused, {} dropped by a full queue, \
-                 {} attempts into a lane still owing a judgment (all offered again), {} expired days \
-                 still to empty",
+                "  retention     {} holds released for outliving it, {} refused and {} dropped by a full queue \
+                 (both offered again), {} expired days still to empty",
                 self.metrics.holds_expired,
                 self.metrics.expiry_refused,
                 self.metrics.expiry_dropped,
-                self.metrics.expiry_lane_busy,
                 behind
             );
         }

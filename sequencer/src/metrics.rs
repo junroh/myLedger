@@ -71,13 +71,6 @@ pub struct Metrics {
     /// the same void again, its id being derived from the hold — and the one number that says the sequencer
     /// is admitting them more slowly than the engine is finding them.
     pub expiry_dropped: u64,
-    /// Attempts to admit a void into a lane that still owed a judgment, which is the one state a
-    /// ledger-origin resolution may not enter: it carries no idempotency dependency, so nothing would order
-    /// it against a client request waiting on one. **Not a loss** — the void keeps its place in the queue
-    /// and is tried again — which is why this counts attempts rather than voids, and why it can exceed the
-    /// number of voids there ever were. High with `days_behind` at one is the gate working; high with
-    /// `days_behind` climbing is a lane busy enough to starve its own holds' expiry.
-    pub expiry_lane_busy: u64,
     /// State-transition records lost because nobody drained the log stream. Not zero means the
     /// forensics for a gap or a quarantine may be missing.
     pub log_drops: u64,
@@ -141,7 +134,6 @@ impl Metrics {
             holds_expired,
             expiry_refused,
             expiry_dropped,
-            expiry_lane_busy,
             log_drops,
             pending_lookups,
             pending_creates,

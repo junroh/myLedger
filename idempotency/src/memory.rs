@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ledger_base::ports::{IdemReply, IdemRequest, IdemVerdict, IdempotencyPort};
+use ledger_base::ports::{IdemAsk, IdemReply, IdemRequest, IdemVerdict, IdempotencyPort};
 use ledger_base::{
     channel, Consumer, Footprint, FxHashMap, MapGauge, Prng, Producer, StagedProducer, TxId,
     UNORDERED,
@@ -108,10 +108,16 @@ impl IdemWorker {
         let mut progress = false;
         while let Some(request) = self.requests.pop() {
             progress = true;
-            let verdict = match self.seen.insert(request.tx_id, request.digest) {
-                None => IdemVerdict::Fresh,
-                Some(digest) if digest == request.digest => IdemVerdict::DuplicateSameBody,
-                Some(_) => IdemVerdict::DuplicateDifferentBody,
+            // A `Serialize` ask wants the queue and not the map. Nothing is recorded, so nothing has to
+            // be taken back if what it belongs to is refused — and the map stays free of ids no client
+            // will ever resend, which matters while it has no expiry.
+            let verdict = match request.ask {
+                IdemAsk::Serialize => IdemVerdict::NotChecked,
+                IdemAsk::Check => match self.seen.insert(request.tx_id, request.digest) {
+                    None => IdemVerdict::Fresh,
+                    Some(digest) if digest == request.digest => IdemVerdict::DuplicateSameBody,
+                    Some(_) => IdemVerdict::DuplicateDifferentBody,
+                },
             };
             let due = self.latency.due_from(Instant::now(), &mut self.jitter);
             let reply = IdemReply {

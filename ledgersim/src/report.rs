@@ -174,12 +174,11 @@ pub fn evidence(plan: &Plan, prediction: &Prediction) {
         || prediction.days_behind_worst > 0
     {
         println!(
-            "  retention      expiry admitted={} refused={} dropped={} lane-busy={} (all offered again next \
+            "  retention      expiry admitted={} refused={} dropped={} (both offered again next \
              round), worst {} days behind",
             prediction.metrics.holds_expired,
             prediction.metrics.expiry_refused,
             prediction.metrics.expiry_dropped,
-            prediction.metrics.expiry_lane_busy,
             prediction.days_behind_worst
         );
     }
@@ -432,9 +431,6 @@ pub struct Coverage {
     /// queue was full. Beside `expiry_refused`, which is one that reached the judge's rules — the two say
     /// different things about where the sweep is being held up.
     expiry_dropped: u64,
-    /// Attempts to admit a void into a lane that still owed a judgment. Attempts, not voids: the void keeps
-    /// its place and is tried again, so this can exceed the number of voids there ever were.
-    expiry_lane_busy: u64,
     /// The furthest behind any seed's sweep fell, in days — a max rather than a sum, because it is a level
     /// and seeds do not add up. One is ordinary; more than a seed's grace is where late deletion stops
     /// being the safe direction and becomes an index that outgrows its declared maximum.
@@ -466,7 +462,6 @@ impl Coverage {
         self.expired += m.holds_expired;
         self.expiry_refused += m.expiry_refused;
         self.expiry_dropped += m.expiry_dropped;
-        self.expiry_lane_busy += m.expiry_lane_busy;
         self.days_behind_worst = self.days_behind_worst.max(report.days_behind_worst);
         self.store_reads += report.store_reads;
         self.stale_answers += report.metrics.stale_answers;
@@ -496,13 +491,12 @@ impl Coverage {
             self.not_stored
         );
         println!(
-            "           expiry offered {} admitted {} refused {} dropped {} lane-busy {}, worst {} \
+            "           expiry offered {} admitted {} refused {} dropped {}, worst {} \
              days behind",
             self.expiries_offered,
             self.expired,
             self.expiry_refused,
             self.expiry_dropped,
-            self.expiry_lane_busy,
             self.days_behind_worst
         );
         println!(

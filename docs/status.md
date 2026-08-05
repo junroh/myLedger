@@ -3,9 +3,23 @@
 What is built and verified, and what is not. Written to be read before picking up work: the design
 reasoning lives in `design-notes.md`, the terms in `glossary.md`, and how to run things in `tools.md`.
 
-Verified at the time of writing with `cargo test` (debug, 121 tests), `cargo build --release
---workspace --all-targets`, all six `ledgerfio` workloads, all three `ledgersim` modes, `ledgerfio
-layout`, `cargo bench -p ledger-pending`, and `ledgerd` starting and draining on SIGTERM.
+Verified at the time of writing with `cargo test` (debug, 123 tests), `cargo build --release
+--workspace --all-targets`, **five of the six** `ledgerfio` workloads, all three `ledgersim` modes,
+`ledgerfio layout`, `cargo bench -p ledger-pending`, and `ledgerd` starting and draining on SIGTERM.
+
+## Broken
+
+**`ledgerfio run --workload linked` crashes: the reactor thread overflows its stack.** A chain that
+completes opens the gates behind it, which completes the next chain, which opens its own — one nested
+call per chain (`judge_chain` → `open_gates` → `release_dep` → `on_ready` → `judge_chain`), so the
+depth is the length of the cascade and nothing bounds it. Rule 12 for the stack, and the fix is a work
+list in place of the recursion.
+
+The recursion is older than the crash. What made it reachable is the `linked` workload resolving a hold
+inside the chain that created it, which is what lengthened those cascades — the same shape as the
+ordering defect below: something latent, exposed by a change rather than introduced by it. It takes a
+second in release and eight in debug, so no test run is long enough to reach it, which is why 123
+tests pass over it.
 
 ## Built
 

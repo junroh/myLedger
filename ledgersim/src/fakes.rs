@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use ledger_base::ports::{
-    IdemReply, IdemRequest, IdemVerdict, IdempotencyPort, OverlayState, PendingCommand,
+    IdemAsk, IdemReply, IdemRequest, IdemVerdict, IdempotencyPort, OverlayState, PendingCommand,
     PendingEffect, PendingNotice, PendingOverlay, PendingPort, PendingReply, RaftCommit,
     RaftOutcome, RaftPort, RaftProposal,
 };
@@ -618,10 +618,14 @@ impl IdempotencyPort for IdemFake {
             return Err(request);
         }
         state.outstanding += 1;
-        let verdict = match state.seen.insert(request.tx_id, request.digest) {
-            None => IdemVerdict::Fresh,
-            Some(digest) if digest == request.digest => IdemVerdict::DuplicateSameBody,
-            Some(_) => IdemVerdict::DuplicateDifferentBody,
+        // Same split as the real component: a `Serialize` ask takes the queue and leaves no record.
+        let verdict = match request.ask {
+            IdemAsk::Serialize => IdemVerdict::NotChecked,
+            IdemAsk::Check => match state.seen.insert(request.tx_id, request.digest) {
+                None => IdemVerdict::Fresh,
+                Some(digest) if digest == request.digest => IdemVerdict::DuplicateSameBody,
+                Some(_) => IdemVerdict::DuplicateDifferentBody,
+            },
         };
         let due = state.now + state.delay;
         let reply = IdemReply {

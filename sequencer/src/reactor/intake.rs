@@ -2,7 +2,7 @@ use ledger_base::ports::{AccountPort, IdempotencyPort, PendingPort, RaftPort};
 use ledger_base::Clock;
 
 use super::Reactor;
-use ledger_base::ports::{IdemRequest, PendingFence, PendingLookup};
+use ledger_base::ports::{IdemAsk, IdemRequest, PendingFence, PendingLookup};
 use ledger_base::{LedgerError, LinkedChainId, Request, Transfer, TransferFlags, UNORDERED};
 
 use crate::state::pipeline::{DepFlags, SlotId, SlotPool, WorkItem};
@@ -75,8 +75,8 @@ where
             }
         }
         // After every client this tick was offered a slot, never before: the ledger's own work goes behind
-        // the work someone is waiting for. Correctness does not rest on this order — the lane gate below is
-        // what does — so this is the priority alone, and reads as one.
+        // the work someone is waiting for. Nothing about correctness rests on this order — every ordered
+        // request shares the queue that puts a lane back together — so this is the priority alone.
         progress | self.admit_parked_expiry()
     }
 
@@ -84,46 +84,22 @@ where
     /// tick that admits anything admits some of these, so the sweep cannot be starved to a standstill by
     /// traffic that never lets up — which is what bounds how far behind a day can fall.
     ///
-    /// A void goes in only where its lane has nothing outstanding, because a ledger-origin resolution
-    /// carries no idempotency dependency and so has nothing ordering it against a client request that is
-    /// waiting on one — see `LaneState::is_caught_up`. A lane that is busy is skipped rather than waited
-    /// for: the void goes to the back and the next one is tried, so one unrelenting account delays its own
-    /// holds instead of every other account's. Attempts are bounded, so a queue of nothing but busy lanes
-    /// costs a fixed amount of this tick and no more.
+    /// Nothing here has to look at the lane. A void is ordered by the same queue every client request is
+    /// ordered by — it asks that component for its place and not for a verdict — so being admitted late in
+    /// the tick costs it nothing but its turn.
     fn admit_parked_expiry(&mut self) -> bool {
         let mut progress = false;
-        let mut admitted = 0;
-        let budget = self.config.capacity.expiry_per_tick;
-        for _ in 0..budget * 2 {
-            if admitted == budget || self.pipeline.has_deferred() {
+        for _ in 0..self.config.capacity.expiry_per_tick {
+            if self.pipeline.has_deferred() {
                 break;
             }
             let Some(void) = self.expiry.take() else {
                 break;
             };
-            if self.lane_is_busy(&void) {
-                self.metrics.expiry_lane_busy += 1;
-                // Not a refusal and not a loss: it keeps its place in the queue, behind whatever else is
-                // waiting, and no seq has been issued for it yet.
-                self.expiry.park(void);
-                continue;
-            }
-            admitted += 1;
             progress = true;
             self.admit_expiry(void);
         }
         progress
-    }
-
-    /// Whether this void would take a place in a lane that still owes a judgment. False for an account the
-    /// ledger does not constrain: that void keeps no place in any lane, so there is no order to protect.
-    fn lane_is_busy(&mut self, void: &Transfer) -> bool {
-        let Some(debit) = self.accounts.resolve(void.debit_account) else {
-            // Unknown to the account component. `admit_expiry` refuses it and counts it, which is where
-            // that answer belongs; nothing here has to decide it twice.
-            return false;
-        };
-        self.accounts.record(debit).is_constrained() && !self.lanes.get(debit).is_caught_up()
     }
 
     fn admit(&mut self, request: &Request) {
@@ -244,16 +220,12 @@ where
         } else {
             DepFlags::IDEM
         };
-        // The ledger's own resolutions are made idempotent by the index that produced them, not by the
-        // dedup map: the sweep offers a void only while the hold is still in the index, and the judge
-        // refuses a second one for a hold a first has already taken. Sending them through dedup would be
-        // worse than redundant. The map records an id when the request is *dispatched*, so a void whose
-        // batch consensus went on to refuse would come back a duplicate — and because its id is derived
-        // from the hold it cannot be changed, that hold would never be released at all. It would also
-        // grow a map that has no expiry with ids no client will ever resend.
-        if request.tx.id.is_ledger_origin() {
-            deps = deps.without(DepFlags::IDEM);
-        }
+        // Every ordered request keeps its idempotency dependency, the ledger's own resolutions included —
+        // but they ask for something different once they get there (`IdemAsk::Serialize`). Dropping the
+        // dependency was the mistake: it did avoid the map, which a derived id must, and it also left the
+        // request out of the queue that puts a lane back in order. A resolution waiting only on the engine
+        // and a transfer waiting only on dedup then had nothing ordering them, and whichever component
+        // answered first was judged first — a seq gap, and a lane quarantined for a fault of ours.
         let gate = self
             .linked
             .gate_for(debit_account)
@@ -334,6 +306,15 @@ where
             lane: item.lane,
             seq: item.seq,
             digest: item.digest,
+            // A resolution the ledger derived asks for the queue and not the map. Why it may not be
+            // recorded is on `IdemAsk::Serialize`; why it is here at all is the queue — a lane is put back
+            // into order by the component the request travels through, and one that travelled through
+            // neither had nothing ordering it against the requests that did.
+            ask: if item.tx.id.is_ledger_origin() {
+                IdemAsk::Serialize
+            } else {
+                IdemAsk::Check
+            },
         };
         self.idem.dispatch(request).is_ok()
     }

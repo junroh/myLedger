@@ -4,7 +4,7 @@ pub mod pending;
 pub mod raft;
 
 pub use account::{AccountFlags, AccountPort, AccountRecord, LedgerTotals};
-pub use idempotency::{IdemReply, IdemRequest, IdemVerdict, IdempotencyPort};
+pub use idempotency::{IdemAsk, IdemReply, IdemRequest, IdemVerdict, IdempotencyPort};
 pub use pending::{
     HoldData, HoldView, OverlayState, PendingCommand, PendingEffect, PendingFence, PendingLookup,
     PendingNotice, PendingOverlay, PendingPort, PendingReply,
