@@ -110,28 +110,37 @@ test asserts the store was reached.
 
 ## Not built
 
-### The expiry throttle has no policy
+### The expiry sweep walks the whole index, and at scale that breaks the speed contract
 
-The throttle is built, and it is a throttle rather than a rate limiter on purpose. It paces in three
-places, none of which refuses anything: a bounded slice per round (`expiry_per_round`), nothing more
-offered while the last slice is unanswered (`PendingWorker::sweep_expiry`), and no second walk of the
-index until the index has moved (`Sweep::waiting_at`). That is the only shape that can be correct
-here — a refused void has nobody to hear the refusal, and a void nobody hears is a pending column
-reserved for good. A rate limiter belongs at the client edge, where a refusal reaches a client and
-becomes an error to retry.
+This entry used to say the throttle was waiting on a number rather than on code. It has been measured,
+and it was the wrong half. The rate is not the problem and never was:
 
-What is missing is the policy that sizes the slice: today it is a constant, where it should follow
-what the sequencer is being asked to do. Falling behind deletes late, which is the safe direction, so
-this is a capacity question rather than a correctness one. The requirement is derived rather than
-guessed:
+| | measured | budget |
+|---|---|---|
+| one pass of the index | **2.2s** at the design's 5.33B slots | ≤5ms, the hard contract |
+| a day's total sweep work | **4.4s** | a day, 86,400s |
 
-```
-drain rate >= a day's survivors / a day
-```
+So the drain rate the requirement asks for — a day's survivors per day — is met three orders over. What
+is not bounded is one pass. `expiring(want, into)` bounds the voids a round *collects*, not the slots it
+*visits*, and a day on its way to empty runs out of voids to collect long before it runs out of table:
+with fewer survivors left than one round takes, a round walks everything. The pass that ends a day
+always does. It runs on the engine's own thread ahead of `drain_commands`, so every lookup behind it
+pays the whole pass.
 
-Sizing it needs a measurement nobody has taken: what a day's worth of voids does to the tail while
-clients are being served. The seam the policy needs is already there — `expiring(want, into)` takes
-its bound per call — so what waits is the number, not the code.
+This is rule 20 again, and it is the reason the entry is here rather than under a tuning knob: no value
+of `expiry_per_round` can make a 2.2s uninterruptible call fit in 5ms, because that knob does not bound
+the walk. The fix is the timing wheel — see the divergence below — which removes the walk instead of
+slicing it. A slot ceiling per round would buy the contract back in a few lines, and is deliberately not
+taken: it is code the wheel deletes.
+
+Both numbers are reproducible, and one anchors the other: the bench predicts 112ms for a 268M-slot pass
+and a run with clients being served shows 108ms, a 4% agreement. Commands under *Where the numbers live*.
+
+Two smaller facts the same measurement turned up. A fresh node's first sweep walks a table nothing has
+touched yet, so it pays page faults on top of the scan — 459ms at 268M slots against 112ms warm. And a
+run whose declared windows are large never flushes a record out of the writeback buffer, so every index
+entry still addresses the buffer segment and no sweep of a day can find anything: reaching a real expiry
+in a run needs more records created than the flush window holds.
 
 ### The negative answer the design asked for is refused
 
@@ -157,6 +166,24 @@ the split exists and that residency keeps IO off resolutions inside it.
 - **Consensus is an echo**, the dedup map has no expiry, and the log has no compaction. All three
   grow with a run, which the tools say out loud.
 
+### Where the documents and the code have diverged
+
+Two places where the design says one thing and this code does another. Kept as a section of its own
+because neither is a gap to fill in passing — each was a substitution, and a substitution that nobody
+writes down is read as an implementation of the thing it replaced.
+
+- **There is no timing wheel.** The design detects expiry with a hierarchical wheel (~2GB, day / hour /
+  minute / second, only the imminent day loaded in detail). This code walks the index instead, repeatedly,
+  until a pass finds nothing. Two consequences follow from the substitution rather than from the design:
+  the same void is offered again on every pass until the judge has taken it, and one pass costs 2.2s at
+  the design's index — the entry above. **This is the next piece of work.**
+- **There is no `min_live_seg_id`.** Design §3.1 and §4.6 give the index an epoch: a slot addressing a
+  segment older than the oldest live one is dead, so a lookup answers Dead with no IO and an insert reuses
+  the slot without a kick cascade. Here a slot is only ever cleared by the resolution that removes it, so
+  an expired day's slots stay occupied until its voids are all judged. Building the wheel closes the first
+  entry and leaves this one: they are separate mechanisms that the single index walk was standing in for
+  at once.
+
 Four earlier entries are closed: the in-chain fallback read is now exercised by the `linked`
 workload (half its chains create a hold and resolve it inside the chain), the stub orderer's
 metrics struct is `FakeOrderWait` so `OrderWait` names one thing, unordered replies skip lane
@@ -166,10 +193,17 @@ account so `check` exercises the order exemption itself — the sweep test asser
 ## Where the numbers live
 
 No measured number is written into these documents as a fact to be trusted; each one names the
-command that reproduces it. The three that decide the most:
+command that reproduces it. The five that decide the most:
 
 - `ledgerfio run --workload partial-settle --duration 10s` — where reads land across the two
   windows, and what compaction saves.
 - `ledgerfio run --workload hold-settle --resolve-after 900000 --external-ratio 30` — what order
   exemption is worth, as lane depth.
 - `ledgersim check --seeds 64` — every invariant under fault injection, including the store path.
+- `cargo bench -p ledger-pending --bench sweep -- --repeat 5 --pin 2` — what one pass of the index
+  costs, and what a day of expiry walks. The size rows are the extrapolation's licence: flat cost per
+  slot across a 64× range is what lets a 2GB table speak for a 37GB one, and a row that stops being flat
+  withdraws the permission.
+- `ledgerfio run --workload void-heavy --rate 100k --daily-arrivals 150m --index-budget 4100m
+  --expiry-days 60` — the same pass as a client sees it. Sixty days forces one pass per day, because
+  three passes in ten seconds are lost in a tail that 950,000 other requests also occupy.

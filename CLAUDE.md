@@ -10,6 +10,11 @@ This covers refactors, renames and fixes noticed along the way, not just new fea
 measuring, and running the tools need no permission; changing a file does. When a question is being
 discussed, the answer is the reasoning, not a commit.
 
+**Explain simply and briefly.** Answer in plain Korean, short sentences. Lead with the finding in one
+line, then the number that supports it, then the one decision I need. No layered clauses, no restating
+the design's own prose, no tables where three lines would do. The code and the documents carry the
+careful wording; a reply to me does not. If an explanation needs a paragraph to set up, it is too long.
+
 ## Agent working context
 
 `CLAUDE.md` is the canonical source for agent guidance. Keep project rules, architecture constraints,

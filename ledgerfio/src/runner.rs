@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{Ack, AckOutcome, LedgerError, Transfer};
 use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
-use ledger_pending::{MemoryPending, MemoryPendingConfig, StoreModel};
+use ledger_pending::{DaySource, MemoryPending, MemoryPendingConfig, StoreModel};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, ReactorConfig};
 use ledger_service::{ClientEndpoint, LedgerService, ServiceConfig};
@@ -38,7 +40,7 @@ impl Runner {
             resolve_after: options.resolve_after,
         };
         let mut workload = Workload::new(options.workload, shape, options.seed);
-        let (service, endpoint) = Self::start_ledger(&options, &workload);
+        let (service, endpoint, calendar) = Self::start_ledger(&options, &workload);
         let reactor_started = Instant::now();
 
         // A signal now stops the run: the driver stops submitting and the service drains.
@@ -49,7 +51,7 @@ impl Runner {
             options.client_batch,
         );
         driver.fund(&mut workload);
-        let elapsed = driver.measure(&mut workload, &options);
+        let elapsed = driver.measure(&mut workload, &options, &calendar);
         if Signals::requested() {
             eprintln!("ledgerfio: interrupted, draining");
         }
@@ -96,23 +98,20 @@ impl Runner {
 
     /// The whole node: the reactor and the three components it talks to, each simulated with the
     /// latency and the faults this run asked for.
+    ///
+    /// The calendar comes back with it, because a run that asked to cross a day has to be the one moving
+    /// it — the engine reads the day and never sets it.
     fn start_ledger(
         options: &Options,
         workload: &Workload,
     ) -> (
         LedgerService<MemoryAccounts, MemoryPending, MemoryDedup, EchoRaft>,
         ClientEndpoint,
+        Calendar,
     ) {
-        LedgerService::start(
-            ServiceConfig {
-                reactor: Self::reactor_config(options),
-                client_queue: options.client_queue,
-                pin: options.pin,
-                log_to_stderr: options.log,
-                ..ServiceConfig::default()
-            },
-            Self::open_accounts(workload),
-            MemoryPending::start(MemoryPendingConfig {
+        let calendar = Calendar::new(options.expiry_days);
+        let pending = MemoryPending::start_with_days(
+            MemoryPendingConfig {
                 violate_order_every: options.violate_order_every,
                 seed: options.seed ^ 0x9e37,
                 overlay_soft_limit: options.overlay_limit,
@@ -128,15 +127,28 @@ impl Runner {
                 },
                 capacity: options.capacity,
                 index_budget_bytes: options.index_budget as usize,
+                expiry_per_round: options.expiry_per_round,
                 ..MemoryPendingConfig::default()
-            })
-            .unwrap_or_else(|err| {
-                // Refused rather than discovered: every window in the engine is derived from these
-                // inputs, so a declaration that does not describe a workload would otherwise become a
-                // size nobody meant.
-                eprintln!("ledgerfio: the engine's declared capacity is not usable ({err:?})");
-                std::process::exit(2);
-            }),
+            },
+            calendar.source(),
+        )
+        .unwrap_or_else(|err| {
+            // Refused rather than discovered: every window in the engine is derived from these
+            // inputs, so a declaration that does not describe a workload would otherwise become a
+            // size nobody meant.
+            eprintln!("ledgerfio: the engine's declared capacity is not usable ({err:?})");
+            std::process::exit(2);
+        });
+        let (service, endpoint) = LedgerService::start(
+            ServiceConfig {
+                reactor: Self::reactor_config(options),
+                client_queue: options.client_queue,
+                pin: options.pin,
+                log_to_stderr: options.log,
+                ..ServiceConfig::default()
+            },
+            Self::open_accounts(workload),
+            pending,
             MemoryDedup::start(MemoryDedupConfig {
                 latency: options.idem_latency,
                 seed: options.seed ^ 0x1de3,
@@ -154,7 +166,8 @@ impl Runner {
         .unwrap_or_else(|err| {
             eprintln!("ledgerfio: the ledger refused this configuration: {err:?}");
             std::process::exit(2);
-        })
+        });
+        (service, endpoint, calendar)
     }
 
     fn reactor_config(options: &Options) -> ReactorConfig {
@@ -183,6 +196,54 @@ impl Runner {
             );
         }
         accounts
+    }
+}
+
+/// The engine's calendar, when the run is the one moving it.
+///
+/// Days rather than a clock, because that is all the engine reads: retention is a calendar promise, and
+/// `DaySource` exists so a window measured in days is reachable by something other than waiting. A run
+/// that asks for none of this leaves the engine on the wall clock, which is what a load driver measuring
+/// throughput should see.
+///
+/// Starts at day zero on purpose. The engine's cursor starts a lifetime behind whatever day it is first
+/// told, so any other origin makes its first sweep a pass over the whole index for a segment that never
+/// held anything — a stall belonging to the start of the process rather than to expiry, and one that would
+/// sit in the same tail as the thing being measured.
+struct Calendar {
+    day: Arc<AtomicU64>,
+    /// Days to advance across the measured phase, evenly. Zero leaves the engine on the wall clock.
+    steps: u64,
+}
+
+impl Calendar {
+    fn new(steps: u64) -> Self {
+        Self {
+            day: Arc::new(AtomicU64::new(0)),
+            steps,
+        }
+    }
+
+    fn source(&self) -> DaySource {
+        match self.steps {
+            0 => DaySource::WallClock,
+            _ => DaySource::Fixed(Arc::clone(&self.day)),
+        }
+    }
+
+    /// Moves the calendar to where the elapsed share of the run puts it. Called from the submit loop, so
+    /// the day turns while clients are being served — which is the whole point: a sweep measured on an idle
+    /// engine says nothing about what it costs a lookup.
+    ///
+    /// Spaced over one more interval than there are days, so the last day arrives before the run ends
+    /// rather than with it. A boundary crossed at the final instant would start a sweep nothing measures.
+    fn advance(&self, elapsed: Duration, duration: Duration) {
+        if self.steps == 0 {
+            return;
+        }
+        let share = elapsed.as_secs_f64() / duration.as_secs_f64().max(f64::MIN_POSITIVE);
+        let day = (share * (self.steps + 1) as f64) as u64;
+        self.day.store(day.min(self.steps), Ordering::Relaxed);
     }
 }
 
@@ -303,11 +364,17 @@ impl Driver {
         self.reset();
     }
 
-    fn measure(&mut self, workload: &mut Workload, options: &Options) -> Duration {
+    fn measure(
+        &mut self,
+        workload: &mut Workload,
+        options: &Options,
+        calendar: &Calendar,
+    ) -> Duration {
         let started = Instant::now();
         // A sealed ledger ends the run: the rest of the requested duration would measure a node that
         // answers everything with `FailStop`, and the report says which it was.
         while started.elapsed() < options.duration && !Signals::requested() && !self.sealed {
+            calendar.advance(started.elapsed(), options.duration);
             if self.outstanding() >= options.in_flight {
                 self.collect(workload, true);
                 continue;

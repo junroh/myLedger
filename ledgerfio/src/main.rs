@@ -210,6 +210,22 @@ fn print_help() {
     println!(
         "  --index-budget <bytes>      (1073741824) refuse a declaration needing a larger index"
     );
+    println!(
+        "  --expiry-days <n>           (0) move the engine's calendar this many days over the run,"
+    );
+    println!(
+        "                              evenly. 0 leaves it on the wall clock, where a run of seconds"
+    );
+    println!(
+        "                              never crosses a day and the expiry sweep is unreachable. Past"
+    );
+    println!(
+        "                              retention+grace to reach the expiry of this run's own holds"
+    );
+    println!(
+        "  --expiry-per-round <n>      (64) voids one sweep round offers. Bounds what it collects, not"
+    );
+    println!("                              the slots it walks: see the sweep line in the report");
     println!();
     println!("measuring:");
     println!("  --sweep <knob=v1,v2>        run once per value and print one row each");

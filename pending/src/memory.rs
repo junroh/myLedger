@@ -331,6 +331,7 @@ struct TrafficGauge {
     overflowed: AtomicU64,
     segment: AtomicU64,
     days_behind: AtomicU64,
+    swept_slots: AtomicU64,
 }
 
 impl TrafficGauge {
@@ -364,6 +365,8 @@ impl TrafficGauge {
             .store(u64::from(traffic.segment), Ordering::Relaxed);
         self.days_behind
             .store(traffic.days_behind, Ordering::Relaxed);
+        self.swept_slots
+            .store(traffic.swept_slots, Ordering::Relaxed);
     }
 
     fn read(&self) -> LogTraffic {
@@ -385,6 +388,7 @@ impl TrafficGauge {
             overflowed: self.overflowed.load(Ordering::Relaxed),
             segment: self.segment.load(Ordering::Relaxed) as u8,
             days_behind: self.days_behind.load(Ordering::Relaxed),
+            swept_slots: self.swept_slots.load(Ordering::Relaxed),
         }
     }
 }
@@ -716,6 +720,9 @@ impl PendingWorker {
                 | self.drain_commands()
                 | self.harvest()
                 | self.deliver();
+            if progress {
+                self.publish();
+            }
             backoff.record(progress);
         }
     }
@@ -770,6 +777,11 @@ impl PendingWorker {
 
     /// Once per round rather than once per command: the store's size is asked for by a report at the
     /// end of a run, and paying six atomic stores per write would be a cost per request for it.
+    ///
+    /// Called from the round itself rather than from whichever stage happened to do the work. A sweep
+    /// round moves no command, so a run whose day ran out while the client went quiet published nothing
+    /// about the walk it had just spent milliseconds on — the number would have been stale exactly when it
+    /// was interesting.
     fn publish(&self) {
         self.store.publish(
             &self.occupancy.holds,
@@ -798,9 +810,6 @@ impl PendingWorker {
             if !self.take(command) {
                 break;
             }
-        }
-        if progress {
-            self.publish();
         }
         progress
     }

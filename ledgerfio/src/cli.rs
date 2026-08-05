@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use ledger_pending::PendingCapacity;
+use ledger_pending::{MemoryPendingConfig, PendingCapacity};
 use ledger_stubkit::LatencyRange;
 
 use crate::workload::WorkloadKind;
@@ -32,6 +32,17 @@ pub struct Options {
     pub capacity: PendingCapacity,
     /// The most the index may occupy. A declaration whose worst case needs more is refused at the start.
     pub index_budget: u64,
+    /// Days the engine's calendar is moved on over the measured phase, evenly spaced. Zero leaves it on
+    /// the wall clock, where a run of seconds never crosses a day and the expiry sweep is unreachable —
+    /// which is why every number about expiry was missing rather than merely untested.
+    ///
+    /// A run reaches the expiry of holds it created itself only past `retention-days + grace-days`: the
+    /// first day's records sit in the segment that day owns, and nothing about them expires until the
+    /// lifetime they were promised has run out.
+    pub expiry_days: u64,
+    /// Expiry voids the engine offers per sweep round. The slice `docs/status.md` says is a constant where
+    /// it should be a policy, exposed so a run can say what each value costs.
+    pub expiry_per_round: usize,
     /// Length of the measured phase. Funding the accounts happens first and is not measured.
     pub duration: Duration,
     /// Target submissions per second, or 0 to submit as fast as the ledger accepts. Use a rate
@@ -105,6 +116,10 @@ impl Default for Options {
             resolve_after: 0,
             capacity: PendingCapacity::default(),
             index_budget: 1 << 30,
+            expiry_days: 0,
+            // The engine's own, not a second copy of it: what a round offers is its policy, and this tool
+            // only asks for a different value.
+            expiry_per_round: MemoryPendingConfig::default().expiry_per_round,
             duration: Duration::from_secs(3),
             rate: 0,
             in_flight: 20_000,
@@ -239,6 +254,8 @@ impl Cli {
             "flush-window" => options.capacity.flush_window_hours = Self::count(value)?,
             "residency" => options.capacity.residency_hours = Self::count(value)?,
             "index-budget" => options.index_budget = Self::count(value)?,
+            "expiry-days" => options.expiry_days = Self::count(value)?,
+            "expiry-per-round" => options.expiry_per_round = (Self::count(value)? as usize).max(1),
             "duration" => options.duration = Self::duration(value)?,
             "rate" => options.rate = Self::count(value)?,
             "in-flight" => options.in_flight = Self::count(value)?,

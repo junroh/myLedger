@@ -490,7 +490,8 @@ impl RunReport {
         // One is ordinary; more than the configured grace is the throttle behind by longer than the index
         // was sized to allow, which ends in the seal below rather than in late deletion.
         let behind = self.pending_traffic.days_behind;
-        if self.metrics.holds_expired + self.metrics.expiry_refused > 0 || behind > 0 {
+        let swept = self.pending_traffic.swept_slots;
+        if self.metrics.holds_expired + self.metrics.expiry_refused > 0 || behind > 0 || swept > 0 {
             println!(
                 "  retention     {} holds released for outliving it, {} refused and {} dropped by a full queue \
                  (both offered again), {} expired days still to empty",
@@ -498,6 +499,21 @@ impl RunReport {
                 self.metrics.expiry_refused,
                 self.metrics.expiry_dropped,
                 behind
+            );
+            // Slots walked per void is the sweep's real price, and the number `expiry_per_round` does not
+            // bound: a round stops when it has collected its voids, so a segment down to its last few
+            // survivors walks the table to find them — on the engine's own thread, ahead of the lookups it
+            // would otherwise be answering. Per index pass rather than absolute, because the pass is the
+            // unit that has to fit in the speed contract.
+            let slots = self.pending_traffic.index_slots.max(1) as f64;
+            let per_void = match self.metrics.holds_expired {
+                0 => "nothing released, so every pass was a whole one".to_owned(),
+                released => format!("{:.0} per void released", swept as f64 / released as f64),
+            };
+            println!(
+                "  sweep         {swept} index slots walked ({:.1} passes of {}, {per_void})",
+                swept as f64 / slots,
+                self.pending_traffic.index_slots,
             );
         }
         if self.metrics.holds_not_stored > 0 {

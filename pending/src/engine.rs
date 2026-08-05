@@ -30,6 +30,12 @@ pub struct PendingEngine {
     sweep: Sweep,
     /// Reused by every sweep round, so expiry allocates nothing however often it is asked.
     expiring: Vec<BlockAddr>,
+    /// Index slots the sweep has walked. Counted because it is the sweep's real cost and the only one
+    /// nothing bounds: a round stops once it has collected `want` voids, so a segment with few survivors
+    /// left walks whatever it takes to find them — up to the whole table — and does it on this thread,
+    /// ahead of the commands being drained. A tail that moves when the sweep runs cannot be explained
+    /// without this number.
+    swept_slots: u64,
     overflowed: u64,
     /// Committed decisions applied, counted so an answer can say which of them it reflects. The
     /// sequencer knows how many it had sent when it asked, and an answer from before one of them is a
@@ -365,6 +371,7 @@ impl PendingEngine {
             overflowed: self.overflowed,
             segment: self.records.segment(),
             days_behind: self.days_behind(),
+            swept_slots: self.swept_slots,
             ..self.records.traffic()
         }
     }
@@ -475,9 +482,11 @@ impl PendingEngine {
         }
         self.expiring.clear();
         let mut addrs = std::mem::take(&mut self.expiring);
+        let from = self.sweep.at;
         self.sweep.at = self
             .index
-            .addresses_in_segment(segment, self.sweep.at, want, &mut addrs);
+            .addresses_in_segment(segment, from, want, &mut addrs);
+        self.swept_slots += (self.sweep.at - from) as u64;
         self.sweep.found |= !addrs.is_empty();
         for &addr in &addrs {
             // Read through to the store rather than only from memory: a record the sweep declined to read

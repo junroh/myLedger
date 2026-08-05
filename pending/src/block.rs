@@ -708,6 +708,10 @@ pub struct LogTraffic {
     /// so this is where "deleting late is safe" stops being true, and a run has to be able to see it.
     pub segment: u8,
     pub days_behind: u64,
+    /// Index slots the expiry sweep has walked. The one cost in the engine that no bound applies to — a
+    /// round is bounded by the voids it collects, not by the slots it visits — so a run that cannot see it
+    /// cannot say why its tail moved when the sweep ran.
+    pub swept_slots: u64,
 }
 
 #[cfg(test)]
