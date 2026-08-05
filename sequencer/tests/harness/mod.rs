@@ -341,7 +341,8 @@ impl<C: Clock> Harness<C> {
             .filter_map(|&account| self.reactor.lane(account).map(|lane| (account, lane)))
             .map(|(account, lane)| {
                 format!(
-                    "lane {account:?} last_seq={} in_flight={} awaits_pending={} quarantined={}",
+                    "sealed={} lane {account:?} last_seq={} in_flight={} awaits_pending={} quarantined={}",
+                    self.reactor.applies_sealed(),
                     lane.last_seq(),
                     lane.in_flight(),
                     lane.awaits_pending_reply(),

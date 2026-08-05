@@ -352,6 +352,13 @@ where
         self.safety.is_fail_stopped()
     }
 
+    /// Whether this node has stopped applying. A sealed apply path is a legitimate end for a run and an
+    /// illegitimate one for a test that is waiting on money to move, so a test that waits has to be able
+    /// to tell the two apart rather than time out on both.
+    pub fn applies_sealed(&self) -> bool {
+        self.safety.applies_sealed()
+    }
+
     pub fn quarantined(&self) -> &[AccountId] {
         self.safety.quarantined()
     }

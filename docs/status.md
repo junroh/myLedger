@@ -17,26 +17,31 @@ by `make verify` on its first run, which is the argument for the target. Present
 change that gave the ledger's own resolutions an idempotency dependency, so that change did not
 introduce it.
 
-What a captured failure says, with the lane state the harness now prints:
+**The defect is a hold resolved twice**, and everything else about the failure is the ledger reacting to
+it correctly. What a captured failure says, with the state the harness now prints:
 
 ```
-lane AccountId(10) last_seq=145 in_flight=38 awaits_pending=false quarantined=false
-judged: 143  committed: 105  proposed_batches: 8  commit_failures: 0
-holds_expired: 101  expiry_refused: 11  pending_removes: 52
+sealed=true  lane AccountId(10) last_seq=154 in_flight=9 awaits_pending=false quarantined=false
+judged: 114  committed: 105  proposed_batches: 7  holds_expired: 141  rejected: 81
 ```
 
-Thirty-eight judged effects were never committed, which is exactly the lane's `in_flight`, and eight
-proposals were made against a `batching.in_flight` of eight. So consensus is holding every proposal it
-is allowed to hold and answering none, and nothing else can be proposed behind them. Not a lane stuck on
-a component — no pending reply is outstanding and the lane is not quarantined — and not a refused
-commit. A leak in what counts as a proposal in flight would look exactly like this, and so would an echo
-that loses one.
+`sealed=true` is the whole story. A second void for a hold already resolved reaches the apply path, the
+column it would move is asked to go below zero, the effect is refused and the apply path seals — rule 19,
+working. Everything after that is a stopped node: effects judged and never committed, proposals
+outstanding and never answered, a lane holding requests that will never move. None of that is a defect of
+its own, and reading it as one costs an afternoon.
 
-**A second shape, seen before the negative-column check below and not since.** The same test reached a
-pending column of **-80** against an expected 5: sixty-seven voids judged good against fifty-one written
-holds, sixteen too many, each releasing five. The ledger released reservations it did not hold. Whether
-that and the stall above are one defect or two is not established — the check turns the write into a
-seal, so the next occurrence will stop at the cause instead of drifting past it.
+Before that check existed the same runs went the other way: the negative column was written and the
+pending column reached **-80** against an expected 5 — sixty-seven voids judged good against fifty-one
+written holds, sixteen too many at five apiece. The ledger released reservations it did not hold and said
+nothing.
+
+**Where to look.** A void is refused when the hold is gone from the index, or when the sequencer's own
+overlay says it is already resolved. Between those two there is a window: the sequencer has decided the
+`Remove` and handed it to the engine, but the engine has not applied it yet. If the overlay stops
+answering for the hold when the write is handed over rather than when it lands, nothing refuses a second
+void offered inside that window. Design notes §2's correction and rule 18 are about exactly that seam —
+what a hold has left follows the write the engine is sent, and nothing else writes it.
 
 ## Built
 
