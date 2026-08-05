@@ -74,6 +74,10 @@ runs out is emptied by releasing whatever survived it. Design notes §14.
   changed and restarted applies to records already written, which is what a retention promise needs.
 - **Expiry is what makes the index's declared maximum true.** Without it a hold never leaves the
   index, and a long-running node eventually passes the maximum it was sized for and seals.
+- **A day's blocks go back once nothing points into it.** A whole pass of the index finding nothing
+  in the expiring segment is the one moment they are known to be dead, and handing them back is the
+  only way the store shrinks — records are written once and never rewritten. Without it a run's total
+  would be holds created rather than holds alive, which is the figure the capacity estimate rests on.
 - **The void is judged, not applied.** A settle the client submitted may be in flight for the same
   hold, and only the judge sees both. Its id is derived from the hold, so two leaders propose the
   same one and the second is a duplicate — which is why the top bit of a transaction id is reserved
@@ -96,32 +100,37 @@ test asserts the store was reached.
 
 ## Not built
 
-### Keeping a mass expiry behind live traffic
+### The expiry throttle has no policy
 
-Expiry itself is built (below). What is not is a rate limiter, so the only thing keeping a day's
-worth of voids from competing with client traffic is `expiry_per_round` — a bound, not a policy.
-Falling behind deletes late, which is the safe direction, so this is a capacity question rather
-than a correctness one. The requirement is derived rather than guessed:
+The throttle is built, and it is a throttle rather than a rate limiter on purpose. It paces in three
+places, none of which refuses anything: a bounded slice per round (`expiry_per_round`), nothing more
+offered while the last slice is unanswered (`PendingWorker::sweep_expiry`), and no second walk of the
+index until the index has moved (`Sweep::waiting_at`). That is the only shape that can be correct
+here — a refused void has nobody to hear the refusal, and a void nobody hears is a pending column
+reserved for good. A rate limiter belongs at the client edge, where a refusal reaches a client and
+becomes an error to retry.
+
+What is missing is the policy that sizes the slice: today it is a constant, where it should follow
+what the sequencer is being asked to do. Falling behind deletes late, which is the safe direction, so
+this is a capacity question rather than a correctness one. The requirement is derived rather than
+guessed:
 
 ```
 drain rate >= a day's survivors / a day
 ```
 
-What is missing to size it is the measurement: what a day's worth of voids does to the tail while
-clients are being served.
+Sizing it needs a measurement nobody has taken: what a day's worth of voids does to the tail while
+clients are being served. The seam the policy needs is already there — `expiring(want, into)` takes
+its bound per call — so what waits is the number, not the code.
 
-### Blocks are not freed yet
+### The negative answer the design asked for is refused
 
-Expiry releases the holds a day's records belonged to, so the records themselves die with the
-`Remove` that resolves them — but nothing yet hands a wholly empty segment's blocks back to the
-store. The bound on *holds* is real; the bound on bytes waits on that.
-
-**The split the engine's design asks for is refused, not deferred.** It wanted a negative answer that
-tells "resolved or expired" from "never existed". Under the retention promise that is
-unimplementable: answering "expired" needs per-hold state kept past retention, and a tombstone is
-exactly the data the promise says is deleted. Design notes §14 has the argument and what serves the
-need instead — telling the client when the void happens, which needs a push channel the ledger does
-not have.
+Refused rather than deferred, which is why it sits here with a reason instead of on a list. The engine's
+design wanted a negative answer that tells "resolved or expired" from "never existed". Under the
+retention promise that is unimplementable: answering "expired" needs per-hold state kept past
+retention, and a tombstone is exactly the data the promise says is deleted. Design notes §14 has the
+argument and what serves the need instead — telling the client when the void happens, which needs a
+push channel the ledger does not have.
 
 ### Recovery is not real
 

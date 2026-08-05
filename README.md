@@ -26,10 +26,11 @@ sequencer holds is one leader's work in progress.
 |---|---|
 | sequencer | built |
 | account balances | in-memory, persistence not built |
-| pending engine (holds) | in-memory tier; disk tier and expiry sweep not built |
+| pending engine (holds) | in-memory tier with retention and expiry; disk tier not built |
 | idempotency | in-memory map; the one-hour window is not expired yet |
 | consensus | commits locally after a simulated round trip; no replication |
-| rate limiter | not built |
+| expiry throttle | paces against the sequencer; the policy that sizes its slice waits on a measurement |
+| rate limiter (client edge) | not built |
 
 The sequencer reaches all of them through ports, so each can be replaced without touching it. The
 three that are simulated share one crate of stand-in machinery — latency, lane ordering, a worker

@@ -54,9 +54,11 @@ grew from 96 to 112 bytes. That is recorded in the layout budget.
 **Expiry belongs to the pending engine, and the judgment does not.** How long a hold may live and
 noticing that it ran out is the engine's work, and that is built: it proposes the void. Deciding it is
 still the sequencer's, because a resolution the client submitted may be in flight for the same hold and
-only the judge sees both. What is not built is the rate limiter that would keep a mass-expiry sweep
-behind live traffic; today a bound on voids per round stands in for it, and falling behind deletes
-late, which is the safe direction. Design notes §14.
+only the judge sees both. The throttle that keeps a mass-expiry sweep behind live traffic is built —
+a bounded slice per round, nothing more offered while the last slice is unanswered — and what is not
+is the policy that sizes the slice, which waits on a measurement rather than on code. Falling behind
+deletes late, which is the safe direction. Not a rate limiter: a refused void has nobody to hear the
+refusal, so pacing is the only mechanism that can be correct here. Design notes §14.
 
 **How long is a configuration, not a per-hold field.** A client cannot ask for its own lifetime —
 `Transfer` is full, and a hold's `pending_ref` already names its budget group — so the retention window
