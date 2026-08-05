@@ -102,6 +102,15 @@ those bugs generalised.
     else writes it. Where the hot path needs a local copy of a fact that lives elsewhere — a lane's
     quarantine flag beside safety's list of quarantined lanes — one call sets both and the invariant
     check proves they agree.
+
+    **A judgment has an owner too, and this is the half that keeps being missed.** Three defects in
+    one week were the same shape: something everything depended on that nothing owned. A lane's order
+    came out of whichever component a request happened to travel through. A cascade's depth was
+    bounded by whichever resource ran out first. Whether a hold still existed was decided separately
+    by each of the three readers that asked. In each case the invariant held by coincidence of how
+    the pieces behaved, and moving one piece broke it silently. Decide it once, in one place, and let
+    the readers derive — `HoldOverlay::known` is that, and its comment says why the compiler could
+    not have helped: the state already existed and only its lifetime changed.
 19. **Detect and stop, never detect and continue.** A commit that answers the wrong batch, or a
     committed effect that cannot be applied, means this node's own bookkeeping no longer follows the
     log: the apply path is sealed, nothing more is applied or answered, and there is deliberately no

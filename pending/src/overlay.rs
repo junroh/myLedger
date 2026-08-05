@@ -64,6 +64,17 @@ impl Entry {
     }
 }
 
+/// What the overlay knows about one hold, which is a smaller question than which entry it is holding.
+/// `Gone` covers both ways a hold can be absent — the engine said so, or a committed removal took it
+/// and has not been applied yet — because nothing outside this file needs to tell those apart.
+enum Known<'a> {
+    Nothing,
+    /// A lookup is out and no answer has come back.
+    Awaiting,
+    Gone,
+    Live(&'a Hold),
+}
+
 struct Hold {
     /// Requests in flight that will read this hold. Eviction leaves those alone.
     pinned: u32,
@@ -86,11 +97,25 @@ impl HoldOverlay {
         }
     }
 
+    /// What is known about a hold, decided **once**. Every reader below derives from this rather than
+    /// reading an entry and deciding for itself.
+    ///
+    /// That is not tidiness. `Removed` already existed when its lifetime changed — it used to last as
+    /// long as a pin, and now it lasts until the engine has applied the removal — and because three
+    /// readers each matched on the entry themselves, three of them had to change and a missed one was
+    /// silent. No variant was added, so no exhaustive match would have caught it. One decode point is
+    /// what a compiler cannot give here.
+    fn known(&self, hold: TxId) -> Known<'_> {
+        match self.entries.get(&hold) {
+            None => Known::Nothing,
+            Some(Entry::Watched { .. }) => Known::Awaiting,
+            Some(Entry::Missing { .. } | Entry::Removed { .. }) => Known::Gone,
+            Some(Entry::Decided(decided)) => Known::Live(decided),
+        }
+    }
+
     pub fn hold_is_missing(&self, hold: TxId) -> bool {
-        matches!(
-            self.entries.get(&hold),
-            Some(Entry::Missing { .. } | Entry::Removed { .. })
-        )
+        matches!(self.known(hold), Known::Gone)
     }
 
     /// Only a place for the pins of the requests waiting on the answer. What is already here must
@@ -130,14 +155,11 @@ impl HoldOverlay {
     /// before that — so "not there" can be about a hold that has since been created, and a remainder
     /// can be the one before a settle that has already committed.
     pub fn admit_lookup(&mut self, hold: TxId, remaining: Option<Amount>) {
-        if self.decided(hold).is_some() {
-            return;
-        }
-        // A removal is a decision like any other, and the same rule applies: this answer was taken
-        // before it, so it may not be believed. Believing it was the defect — the answer still carries
-        // the hold with its whole remainder, because the engine has not applied the removal yet, and
-        // deciding a live hold from it resolves the hold a second time.
-        if matches!(self.entries.get(&hold), Some(Entry::Removed { .. })) {
+        // Anything already known here was decided by the sequencer, and this answer left before that.
+        // A removal counts: believing an answer that crossed one was the defect, because the answer
+        // still carries the hold with its whole remainder and deciding a live hold from it resolves the
+        // hold a second time.
+        if matches!(self.known(hold), Known::Live(_) | Known::Gone) {
             return;
         }
         match remaining {
@@ -164,22 +186,21 @@ impl HoldOverlay {
     }
 
     pub fn overlay(&self, hold: TxId) -> OverlayState {
-        match self.entries.get(&hold) {
-            Some(Entry::Decided(decided)) => OverlayState {
+        match self.known(hold) {
+            Known::Live(decided) => OverlayState {
                 remaining: Some(decided.committed_remaining),
                 taken: decided.reserved,
                 resolved: decided.resolved,
             },
-            // A removal the engine has not applied yet. Whoever asks is composing a view from a record
-            // a lookup brought back, and that record still shows the hold alive with its whole
-            // remainder — the engine's index has not been cleared. So the answer has to come from here:
-            // resolved, nothing left, whatever the record says.
-            Some(Entry::Removed { .. }) => OverlayState {
+            // The caller is composing a view from a record a lookup brought back, and where the hold is
+            // gone that record can still show it alive with its whole remainder — the engine clears its
+            // index a queue after the sequencer hands the removal over. So the answer comes from here.
+            Known::Gone => OverlayState {
                 remaining: Some(0),
                 taken: 0,
                 resolved: true,
             },
-            _ => OverlayState::default(),
+            Known::Nothing | Known::Awaiting => OverlayState::default(),
         }
     }
 
@@ -311,13 +332,6 @@ impl HoldOverlay {
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
-    }
-
-    fn decided(&self, hold: TxId) -> Option<&Hold> {
-        match self.entries.get(&hold)? {
-            Entry::Decided(decided) => Some(decided),
-            _ => None,
-        }
     }
 
     fn decided_mut(&mut self, hold: TxId) -> Option<&mut Hold> {
