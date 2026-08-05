@@ -36,12 +36,25 @@ pending column reached **-80** against an expected 5 — sixty-seven voids judge
 written holds, sixteen too many at five apiece. The ledger released reservations it did not hold and said
 nothing.
 
-**Where to look.** A void is refused when the hold is gone from the index, or when the sequencer's own
-overlay says it is already resolved. Between those two there is a window: the sequencer has decided the
-`Remove` and handed it to the engine, but the engine has not applied it yet. If the overlay stops
-answering for the hold when the write is handed over rather than when it lands, nothing refuses a second
-void offered inside that window. Design notes §2's correction and rule 18 are about exactly that seam —
-what a hold has left follows the write the engine is sent, and nothing else writes it.
+**The mechanism, as far as reading the code takes it.** A stale lookup reply can resurrect a hold the
+ledger has already removed.
+
+1. A committed removal calls `HoldOverlay::forget`. With nothing pinned it **drops the entry**; only a
+   pinned hold is kept, as `Removed`. The comment there is about not dropping another request's pin, and
+   the state is doing double duty — it is also the only memory that the hold is gone.
+2. A second void for the same hold has a lookup already in flight. Its pin comes off when its reply
+   arrives, before the judge runs.
+3. `admit_lookup` finds no decided entry, so it **decides one from the reply** — a record the engine had
+   not applied the removal to yet, with the full remainder still on it.
+4. `HoldView::compose` takes `resolved` from the overlay and only from the overlay. A fresh entry says
+   `resolved: false`, so the judge sees a live hold with money on it and voids it a second time.
+
+So the tombstone lives exactly as long as a pin, and the window is between the removal committing and
+the engine applying it. `stale_answers` does not cover it: that check compares what the engine had
+applied against what this request was dispatched behind, and this reply is not late by that measure.
+
+What it needs is a decision rather than a patch: how long a removed hold has to stay known-removed. Long
+enough for every lookup that could still answer for it, which is not the same as "while pinned".
 
 ## Built
 
