@@ -168,6 +168,19 @@ pub fn evidence(plan: &Plan, prediction: &Prediction) {
         prediction.metrics.holds_evicted,
         prediction.metrics.fences
     );
+    // Only where a day passed. Silence beats a line of zeroes that reads as a measurement: a run with no
+    // `--day-ms` has not asked the question, which is not the same as answering nothing fell behind.
+    if prediction.metrics.holds_expired + prediction.metrics.expiry_refused > 0
+        || prediction.days_behind_worst > 0
+    {
+        println!(
+            "  retention      expiry admitted={} refused={} (offered again next round), worst {} days \
+             behind",
+            prediction.metrics.holds_expired,
+            prediction.metrics.expiry_refused,
+            prediction.days_behind_worst
+        );
+    }
 }
 
 /// What this workload would occupy, and what it would push down. The two are different questions and
@@ -413,6 +426,10 @@ pub struct Coverage {
     expiries_offered: u64,
     expired: u64,
     expiry_refused: u64,
+    /// The furthest behind any seed's sweep fell, in days — a max rather than a sum, because it is a level
+    /// and seeds do not add up. One is ordinary; more than a seed's grace is where late deletion stops
+    /// being the safe direction and becomes an index that outgrows its declared maximum.
+    days_behind_worst: u64,
     store_reads: u64,
     stale_answers: u64,
     lookups: u64,
@@ -439,6 +456,7 @@ impl Coverage {
         self.expiries_offered += report.expiries_offered;
         self.expired += m.holds_expired;
         self.expiry_refused += m.expiry_refused;
+        self.days_behind_worst = self.days_behind_worst.max(report.days_behind_worst);
         self.store_reads += report.store_reads;
         self.stale_answers += report.metrics.stale_answers;
         self.lookups += m.pending_lookups;
@@ -467,8 +485,8 @@ impl Coverage {
             self.not_stored
         );
         println!(
-            "           expiry offered {} admitted {} refused {}",
-            self.expiries_offered, self.expired, self.expiry_refused
+            "           expiry offered {} admitted {} refused {}, worst {} days behind",
+            self.expiries_offered, self.expired, self.expiry_refused, self.days_behind_worst
         );
         println!(
             "           seq gaps {} stale answers {} quarantines {} refused commits {} \

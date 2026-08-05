@@ -485,11 +485,17 @@ impl RunReport {
                 self.metrics.invariant_breaks
             );
         }
-        if self.metrics.holds_expired + self.metrics.expiry_refused > 0 {
+        // The days behind belong beside the refusals, because they are cause and effect: a void with no
+        // room is offered again next round, and a day that keeps being offered again is a day not emptied.
+        // One is ordinary; more than the configured grace is the throttle behind by longer than the index
+        // was sized to allow, which ends in the seal below rather than in late deletion.
+        let behind = self.pending_traffic.days_behind;
+        if self.metrics.holds_expired + self.metrics.expiry_refused > 0 || behind > 0 {
             println!(
                 "  retention     {} holds released for outliving it, {} offered and refused (already \
-                 resolved, or no room yet — the sweep offers those again)",
-                self.metrics.holds_expired, self.metrics.expiry_refused
+                 resolved, or no room yet — the sweep offers those again), {} expired days still to \
+                 empty",
+                self.metrics.holds_expired, self.metrics.expiry_refused, behind
             );
         }
         if self.metrics.holds_not_stored > 0 {

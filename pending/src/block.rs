@@ -702,11 +702,12 @@ pub struct LogTraffic {
     /// Holds whose fingerprint turned out to be shared, and inserts the table could not take at all.
     pub ambiguous: u64,
     pub overflowed: u64,
-    /// The day records are being written into, as a segment number, and whether the day that ran out is
-    /// still being emptied. A sweep still going when the next day arrives is deleting late — safe, but it
-    /// is the number that says the expiry rate is short, so a run has to be able to see it.
+    /// The day records are being written into, as a segment number, and how many expired days are still
+    /// waiting to be emptied. One is ordinary. More than `grace_days` is the throttle behind by longer
+    /// than the slack the index was sized with, and past that a hold cannot be stored and the node seals —
+    /// so this is where "deleting late is safe" stops being true, and a run has to be able to see it.
     pub segment: u8,
-    pub sweeping: bool,
+    pub days_behind: u64,
 }
 
 #[cfg(test)]

@@ -327,7 +327,7 @@ struct TrafficGauge {
     ambiguous: AtomicU64,
     overflowed: AtomicU64,
     segment: AtomicU64,
-    sweeping: AtomicBool,
+    days_behind: AtomicU64,
 }
 
 impl TrafficGauge {
@@ -359,7 +359,8 @@ impl TrafficGauge {
         self.overflowed.store(traffic.overflowed, Ordering::Relaxed);
         self.segment
             .store(u64::from(traffic.segment), Ordering::Relaxed);
-        self.sweeping.store(traffic.sweeping, Ordering::Relaxed);
+        self.days_behind
+            .store(traffic.days_behind, Ordering::Relaxed);
     }
 
     fn read(&self) -> LogTraffic {
@@ -380,7 +381,7 @@ impl TrafficGauge {
             ambiguous: self.ambiguous.load(Ordering::Relaxed),
             overflowed: self.overflowed.load(Ordering::Relaxed),
             segment: self.segment.load(Ordering::Relaxed) as u8,
-            sweeping: self.sweeping.load(Ordering::Relaxed),
+            days_behind: self.days_behind.load(Ordering::Relaxed),
         }
     }
 }

@@ -364,7 +364,7 @@ impl PendingEngine {
             ambiguous: self.index.ambiguous(),
             overflowed: self.overflowed,
             segment: self.records.segment(),
-            sweeping: self.sweeping(),
+            days_behind: self.days_behind(),
             ..self.records.traffic()
         }
     }
@@ -523,17 +523,35 @@ impl PendingEngine {
         };
     }
 
-    /// The segment being emptied, if a day has run out. Days are finished in order, so this is the oldest
-    /// unfinished one rather than whatever expired most recently.
-    fn expiring_segment(&self) -> Option<u8> {
+    /// The oldest day still waiting to be emptied, and how many such days there are. Days are finished
+    /// in order, so the first is the oldest unfinished one rather than whatever expired most recently.
+    /// `None` when nothing has run out.
+    ///
+    /// One rule, one place: the segment to empty, whether a sweep is owed at all, and how far behind it
+    /// is are three readings of this one fact.
+    fn behind(&self) -> Option<(u64, u64)> {
         let day = self.sweep.day?;
         let expired_through = self.today.checked_sub(self.lifetime_days)?;
-        (day <= expired_through).then_some((day % SEGMENTS) as u8)
+        Some((day, expired_through.checked_sub(day)? + 1))
     }
 
-    /// Whether a day is still waiting to be emptied. What says the sweep is keeping up.
+    /// The segment being emptied, if a day has run out.
+    fn expiring_segment(&self) -> Option<u8> {
+        self.behind().map(|(day, _)| (day % SEGMENTS) as u8)
+    }
+
+    /// How many expired days are still waiting to be emptied. One is the ordinary state — the day that
+    /// just ran out is being worked through. More than `grace_days` is the throttle behind by longer than
+    /// the slack the index was sized with: `declared_maximum` assumes a hold leaves within
+    /// `retention + grace`, and a hold that stays past it is an insert the index cannot take, which seals.
+    /// So this is the number that says whether "deleting late is safe" is still true of a run.
+    pub fn days_behind(&self) -> u64 {
+        self.behind().map_or(0, |(_, behind)| behind)
+    }
+
+    /// Whether a day is still waiting to be emptied at all.
     pub fn sweeping(&self) -> bool {
-        self.expiring_segment().is_some()
+        self.days_behind() > 0
     }
 
     /// Blocks handed back to the store, which is the only way it shrinks. Read from the log rather than
@@ -1238,6 +1256,9 @@ mod expiry_tests {
     /// day open for ever rather than being skipped. An earlier version restarted the walk at whatever had
     /// just expired, so a day still being walked when the next arrived was abandoned — and its holds were
     /// never released at all.
+    ///
+    /// The days that ran out meanwhile pile up, and the count is what says so: a bool could not tell one
+    /// day behind from four, and four is where the index has outlived the slack it was sized with.
     #[test]
     fn a_day_with_a_hold_left_is_never_finished_or_skipped() {
         let (mut engine, _) = written_on_day_zero();
@@ -1247,6 +1268,7 @@ mod expiry_tests {
         let voids = offered(&mut engine, 1024);
         let (keep, release) = voids.split_first().expect("voids to commit");
         commit(&mut engine, release);
+        assert_eq!(engine.days_behind(), 1, "one day has run out");
         for day in LIFETIME + 1..LIFETIME + 4 {
             engine.open_day(day, LIFETIME);
             let again = offered(&mut engine, 1024);
@@ -1257,7 +1279,11 @@ mod expiry_tests {
                 "a later day was worked on while an earlier one still had a hold"
             );
         }
-        assert!(engine.sweeping(), "the unfinished day was abandoned");
+        assert_eq!(
+            engine.days_behind(),
+            4,
+            "the unfinished day was abandoned, or the days behind it did not pile up"
+        );
         assert_eq!(
             engine.freed_blocks(),
             0,

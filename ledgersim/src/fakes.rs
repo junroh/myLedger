@@ -137,11 +137,12 @@ impl From<&crate::sim::Plan> for Timings {
             idem_nanos: plan.idem_nanos,
             raft_nanos: plan.raft_nanos,
             raft_tail_nanos: plan.raft_tail_nanos,
-            // No day ever passes: a capacity run asks what the ledger does against components of a given
-            // speed, and a background sweep competing with the traffic would answer a different question.
-            day_nanos: 0,
-            lifetime_days: 1,
-            expiry_per_round: 0,
+            // Zero by default, so a capacity run asks what the ledger does against components of a given
+            // speed and nothing else. Set them and the sweep competes with the traffic, which is the other
+            // question: whether the throttle keeps up while clients are being served.
+            day_nanos: plan.day_nanos,
+            lifetime_days: plan.lifetime_days.max(1),
+            expiry_per_round: plan.expiry_per_round,
         }
     }
 }
@@ -305,6 +306,13 @@ impl PendingFake {
     /// what matters is whether the sweep found anything for the sequencer to judge.
     pub fn expiries_offered(&self) -> u64 {
         self.0.borrow().expiries_offered
+    }
+
+    /// Expired days the sweep has not emptied yet. A level rather than a total, which is why a run reports
+    /// the worst it reached and not a sum: what matters is whether the throttle ever fell further behind
+    /// than the slack the index was sized with.
+    pub fn days_behind(&self) -> u64 {
+        self.0.borrow().store.days_behind()
     }
 
     /// Moves the engine's day on, which is the whole of what a clock does for retention. Driven by the

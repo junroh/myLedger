@@ -249,6 +249,14 @@ pub struct Plan {
     /// them it assumed: what a resolution costs depends entirely on which one answers it.
     pub flush_blocks: usize,
     pub resident_blocks: usize,
+    /// Retention, as the three numbers a run needs to reach it: how long a day is on the virtual clock,
+    /// how many days a hold lives, and how much the sweep may offer per round. A day of zero is a run no
+    /// day ever passes in, which is the default — a capacity run asks what the ledger does against
+    /// components of a given speed, and a sweep competing with the traffic is a different question. It is
+    /// a default rather than a fact so that question can actually be asked.
+    pub day_nanos: u64,
+    pub lifetime_days: u64,
+    pub expiry_per_round: usize,
 }
 
 impl Plan {
@@ -287,6 +295,10 @@ pub struct Report {
     /// above: not an invariant, but a sweep whose total is zero has covered no expiry at all — and expiry
     /// is what makes the index's declared maximum true rather than assumed.
     pub expiries_offered: u64,
+    /// The furthest behind the sweep fell, in days. One is ordinary. More than the run's `grace_days` is
+    /// the throttle behind by longer than the slack `declared_maximum` was sized with — past that a hold
+    /// stays in an index that cannot grow, and late deletion has turned into a seal.
+    pub days_behind_worst: u64,
 }
 
 pub struct Prediction {
@@ -322,6 +334,10 @@ pub struct Prediction {
     /// statement the two memory windows exist to make: at this resolution age and these windows, this
     /// share of resolutions costs an IO.
     pub store_reads: u64,
+    /// The furthest behind the expiry sweep fell, in days. Zero in every run that passes no day, which is
+    /// the default; where a day does pass, this is what says whether the throttle kept up with the traffic
+    /// beside it, and more than the run's grace is where deleting late has become a seal.
+    pub days_behind_worst: u64,
     /// The mean, in microseconds. Little's law is about the mean, not the median: a run held back by
     /// its queue depth answers `depth / mean`, and reading p50 there understates how long a slot is
     /// held whenever the tail is heavy.
@@ -465,6 +481,10 @@ struct Sim {
     day: u64,
     lifetime_days: u64,
     expiry_per_round: usize,
+    /// The furthest behind the expiry sweep ever fell, in days. Watched every step rather than read at
+    /// the end, because it is a level: a sweep five days behind halfway through and caught up by the last
+    /// step is the run that matters, and the final reading calls it zero.
+    days_behind_worst: u64,
     /// Requests generated and not yet accepted by the intake queue. A submission goes in whole or
     /// waits: half a chain reaches the ledger as a chain the client never sent, because the next
     /// unlinked request is what terminates an open one.
@@ -604,6 +624,7 @@ pub fn explore(
         store_reads,
         exempt_lookups,
         expiries_offered,
+        days_behind_worst: sim.days_behind_worst,
     })
 }
 
@@ -703,6 +724,7 @@ pub fn capacity(plan: Plan) -> Result<Prediction, Box<Failure>> {
             percentile(1.0),
         ],
         mean_us: sim.latency.mean() / 1_000.0,
+        days_behind_worst: sim.days_behind_worst,
         pending_commands: engine.reads,
         pending_queue_us: engine.queued_nanos as f64 / engine.reads.max(1) as f64 / 1_000.0,
         order_wait_us: order_wait.waited_nanos as f64 / order_wait.released.max(1) as f64 / 1_000.0,
@@ -803,6 +825,7 @@ impl Sim {
             day: 0,
             lifetime_days: timings.lifetime_days,
             expiry_per_round: timings.expiry_per_round,
+            days_behind_worst: 0,
             unsent: VecDeque::new(),
             now: 0,
             charged: StageCharge::default(),
@@ -924,6 +947,7 @@ impl Sim {
             self.pending.open_day(day, self.lifetime_days);
         }
         self.pending.sweep_expiry(self.expiry_per_round);
+        self.days_behind_worst = self.days_behind_worst.max(self.pending.days_behind());
     }
 
     /// The earliest any component has something to hand back.
