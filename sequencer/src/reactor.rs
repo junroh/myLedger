@@ -14,6 +14,7 @@ use crate::metrics::{Metrics, StageTimes};
 use crate::rules::budget::BudgetCoverage;
 use crate::rules::linked::LinkedChains;
 use crate::state::batcher::Batcher;
+use crate::state::expiry::ExpiryQueue;
 use crate::state::lane::LaneTable;
 use crate::state::outbox::Outbox;
 use crate::state::pending::PendingChannel;
@@ -79,6 +80,8 @@ pub struct Reactor<A: AccountPort, P: PendingPort, I: IdempotencyPort, R: RaftPo
     batcher: Batcher,
     /// Acks on their way to the client, bounded so a slow client becomes backpressure.
     outbox: Outbox,
+    /// Expiry voids waiting their turn, which comes after every client request this tick.
+    expiry: ExpiryQueue,
     /// The pending port and the committed decisions not yet handed to it; a queued write must
     /// precede any later lookup.
     pending: PendingChannel<P>,
@@ -157,6 +160,7 @@ where
             pipeline: Pipeline::new(transport.requests, capacity.slots, capacity.intake_per_tick),
             batcher: Batcher::new(config.batching, config.batch_headroom()),
             outbox: Outbox::new(transport.acks, capacity.ack_backlog, capacity.slots),
+            expiry: ExpiryQueue::new(capacity.expiry_backlog),
             pending: PendingChannel::new(
                 pending,
                 capacity.pending_write_backlog,
@@ -399,16 +403,25 @@ where
         progress
     }
 
-    /// The one place the engine speaks first. It gets no stage of its own: a stage would add a sixth
-    /// column to every `--cpu` report for something that happens once in the life of a node, and this
-    /// stage already runs before every other.
+    /// The one place the engine speaks first. Drained in full and before every other stage, because the
+    /// seal is on this wire: a seal decided now has to be in effect before this tick applies anything, and
+    /// it may not wait behind a void.
+    ///
+    /// The two notices are not the same character of work, so only one of them acts here. A seal happens
+    /// once in the life of a node and stops it. An expiry void is ordinary traffic nobody is waiting for —
+    /// millions of them in a run — so it is parked and admitted after the clients, on its own budget.
+    /// Acting on it here was giving the ledger's own background work first call on every slot.
     fn drain_pending_notices(&mut self) -> bool {
         let mut progress = false;
         while let Some(notice) = self.pending.notice() {
             progress = true;
             match notice {
                 PendingNotice::HoldNotStored { hold } => self.on_hold_not_stored(hold),
-                PendingNotice::HoldExpired { void } => self.admit_expiry(void),
+                PendingNotice::HoldExpired { void } => {
+                    if !self.expiry.park(void) {
+                        self.metrics.expiry_dropped += 1;
+                    }
+                }
             }
         }
         progress

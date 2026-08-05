@@ -74,7 +74,56 @@ where
                 break;
             }
         }
+        // After every client this tick was offered a slot, never before: the ledger's own work goes behind
+        // the work someone is waiting for. Correctness does not rest on this order — the lane gate below is
+        // what does — so this is the priority alone, and reads as one.
+        progress | self.admit_parked_expiry()
+    }
+
+    /// The parked voids, up to this tick's budget. The budget is a share and not a threshold on purpose: a
+    /// tick that admits anything admits some of these, so the sweep cannot be starved to a standstill by
+    /// traffic that never lets up — which is what bounds how far behind a day can fall.
+    ///
+    /// A void goes in only where its lane has nothing outstanding, because a ledger-origin resolution
+    /// carries no idempotency dependency and so has nothing ordering it against a client request that is
+    /// waiting on one — see `LaneState::is_caught_up`. A lane that is busy is skipped rather than waited
+    /// for: the void goes to the back and the next one is tried, so one unrelenting account delays its own
+    /// holds instead of every other account's. Attempts are bounded, so a queue of nothing but busy lanes
+    /// costs a fixed amount of this tick and no more.
+    fn admit_parked_expiry(&mut self) -> bool {
+        let mut progress = false;
+        let mut admitted = 0;
+        let budget = self.config.capacity.expiry_per_tick;
+        for _ in 0..budget * 2 {
+            if admitted == budget || self.pipeline.has_deferred() {
+                break;
+            }
+            let Some(void) = self.expiry.take() else {
+                break;
+            };
+            if self.lane_is_busy(&void) {
+                self.metrics.expiry_lane_busy += 1;
+                // Not a refusal and not a loss: it keeps its place in the queue, behind whatever else is
+                // waiting, and no seq has been issued for it yet.
+                self.expiry.park(void);
+                continue;
+            }
+            admitted += 1;
+            progress = true;
+            self.admit_expiry(void);
+        }
         progress
+    }
+
+    /// Whether this void would take a place in a lane that still owes a judgment. False for an account the
+    /// ledger does not constrain: that void keeps no place in any lane, so there is no order to protect.
+    fn lane_is_busy(&mut self, void: &Transfer) -> bool {
+        let Some(debit) = self.accounts.resolve(void.debit_account) else {
+            // Unknown to the account component. `admit_expiry` refuses it and counts it, which is where
+            // that answer belongs; nothing here has to decide it twice.
+            return false;
+        };
+        self.accounts.record(debit).is_constrained() && !self.lanes.get(debit).is_caught_up()
     }
 
     fn admit(&mut self, request: &Request) {

@@ -54,6 +54,20 @@ impl LaneState {
         self.seq_counter
     }
 
+    /// Every seq this lane has issued has been judged, so the next one issued will be the next one
+    /// judgeable whatever it waits on.
+    ///
+    /// This is what the ledger's own resolutions are admitted on. Every client request carries an
+    /// idempotency dependency and idempotency answers a lane in order, which is what keeps two client
+    /// requests from being judged out of turn. A ledger-origin resolution deliberately carries no such
+    /// dependency — it is made idempotent by the index that produced it — so it has nothing ordering it
+    /// against a client request that is waiting on idempotency alone. Admitting it only into a lane with
+    /// nothing outstanding is what replaces that: it takes `last_seq + 1` and is the only ordered request
+    /// on the lane, so no reply of another component can overtake it.
+    pub const fn is_caught_up(&self) -> bool {
+        self.seq_counter == self.last_seq
+    }
+
     /// Contract-1 check, not a reorder: a gap means an external component returned out of order.
     pub fn accept_seq(&mut self, seq: Seq) -> Result<(), LedgerError> {
         let expected = self.last_seq + 1;

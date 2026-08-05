@@ -9,6 +9,14 @@ pub struct Capacity {
     pub slots: usize,
     /// Caps how long intake holds the loop. Not a throughput limit.
     pub intake_per_tick: usize,
+    /// Expiry voids admitted per tick, against `intake_per_tick` for clients. The ratio between the two
+    /// is what keeps the ledger's own work behind the work someone is waiting for — and being a ratio
+    /// rather than a threshold is what bounds how far expiry can fall behind: a share of every tick that
+    /// admits anything at all is never a share of nothing.
+    pub expiry_per_tick: usize,
+    /// Expiry voids parked while waiting for one of those turns. Full declines the void, which the sweep
+    /// offers again; it never blocks the notice channel, because the apply-path seal travels on it.
+    pub expiry_backlog: usize,
     /// Acks buffered when the client is not draining. Reaching it pauses intake.
     pub ack_backlog: usize,
     /// Hold decisions buffered when the pending engine is not draining. Also pauses intake.
@@ -66,6 +74,11 @@ impl Default for ReactorConfig {
             capacity: Capacity {
                 slots: 1 << 16,
                 intake_per_tick: 4096,
+                // A sixty-fourth of the client budget. Enough that the sweep is never the reason a day
+                // stays open — measured drain kept up at a small fraction of this — and small enough that
+                // a day's worth of voids cannot become the traffic.
+                expiry_per_tick: 64,
+                expiry_backlog: 1 << 12,
                 ack_backlog: 1 << 14,
                 pending_write_backlog: 1 << 14,
                 log_events: 1 << 12,
@@ -91,6 +104,10 @@ impl ReactorConfig {
     pub fn validate(&self) -> Result<(), LedgerError> {
         let sane = self.capacity.slots > 0
             && self.capacity.intake_per_tick > 0
+            // Zero would starve expiry outright, and a hold that is never released stays in an index
+            // that never grows. Both refused here rather than discovered as a seal.
+            && self.capacity.expiry_per_tick > 0
+            && self.capacity.expiry_backlog > 0
             && self.capacity.log_events > 0
             && self.batching.size > 0
             && self.batching.in_flight > 0
