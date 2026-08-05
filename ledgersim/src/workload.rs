@@ -191,7 +191,13 @@ impl Traffic {
     }
 
     fn hold(&mut self) -> Transfer {
-        let debit = self.user();
+        // Some holds debit the unconstrained external account, so their resolutions are order-exempt:
+        // without them the exemption itself is never exercised, only the data check that covers it.
+        let debit = if self.prng.next_u64().is_multiple_of(4) {
+            EXTERNAL
+        } else {
+            self.user()
+        };
         let credit = self.other(debit);
         let amount = self.amount();
         let mut transfer = self.transfer(debit, credit, amount);

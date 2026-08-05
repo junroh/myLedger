@@ -18,6 +18,7 @@ impl LogKind {
     pub const COMMIT_OUT_OF_ORDER: u16 = 11;
     pub const APPLY_FAILED: u16 = 12;
     pub const INVARIANT_BROKEN: u16 = 13;
+    pub const HOLD_NOT_STORED: u16 = 14;
 
     pub fn describe(event: &LogEvent) -> String {
         let LogEvent {
@@ -55,6 +56,10 @@ impl LogKind {
             Self::APPLY_FAILED => {
                 format!("[{micros}us] committed effect could not be applied: batch={a} error={b}")
             }
+            Self::HOLD_NOT_STORED => format!(
+                "[{micros}us] the engine could not store a committed hold: hold={a:#x} after {b} \
+                 committed effects — the index was sized for a maximum this has passed"
+            ),
             other => format!("[{micros}us] unknown event {other}: a={a} b={b}"),
         }
     }

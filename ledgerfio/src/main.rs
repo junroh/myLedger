@@ -187,6 +187,12 @@ fn print_help() {
     println!("  --daily-arrivals <n>        (1m) transfers a day; scales both memory windows");
     println!("  --retention-days <n>        (2) how long a hold may live: with the share below, the index");
     println!(
+        "  --grace-days <n>            (1) slack before deletion, so it is never early: costs this"
+    );
+    println!(
+        "                              many days of capacity and buys away every early-deletion cause"
+    );
+    println!(
         "  --survivor-share <50%>      (50%) still unresolved when retention ends: sizes the index"
     );
     println!(

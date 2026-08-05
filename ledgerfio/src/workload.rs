@@ -92,7 +92,9 @@ pub struct Workload {
     /// oldest is the one whose record may have moved out of memory, which is the case worth reaching.
     ready_holds: VecDeque<OpenHold>,
     resolve_after: usize,
-    open_chain_leg: Option<AccountId>,
+    /// Legs of the chain being submitted, after the one already handed out. The batch must not end
+    /// while any are left.
+    queued_chain_legs: VecDeque<Transfer>,
 }
 
 impl Workload {
@@ -109,7 +111,7 @@ impl Workload {
             next_id: 1,
             submitted_holds: FxHashMap::default(),
             ready_holds: VecDeque::new(),
-            open_chain_leg: None,
+            queued_chain_legs: VecDeque::new(),
         }
     }
 
@@ -165,7 +167,7 @@ impl Workload {
 
     /// True while a linked chain is half-submitted: the batch must not end here.
     pub fn chain_open(&self) -> bool {
-        self.open_chain_leg.is_some()
+        !self.queued_chain_legs.is_empty()
     }
 
     /// A hold only becomes referenceable once its commit is acked; settling earlier would
@@ -179,37 +181,81 @@ impl Workload {
         }
     }
 
-    /// Two-leg chain: money arrives from outside, then the second leg spends it. Only the
-    /// group's own scratch layer makes that second leg possible.
+    /// One leg of a chain, starting a new chain when none is open. Two shapes, alternating: money
+    /// arrives and the second leg spends it, which only the chain's own scratch makes possible; or a
+    /// hold is created and resolved inside the chain that created it — the one resolution judged with
+    /// no record, so the engine reads back the version it appended (the in-chain fallback).
     fn chain_leg(&mut self) -> Transfer {
-        match self.open_chain_leg.take() {
-            None => {
-                let user = self.random_user();
-                self.open_chain_leg = Some(user);
-                let mut transfer = Transfer {
-                    id: self.take_id(),
-                    pending_ref: TxId::ABSENT,
-                    debit_account: EXTERNAL_ACCOUNT,
-                    credit_account: user,
-                    amount: self.transfer_amount,
-                    ledger: LEDGER,
-                    flags: TransferFlags::LINKED,
-                };
-                transfer.flags = TransferFlags::LINKED;
-                transfer
-            }
-            Some(user) => {
-                let credit = self.other_user(user);
-                Transfer {
-                    id: self.take_id(),
-                    pending_ref: TxId::ABSENT,
-                    debit_account: user,
-                    credit_account: credit,
-                    amount: self.transfer_amount,
-                    ledger: LEDGER,
-                    flags: TransferFlags::NONE,
-                }
-            }
+        if let Some(leg) = self.queued_chain_legs.pop_front() {
+            return leg;
+        }
+        if self.rng.next_u64().is_multiple_of(2) {
+            self.fund_then_spend_chain()
+        } else {
+            self.hold_then_resolve_chain()
+        }
+    }
+
+    fn fund_then_spend_chain(&mut self) -> Transfer {
+        let user = self.random_user();
+        let credit = self.other_user(user);
+        let spend = Transfer {
+            id: self.take_id(),
+            pending_ref: TxId::ABSENT,
+            debit_account: user,
+            credit_account: credit,
+            amount: self.transfer_amount,
+            ledger: LEDGER,
+            flags: TransferFlags::NONE,
+        };
+        self.queued_chain_legs.push_back(spend);
+        Transfer {
+            id: self.take_id(),
+            pending_ref: TxId::ABSENT,
+            debit_account: EXTERNAL_ACCOUNT,
+            credit_account: user,
+            amount: self.transfer_amount,
+            ledger: LEDGER,
+            flags: TransferFlags::LINKED,
+        }
+    }
+
+    /// Hold, partial settle, void of the rest — all in one chain. The settle is judged against the
+    /// chain's scratch rather than a record, so its committed `Reduce` carries no original size and
+    /// the engine falls back to reading the version it appended moments ago. No workload reached that
+    /// path before; its cost was covered by a unit test and nothing else. The hold declares no budget
+    /// group (`pending_ref` absent), because a group member may only move whole.
+    fn hold_then_resolve_chain(&mut self) -> Transfer {
+        let user = self.random_user();
+        let hold_id = self.take_id();
+        let settle = Transfer {
+            id: self.take_id(),
+            pending_ref: hold_id,
+            debit_account: EXTERNAL_ACCOUNT,
+            credit_account: user,
+            amount: (self.transfer_amount / 2).max(1),
+            ledger: LEDGER,
+            flags: TransferFlags::POST_PENDING | TransferFlags::LINKED,
+        };
+        let void_rest = Transfer {
+            id: self.take_id(),
+            pending_ref: hold_id,
+            debit_account: EXTERNAL_ACCOUNT,
+            credit_account: user,
+            amount: 0,
+            ledger: LEDGER,
+            flags: TransferFlags::VOID_PENDING,
+        };
+        self.queued_chain_legs.push_back(settle);
+        self.queued_chain_legs.push_back(void_rest);
+        Transfer {
+            id: hold_id,
+            pending_ref: TxId::ABSENT,
+            debit_account: EXTERNAL_ACCOUNT,
+            credit_account: user,
+            amount: self.transfer_amount,
+            ledger: LEDGER,
+            flags: TransferFlags::PENDING | TransferFlags::LINKED,
         }
     }
 

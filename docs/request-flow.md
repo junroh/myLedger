@@ -7,8 +7,9 @@ stage names are the design's: S1 intake, S2 dispatch, S3 judge, S4 propose, S5 a
 
 `Reactor::tick` runs the stages in a fixed order and never waits for any of them:
 
-1. **drain backlogs** — hand over acks and hold decisions that a full queue refused earlier, and
-   retry dispatches that a full external queue refused.
+1. **drain backlogs** — take whatever the pending engine said without being asked, hand over acks and
+   hold decisions that a full queue refused earlier, and retry dispatches that a full external queue
+   refused.
 2. **intake (S1) and dispatch (S2)** — admit requests, give each a place in its lane, throw the
    external calls.
 3. **judge (S3)** — take whatever external replies have arrived and decide the requests they
@@ -20,6 +21,12 @@ stage names are the design's: S1 intake, S2 dispatch, S3 judge, S4 propose, S5 a
 Backlogs come first because they are the only things that can block intake, and apply comes last
 because it is the only stage that cannot be moved off this core. A tick that finds nothing to do
 reports that, and the loop spins.
+
+The engine's notices are read at the top of step 1 rather than in a stage of their own, and being
+first is the point: one of them seals the apply path, so a seal decided this tick has to be in effect
+before step 5 applies anything. The other proposes a void for a hold that outlived its retention,
+which then travels the ordinary pending path — it takes a slot, a place in its lane and a lookup, and
+the judge is what refuses it if the client resolved that hold first. Design notes §13 and §14.
 
 ## Single-phase: the short path
 
@@ -99,6 +106,8 @@ boundary was abandoned by the client and is rejected, rather than gating its lan
 | Consensus refuses the batch | S5 | every effect rolled back: overlay released, reservation returned, requests rejected |
 | A queue is full | S2, S4 | deferred and retried; reaching a backlog limit pauses intake |
 | No work slot left | S1 | refused as overloaded, which is backpressure reaching the client |
+| The engine cannot store a committed hold | backlog drain | the apply path is sealed: nothing more is applied, and what is admitted after is refused as `FailStop` |
+| A hold outlives its retention | backlog drain | the engine proposes a void, judged like any other resolution; nobody is acked, because nobody asked |
 
 A refused commit can only cause a false reject, never an overdraft: the overlay records what a
 request will *take* at judge time and gives it back on failure, so a decision the ledger never

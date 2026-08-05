@@ -11,7 +11,7 @@ Each supported scenario has a test named after the behaviour in the evidence col
 | 4. Single hold, credit | supported | an incoming hold is not spendable until it settles |
 | 1. Shared budget group | supported | a group of three resolves as one unit, and every partial or short resolution is refused |
 | 2. Linked transfers | supported | a later leg spends what an earlier leg brings in; a chain resolves a hold it created itself; one failing leg rolls back the chain; an unterminated chain is rejected at the batch boundary |
-| 3. Delayed settlement and timeout | sequencer side supported | the void path is the same as scenario 0; nothing expires a hold yet |
+| 3. Delayed settlement and timeout | supported | a hold that outlives its retention is released without a client asking, and the void is judged so a client's own resolution cannot be overtaken |
 | A. Auth-less direct settlement | supported | single-phase transfers never touch the pending path |
 | 5, 6, 7 (conditional) | not implemented | they depend on open questions that are still open |
 
@@ -51,10 +51,16 @@ grew from 96 to 112 bytes. That is recorded in the layout budget.
 
 ## Accepted limits
 
-**Expiry belongs to the pending engine.** The sequencer accepts an inbound void, which is its
-whole part in scenario 3. How long a hold may live, detecting that it expired and submitting the
-voids is the pending engine's work — none of it is built — and keeping a mass-expiry sweep behind
-live traffic is the rate limiter's.
+**Expiry belongs to the pending engine, and the judgment does not.** How long a hold may live and
+noticing that it ran out is the engine's work, and that is built: it proposes the void. Deciding it is
+still the sequencer's, because a resolution the client submitted may be in flight for the same hold and
+only the judge sees both. What is not built is the rate limiter that would keep a mass-expiry sweep
+behind live traffic; today a bound on voids per round stands in for it, and falling behind deletes
+late, which is the safe direction. Design notes §14.
+
+**How long is a configuration, not a per-hold field.** A client cannot ask for its own lifetime —
+`Transfer` is full, and a hold's `pending_ref` already names its budget group — so the retention window
+applies to every hold, and a configuration changed and restarted applies to records already written.
 
 ## Consistency is the sequencer's, not the pending engine's
 

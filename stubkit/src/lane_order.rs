@@ -15,6 +15,9 @@ struct Delayed<T, D> {
 pub struct LaneOrderer<T, D = Instant> {
     lanes: FxHashMap<AccountId, VecDeque<Delayed<T, D>>>,
     rotation: VecDeque<AccountId>,
+    /// Order-exempt results: they keep no place in any lane, so they leave as soon as their own
+    /// simulated work is done, never behind anyone else's.
+    exempt: VecDeque<Delayed<T, D>>,
     violate_every: u32,
     pushes: u32,
     items: usize,
@@ -25,6 +28,7 @@ impl<T, D: Ord + Copy> LaneOrderer<T, D> {
         Self {
             lanes: FxHashMap::default(),
             rotation: VecDeque::new(),
+            exempt: VecDeque::new(),
             violate_every,
             pushes: 0,
             items: 0,
@@ -49,6 +53,13 @@ impl<T, D: Ord + Copy> LaneOrderer<T, D> {
         }
     }
 
+    /// An order-exempt result: no lane, no place, so lane-ordering it would be order-wait bought for
+    /// nothing. It still owes its own simulated latency, which is what the due time carries.
+    pub fn push_unordered(&mut self, due: D, value: T) {
+        self.exempt.push_back(Delayed { due, value });
+        self.items += 1;
+    }
+
     /// The earliest a lane head can leave, so a virtual clock can jump to it. Only lanes with
     /// something waiting are considered, which is what the rotation holds — the lane map keeps an
     /// entry per account it has ever seen.
@@ -56,19 +67,26 @@ impl<T, D: Ord + Copy> LaneOrderer<T, D> {
         self.rotation
             .iter()
             .filter_map(|lane| self.lanes.get(lane).and_then(|queue| queue.front()))
+            .chain(self.exempt.front())
             .map(|head| head.due)
             .min()
     }
 
     /// Results held behind a lane head. This is what putting a lane back in order costs: with reads
     /// that complete out of order, a finished result waits for an earlier one on its lane, and the
-    /// wait is the depth times a read's latency rather than one read's latency.
+    /// wait is the depth times a read's latency rather than one read's latency. Exempt results are
+    /// never behind anyone, so only the one at the front of their queue counts as a head.
     pub fn behind_heads(&self) -> usize {
-        self.items - self.rotation.len()
+        let exempt_head = usize::from(!self.exempt.is_empty());
+        self.items - self.rotation.len() - exempt_head
     }
 
     /// Head-of-lane only, which is what keeps a lane in order.
     pub fn pop_ready(&mut self, now: D) -> Option<T> {
+        if let Some(head) = self.exempt.pop_front_if(|head| head.due <= now) {
+            self.items -= 1;
+            return Some(head.value);
+        }
         for _ in 0..self.rotation.len() {
             let lane = self.rotation.pop_front()?;
             let queue = match self.lanes.get_mut(&lane) {

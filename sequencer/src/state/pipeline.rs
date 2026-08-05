@@ -3,13 +3,12 @@
 
 use std::collections::VecDeque;
 
-use crate::state::lane::LaneState;
 use std::mem::size_of;
 
 use ledger_base::ports::{Correlation, HoldData, IdemVerdict};
 use ledger_base::{
     AccountId, AcctHandle, Consumer, Footprint, LinkedChainId, Peak, Request, Seq, Transfer,
-    TransferKind,
+    TransferKind, UNORDERED,
 };
 
 /// Index into the work pool. Components see it only as an opaque correlation token.
@@ -98,7 +97,7 @@ impl WorkItem {
     /// count read it — taken at dispatch, given back when the reply arrives — because deriving the same
     /// fact twice is how the two drift apart, and a drifted count breaks ordering silently.
     pub const fn keeps_lane_place(&self) -> bool {
-        self.seq != LaneState::UNORDERED
+        self.seq != UNORDERED
     }
 }
 

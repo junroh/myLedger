@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use ledger_base::ports::{
-    OverlayState, PendingCommand, PendingEffect, PendingFence, PendingLookup, PendingPort,
-    PendingReply,
+    OverlayState, PendingCommand, PendingEffect, PendingFence, PendingLookup, PendingNotice,
+    PendingPort, PendingReply,
 };
 use ledger_base::{Amount, Footprint, Peak, TxId};
 
@@ -100,6 +100,12 @@ impl<P: PendingPort> PendingChannel<P> {
 
     pub fn poll(&self) -> Option<PendingReply> {
         self.port.poll()
+    }
+
+    /// What the engine said without being asked. Its own channel, so it is neither behind a reply nor
+    /// in front of one.
+    pub fn notice(&self) -> Option<PendingNotice> {
+        self.port.notices()
     }
 
     /// The inline half of the port, forwarded so the reactor reads one wrapper. Everything below this

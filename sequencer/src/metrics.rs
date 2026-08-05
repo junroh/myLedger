@@ -55,6 +55,18 @@ pub struct Metrics {
     /// Times the sequencer's own bookkeeping stopped adding up. Anything but zero means the node
     /// sealed its apply path and has to be replaced.
     pub invariant_breaks: u64,
+    /// Committed holds the engine could not store: its index was sized for a declared maximum and that
+    /// maximum has been passed. The one thing the engine says without being asked, and anything but zero
+    /// means the node sealed its apply path — the hold is in the log and no resolution of it can ever be
+    /// answered.
+    pub holds_not_stored: u64,
+    /// Expiry voids the engine asked for and the sequencer admitted: a hold whose retention ran out, whose
+    /// remainder has to be released or the pending column it reserved never comes down.
+    pub holds_expired: u64,
+    /// Expiry voids that could not be admitted — no slot, a quarantined lane, a sealed apply path. Not a
+    /// loss: nobody asked for them and the sweep offers them again. Non-zero for long means the sweep is
+    /// not keeping up, which is a capacity question rather than a correctness one.
+    pub expiry_refused: u64,
     /// State-transition records lost because nobody drained the log stream. Not zero means the
     /// forensics for a gap or a quarantine may be missing.
     pub log_drops: u64,
@@ -114,6 +126,9 @@ impl Metrics {
             holds_evicted,
             stale_answers,
             invariant_breaks,
+            holds_not_stored,
+            holds_expired,
+            expiry_refused,
             log_drops,
             pending_lookups,
             pending_creates,

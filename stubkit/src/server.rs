@@ -35,11 +35,8 @@ impl Server {
         Self {
             base_nanos,
             tail_nanos,
-            service_nanos: if per_second == 0 {
-                0
-            } else {
-                1_000_000_000 / per_second
-            },
+            // Zero is no ceiling, so there is no interval to keep between services.
+            service_nanos: 1_000_000_000u64.checked_div(per_second).unwrap_or(0),
             free_at_nanos: 0,
             reads: 0,
             queued_nanos: 0,

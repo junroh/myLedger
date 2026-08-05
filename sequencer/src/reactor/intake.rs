@@ -3,9 +3,8 @@ use ledger_base::Clock;
 
 use super::Reactor;
 use ledger_base::ports::{IdemRequest, PendingFence, PendingLookup};
-use ledger_base::{LedgerError, LinkedChainId, Request, TransferFlags};
+use ledger_base::{LedgerError, LinkedChainId, Request, Transfer, TransferFlags, UNORDERED};
 
-use crate::state::lane::LaneState;
 use crate::state::pipeline::{DepFlags, SlotId, SlotPool, WorkItem};
 
 /// What the pending path has to do for one request. Deciding it is the subtle part and causes
@@ -79,6 +78,13 @@ where
     }
 
     fn admit(&mut self, request: &Request) {
+        // The client boundary, and the only place this rule belongs: the top bit of a transaction id is
+        // the ledger's own, so a client using it could collide with a resolution the ledger derives and
+        // idempotency would answer a real transfer as a duplicate. Not part of `Transfer::validate`,
+        // which is shape only — a ledger-origin id is perfectly well shaped, and the ledger submits one.
+        if request.tx.id.is_ledger_origin() {
+            return self.reject_before_seq(request, LedgerError::ReservedTransactionId);
+        }
         let chain_id = self
             .linked
             .admit(request.tx.flags.contains(TransferFlags::LINKED));
@@ -88,10 +94,7 @@ where
                     let lane = self.pipeline.item(slot).debit;
                     self.linked.add_leg(id, lane, slot);
                 }
-                if !self.dispatch(slot) {
-                    self.pipeline.defer(slot);
-                    self.metrics.dispatch_deferred += 1;
-                }
+                self.dispatch_or_defer(slot);
             }
             Err(err) => {
                 self.reject_before_seq(request, err);
@@ -103,6 +106,33 @@ where
                     }
                 }
             }
+        }
+    }
+
+    /// A resolution the engine asked for rather than a client: the hold's retention has run out and what
+    /// is left of it has to be released, or the pending column it reserved never comes back down.
+    ///
+    /// It is judged exactly like a client's resolution, and it has to be: a settle the client submitted
+    /// may be in flight for the same hold, and only the judge sees both. So it takes a slot, a place in
+    /// its lane and a lookup, and it is refused by the same rules — a hold already resolved, or a lane
+    /// quarantined, and the sweep will offer it again when it comes round.
+    pub(super) fn admit_expiry(&mut self, void: Transfer) {
+        let request = Request::single(void, self.clock.now_nanos());
+        match self.prepare(&request, None) {
+            Ok(slot) => {
+                self.metrics.holds_expired += 1;
+                self.dispatch_or_defer(slot);
+            }
+            // Nobody to tell: no client asked for this. The sweep offers it again next round, and if the
+            // reason was terminal — a sealed apply path — nothing is being released anyway.
+            Err(_) => self.metrics.expiry_refused += 1,
+        }
+    }
+
+    fn dispatch_or_defer(&mut self, slot: SlotId) {
+        if !self.dispatch(slot) {
+            self.pipeline.defer(slot);
+            self.metrics.dispatch_deferred += 1;
         }
     }
 
@@ -165,6 +195,16 @@ where
         } else {
             DepFlags::IDEM
         };
+        // The ledger's own resolutions are made idempotent by the index that produced them, not by the
+        // dedup map: the sweep offers a void only while the hold is still in the index, and the judge
+        // refuses a second one for a hold a first has already taken. Sending them through dedup would be
+        // worse than redundant. The map records an id when the request is *dispatched*, so a void whose
+        // batch consensus went on to refuse would come back a duplicate — and because its id is derived
+        // from the hold it cannot be changed, that hold would never be released at all. It would also
+        // grow a map that has no expiry with ids no client will ever resend.
+        if request.tx.id.is_ledger_origin() {
+            deps = deps.without(DepFlags::IDEM);
+        }
         let gate = self
             .linked
             .gate_for(debit_account)
@@ -178,7 +218,7 @@ where
             lane_state.issue_seq()
         } else {
             self.metrics.order_exempt += 1;
-            LaneState::UNORDERED
+            UNORDERED
         };
         *self.pipeline.item_mut(slot) = WorkItem {
             tx: request.tx,

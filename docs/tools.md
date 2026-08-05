@@ -107,7 +107,9 @@ decides what the prediction is worth:
   leave memory inside a two-thousand-step run and the fetch path — the candidate walk, the fingerprint
   confirmation against a record, replies completing in the device's order rather than the lane's — runs
   while the faults are on. The sweep test asserts the store was reached, because before this the sweep
-  reported that every invariant held about a path it never entered.
+  reported that every invariant held about a path it never entered. It asserts the same about exempt
+  lookups: some holds debit the unconstrained account, so their resolutions keep no place in a lane and
+  the order exemption itself runs under faults, not only the data check that covers it.
 - **A hold needs an age before any of this is exercised.** `--resolve-after <n>` resolves a hold once *n*
   more have been created behind it, so its record is read back at a declared age rather than moments after
   it was written. Without it a workload has only two settings — resolve at once, or never — and the engine

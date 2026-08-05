@@ -2,6 +2,8 @@
 //! everything under `tests/*/` as shared code, so this is where the setup lives.
 #![allow(dead_code)]
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ledger_account::MemoryAccounts;
@@ -11,7 +13,7 @@ use ledger_base::{
     Producer, Request, SystemClock, Transfer, TransferFlags, TxId,
 };
 use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
-use ledger_pending::{MemoryPending, MemoryPendingConfig};
+use ledger_pending::{DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, Reactor, ReactorConfig, Transport};
 use ledger_stubkit::LatencyRange;
@@ -53,6 +55,49 @@ impl NoLatency {
         }
     }
 
+    /// The smallest declared maximum the engine will accept, which sizes its index at a couple of
+    /// dozen slots. A test can then pass that maximum in a handful of holds instead of a load run —
+    /// and passing it is the one thing the engine reports without being asked.
+    pub fn tiny_index() -> MemoryPendingConfig {
+        MemoryPendingConfig {
+            capacity: Self::short_windows(),
+            ..Self::pending()
+        }
+    }
+
+    /// A flush window of one block, so a test reaches the store — and therefore a real segment — in one
+    /// block's worth of holds rather than an hour of arrivals. Retention is one day plus the grace that
+    /// keeps deletion from being early, which is the smallest lifetime the engine will accept.
+    pub fn short_windows() -> PendingCapacity {
+        PendingCapacity {
+            daily_arrivals: 24,
+            worst_survivor_share: 0.5,
+            retention_days: 1,
+            grace_days: 1,
+            survives_flush_window: 0.5,
+            flush_window_hours: 1,
+            residency_hours: 1,
+        }
+    }
+
+    /// Windows short enough that a test's holds reach a segment, and an index roomy enough that they do
+    /// not overflow it on the way: a test about expiry must not be a test about the seal.
+    ///
+    /// One number decides both, which is the point of deriving every size from declared inputs — so it is
+    /// chosen rather than tuned. A flush window of one block needs an hour's arrivals to be one block's
+    /// worth of records; the index is then sized for a lifetime of those, which is far more holds than a
+    /// test writes.
+    pub fn expiring() -> MemoryPendingConfig {
+        let hourly_records = ledger_pending::RECORDS_PER_BLOCK as u64;
+        MemoryPendingConfig {
+            capacity: PendingCapacity {
+                daily_arrivals: hourly_records * 24,
+                ..Self::short_windows()
+            },
+            ..Self::pending()
+        }
+    }
+
     pub fn idem() -> MemoryDedupConfig {
         MemoryDedupConfig {
             latency: LatencyRange::fixed(Duration::ZERO),
@@ -75,6 +120,9 @@ pub struct Harness<C = SystemClock> {
     acks: Consumer<Ack>,
     log: LogStream,
     next_id: u128,
+    /// The day the engine thinks it is. Retention is measured in days, so a test that had to wait for one
+    /// to pass could not reach expiry at all.
+    day: Arc<AtomicU64>,
 }
 
 impl Harness<SystemClock> {
@@ -158,6 +206,7 @@ impl<C: Clock> Harness<C> {
         }
         let (request_tx, request_rx) = channel(client_queue);
         let (ack_tx, ack_rx) = channel(client_queue);
+        let (days, day) = DaySource::manual(0);
         let (reactor, log) = Reactor::with_clock(
             config,
             Transport {
@@ -165,7 +214,7 @@ impl<C: Clock> Harness<C> {
                 acks: ack_tx,
             },
             accounts,
-            MemoryPending::start(pending).expect("a test engine config"),
+            MemoryPending::start_with_days(pending, days).expect("a test engine config"),
             MemoryDedup::start(NoLatency::idem()),
             EchoRaft::start(raft),
             clock,
@@ -177,7 +226,32 @@ impl<C: Clock> Harness<C> {
             acks: ack_rx,
             log,
             next_id: 1,
+            day,
         }
+    }
+
+    /// Moves the engine's day on, which is the whole of what a clock does for retention.
+    pub fn open_day(&self, day: u64) {
+        self.day.store(day, Ordering::Relaxed);
+    }
+
+    /// Waits until the engine has written `records` of them out of its writeback buffer.
+    ///
+    /// A record's segment is the day it was **written**, not the day its hold was committed, and writing
+    /// happens on the engine's own thread. So a test that moves the day before the writes have landed puts
+    /// those records in the *next* day and then waits for an expiry that is a day further out than it
+    /// thinks. Establishing the precondition is the test's job, not the engine's.
+    pub fn tick_until_written(&mut self, records: u64) {
+        self.tick_until("the engine never wrote the records out", |reactor| {
+            reactor.pending().traffic().flushed >= records
+        });
+    }
+
+    /// What one account still has reserved, readable from inside a `tick_until` predicate — which is where
+    /// a test about expiry has to wait, because there is no ack to wait for.
+    pub fn pending_column(reactor: &TestReactor<C>) -> Amount {
+        let handle = reactor.accounts().resolve(ALICE).expect("a known account");
+        reactor.accounts().record(handle).debits_pending()
     }
 
     pub fn transfer(&mut self, debit: AccountId, credit: AccountId, amount: Amount) -> Transfer {
@@ -243,11 +317,17 @@ impl<C: Clock> Harness<C> {
         self.drain_acks(legs.len(), "chain stalled")
     }
 
+    /// A timeout carries the counters with it: what the ledger was doing when it stopped making progress is
+    /// the whole of what a stalled test has to say, and a bare reason string says none of it.
     pub fn tick_until(&mut self, reason: &str, mut done: impl FnMut(&TestReactor<C>) -> bool) {
         let deadline = Instant::now() + TIMEOUT;
         while !done(&self.reactor) {
             self.reactor.tick();
-            assert!(Instant::now() < deadline, "{reason}");
+            assert!(
+                Instant::now() < deadline,
+                "{reason}\n  {:?}",
+                self.reactor.metrics()
+            );
         }
     }
 

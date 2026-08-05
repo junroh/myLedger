@@ -83,7 +83,7 @@ much as the latency, because a component modelled as latency alone has unlimited
 Tests and benchmarks:
 
 ```
-cargo test --release
+cargo test        # debug on purpose: the self-invariants and every debug_assert are live only here
 cargo bench -p ledger-sequencer --bench pipeline -- --repeat 5
 cargo bench -p ledger-account   --bench columns  -- --repeat 5
 cargo run  --release -p ledgerfio -- layout

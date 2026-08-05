@@ -271,15 +271,22 @@ pub struct Report {
     /// apply path. That is the right answer to those faults, and it also means the rest of this
     /// seed's steps explored nothing.
     pub halted: bool,
-    /// Holds the engine's index could not take. Has to be zero: the index is sized from what the
-    /// configuration declares and never grows, so anything here is a hold the log says exists and the
-    /// store does not have. Nothing inside the ledger can notice it yet — a write carries no reply — so
-    /// this is the only place it is caught.
+    /// Holds the engine's index could not take, counted from outside. Some seeds are given an index too
+    /// small on purpose, so this is no longer required to be zero — what is required is that the ledger
+    /// answered each one, which is `metrics.holds_not_stored` and the seal that follows it.
     pub overflowed: u64,
     /// Reads that went to the store. Not an invariant — zero is a correct run — but a sweep whose total
     /// is zero has not exercised the fetch path, and would say "every invariant held" about a path it
     /// never entered.
     pub store_reads: u64,
+    /// Pending replies that kept no place in a lane: the lookups of order-exempt resolutions. Same
+    /// standing as `store_reads` — a sweep whose total is zero has covered the exemption's data check
+    /// but never the exemption itself.
+    pub exempt_lookups: u64,
+    /// Expiry voids the engine offered because a hold outlived its retention. Same standing as the two
+    /// above: not an invariant, but a sweep whose total is zero has covered no expiry at all — and expiry
+    /// is what makes the index's declared maximum true rather than assumed.
+    pub expiries_offered: u64,
 }
 
 pub struct Prediction {
@@ -452,6 +459,12 @@ struct Sim {
     idem: IdemFake,
     raft: RaftFake,
     traffic: Traffic,
+    /// How long a day is on this clock, and the day it last told the engine about. Retention is the one
+    /// thing measured in days, so a run that never crossed one would explore no expiry at all.
+    day_nanos: u64,
+    day: u64,
+    lifetime_days: u64,
+    expiry_per_round: usize,
     /// Requests generated and not yet accepted by the intake queue. A submission goes in whole or
     /// waits: half a chain reaches the ledger as a chain the client never sent, because the next
     /// unlinked request is what terminates an open one.
@@ -568,6 +581,8 @@ pub fn explore(
     }
     let overflowed = sim.pending.overflowed();
     let store_reads = sim.pending.store_reads();
+    let exempt_lookups = sim.pending.exempt_replies();
+    let expiries_offered = sim.pending.expiries_offered();
     let metrics = sim.reactor.metrics();
     if metrics.invariant_breaks > 0 {
         return Err(Box::new(Failure {
@@ -587,6 +602,8 @@ pub fn explore(
         halted,
         overflowed,
         store_reads,
+        exempt_lookups,
+        expiries_offered,
     })
 }
 
@@ -782,6 +799,10 @@ impl Sim {
                 skew,
                 resolve_after,
             ),
+            day_nanos: timings.day_nanos,
+            day: 0,
+            lifetime_days: timings.lifetime_days,
+            expiry_per_round: timings.expiry_per_round,
             unsent: VecDeque::new(),
             now: 0,
             charged: StageCharge::default(),
@@ -884,9 +905,25 @@ impl Sim {
         };
         self.now += advance;
         self.clock.advance(advance);
+        self.advance_day();
         self.pending.drive(self.now);
         self.idem.drive(self.now);
         self.raft.drive(self.now);
+    }
+
+    /// Tells the engine what day it is, and lets it offer the next slice of whatever ran out. The day is
+    /// handed in rather than read from a clock, which is what lets a two-thousand-step run cross a
+    /// retention window that is measured in days.
+    fn advance_day(&mut self) {
+        if self.day_nanos == 0 {
+            return;
+        }
+        let day = self.now / self.day_nanos;
+        if day != self.day {
+            self.day = day;
+            self.pending.open_day(day, self.lifetime_days);
+        }
+        self.pending.sweep_expiry(self.expiry_per_round);
     }
 
     /// The earliest any component has something to hand back.

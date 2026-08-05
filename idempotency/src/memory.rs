@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use ledger_base::ports::{IdemReply, IdemRequest, IdemVerdict, IdempotencyPort};
 use ledger_base::{
     channel, Consumer, Footprint, FxHashMap, MapGauge, Prng, Producer, StagedProducer, TxId,
+    UNORDERED,
 };
 use ledger_stubkit::{IdleBackoff, LaneOrderer, LatencyRange, WorkerThread};
 
@@ -113,16 +114,19 @@ impl IdemWorker {
                 Some(_) => IdemVerdict::DuplicateDifferentBody,
             };
             let due = self.latency.due_from(Instant::now(), &mut self.jitter);
-            self.orderer.push(
-                request.lane,
-                due,
-                IdemReply {
-                    correlation: request.correlation,
-                    lane: request.lane,
-                    seq: request.seq,
-                    verdict,
-                },
-            );
+            let reply = IdemReply {
+                correlation: request.correlation,
+                lane: request.lane,
+                seq: request.seq,
+                verdict,
+            };
+            // An order-exempt request keeps no place in its lane, so its reply is not lane-ordered
+            // either — waiting behind the lane here would be order-wait bought for nothing.
+            if request.seq == UNORDERED {
+                self.orderer.push_unordered(due, reply);
+            } else {
+                self.orderer.push(request.lane, due, reply);
+            }
         }
         // Once per round rather than once per request: a report asks at the end of a run, and paying
         // for it per request would be a cost on the path this component exists to keep cheap.

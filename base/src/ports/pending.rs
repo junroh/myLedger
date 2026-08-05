@@ -1,5 +1,6 @@
 use crate::ids::{AccountId, Amount, BudgetGroup, Seq, TxId};
 use crate::ports::Correlation;
+use crate::transfer::Transfer;
 
 /// Hold record as stored by the pending engine. It provides data and judges nothing.
 #[derive(Debug, Clone, Copy)]
@@ -94,6 +95,31 @@ pub enum PendingCommand {
     Lookup(PendingLookup),
     Fence(PendingFence),
     Apply(PendingEffect),
+}
+
+/// What the engine says without being asked.
+///
+/// Everything else on this port answers a command the sequencer sent, and carries the
+/// [`Correlation`] of the request that sent it. A notice answers nothing and names no request, so
+/// it cannot travel as a reply: a sentinel correlation would be one field meaning two things. It
+/// travels its own way for a second reason too — a notice is on no request's latency path, and a
+/// notice the sequencer is slow to take must not delay a reply that is.
+#[derive(Debug, Clone, Copy)]
+pub enum PendingNotice {
+    /// A hold consensus committed that the engine could not store: its index was sized for a
+    /// declared maximum and that maximum has been passed. The log says the hold exists and no
+    /// resolution of it can ever be answered, so there is nothing to retry and nothing to fix here
+    /// — which is why this is news the sequencer has to act on rather than a number to report.
+    HoldNotStored { hold: TxId },
+    /// A hold whose record has reached the end of its retention. The engine proposes releasing what is
+    /// left of it, and the sequencer judges that like any other resolution — it has to, because a
+    /// resolution the client submitted may be in flight for the same hold, and only the judge can see
+    /// both.
+    ///
+    /// It carries a whole [`Transfer`] rather than a hold id because a resolution *is* a transfer, and
+    /// building one needs the record — the two accounts, the ledger — which the engine has and the
+    /// sequencer does not. The engine reads that record as part of the sweep; it needs it either way.
+    HoldExpired { void: Transfer },
 }
 
 /// What the sequencer has decided about a hold and not handed over yet. It exists nowhere else: the
@@ -200,4 +226,10 @@ pub trait PendingPort: PendingOverlay {
     /// been told to create has all of itself left, and one it has removed is gone.
     fn send(&mut self, command: PendingCommand) -> Result<(), PendingCommand>;
     fn poll(&self) -> Option<PendingReply>;
+
+    /// What the engine has to say on its own, drained once a tick. The third direction on this port:
+    /// `send` is the sequencer speaking, `poll` is the engine answering, and this is the engine
+    /// speaking first. A method rather than a trait of its own, because one component answers all
+    /// three and splitting them would be three traits for one seam.
+    fn notices(&self) -> Option<PendingNotice>;
 }

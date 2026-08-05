@@ -9,15 +9,15 @@ mod overlay;
 /// a file or a network volume later without the engine above changing.
 pub use block::{
     BlockAddr, BlockStore, LatencyBlockStore, LogTraffic, MemBlockStore, BLOCK_BYTES,
-    DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS, RECORDS_PER_BLOCK, RECORD_BYTES,
+    DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS, RECORDS_PER_BLOCK, RECORD_BYTES, SEGMENTS,
 };
 /// Exported for the same reason as the overlay: a simulation that drives the engine itself needs the
 /// store the engine actually keeps, and one that reimplemented it would be exercising something else.
-pub use engine::{PendingEngine, Started};
+pub use engine::{NotStored, PendingEngine, Started};
 /// Exported for this crate's own bench: what the index costs as it fills is the number an analytic
 /// estimate of it was guessing, and it can only be measured from outside.
 pub use index::{Candidates, HoldTable, Homeless, DEFAULT_SLOTS, LOAD_TARGET, SLOT_BYTES};
-pub use memory::{MemoryPending, MemoryPendingConfig, PendingCapacity, StoreModel};
+pub use memory::{DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity, StoreModel};
 /// Contract 1 is the engine's own work, so the structure that keeps it lives here. Exported for a
 /// simulation that drives the engine and wants to see what ordering cost it.
 pub use orderer::{OrderWait, Orderer};

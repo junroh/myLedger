@@ -3,12 +3,13 @@ use ledger_base::Clock;
 
 use super::Reactor;
 use ledger_base::ports::{HoldView, IdemReply, IdemVerdict, PendingReply};
-use ledger_base::{AckOutcome, Amount, Effect, EffectKind, LedgerError, TransferKind, TxId};
+use ledger_base::{
+    AckOutcome, Amount, Effect, EffectKind, LedgerError, TransferKind, TxId, UNORDERED,
+};
 
 use crate::log_kind::LogKind;
 use crate::rules::budget::{BudgetCoverage, BudgetRules};
 use crate::rules::linked::{LinkedChain, LinkedScratch};
-use crate::state::lane::LaneState;
 use crate::state::pipeline::{DepFlags, SlotId, WorkItem};
 
 impl<A, P, I, R, C> Reactor<A, P, I, R, C>
@@ -214,7 +215,7 @@ where
         if self.lanes.get(item.debit).is_quarantined() {
             return Err(LedgerError::AccountQuarantined(item.lane));
         }
-        if item.seq != LaneState::UNORDERED {
+        if item.seq != UNORDERED {
             if let Err(err) = self.lanes.get_mut(item.debit).accept_seq(item.seq) {
                 self.on_seq_gap(item.lane, item.debit, item.seq);
                 return Err(err);

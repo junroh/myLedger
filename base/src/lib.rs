@@ -27,7 +27,9 @@ pub use effect::{ColumnDelta, Effect, EffectKind};
 pub use error::LedgerError;
 pub use footprint::{Footprint, MapGauge, Part, Peak};
 pub use hash::{FxBuildHasher, FxHashMap};
-pub use ids::{AccountId, AcctHandle, Amount, BudgetGroup, LinkedChainId, Seq, TxId, MAX_AMOUNT};
+pub use ids::{
+    AccountId, AcctHandle, Amount, BudgetGroup, LinkedChainId, Seq, TxId, MAX_AMOUNT, UNORDERED,
+};
 pub use layout::{layouts_are_sound, LineFit, TypeLayout, CACHE_LINE, HOT_TYPES, SUPPORTED_LINES};
 pub use logging::{log_channel, LogEvent, LogSink, LogStream};
 pub use pool::BufferPool;

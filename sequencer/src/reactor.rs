@@ -2,10 +2,10 @@ mod apply;
 mod intake;
 mod judge;
 
-use ledger_base::ports::{AccountPort, IdempotencyPort, PendingPort, RaftPort};
+use ledger_base::ports::{AccountPort, IdempotencyPort, PendingNotice, PendingPort, RaftPort};
 use ledger_base::{
     AccountId, AcctHandle, Ack, AckOutcome, Amount, Clock, Consumer, Effect, EffectKind, Footprint,
-    LedgerError, LogSink, LogStream, Producer, Request, SystemClock,
+    LedgerError, LogSink, LogStream, Producer, Request, SystemClock, TxId,
 };
 
 use crate::config::ReactorConfig;
@@ -384,7 +384,10 @@ where
     }
 
     pub fn drain_backlogs(&mut self) -> bool {
-        let mut progress = self.outbox.flush();
+        // Before anything else this tick, including the apply below: the only notice there is seals the
+        // apply path, and a seal decided now has to be in effect before this tick applies anything.
+        let mut progress = self.drain_pending_notices();
+        progress |= self.outbox.flush();
         progress |= self.pending.flush();
         while let Some(slot) = self.pipeline.deferred_front() {
             if !self.dispatch(slot) {
@@ -394,6 +397,44 @@ where
             progress = true;
         }
         progress
+    }
+
+    /// The one place the engine speaks first. It gets no stage of its own: a stage would add a sixth
+    /// column to every `--cpu` report for something that happens once in the life of a node, and this
+    /// stage already runs before every other.
+    fn drain_pending_notices(&mut self) -> bool {
+        let mut progress = false;
+        while let Some(notice) = self.pending.notice() {
+            progress = true;
+            match notice {
+                PendingNotice::HoldNotStored { hold } => self.on_hold_not_stored(hold),
+                PendingNotice::HoldExpired { void } => self.admit_expiry(void),
+            }
+        }
+        progress
+    }
+
+    /// A hold consensus committed that the engine could not store. Its columns have already moved and
+    /// its client has already been told it committed — neither can be taken back — but the pending
+    /// column that hold reserved can now never come down, because no resolution of a hold the store
+    /// does not have can be answered. So this node's state has stopped following the log, which is the
+    /// same class of failure as a committed effect that cannot be applied: the apply path is sealed and
+    /// the drain that never completes is the signal to replace the leader.
+    ///
+    /// There is deliberately no operator action. The index is sized from a declared maximum, so passing
+    /// it is a business change — the remedy is a configuration change and a rolling restart, and the
+    /// index is rebuilt on the way back up anyway.
+    fn on_hold_not_stored(&mut self, hold: TxId) {
+        self.metrics.holds_not_stored += 1;
+        if self.safety.seal_applies() {
+            // The low 64 bits of the id: a log event carries two numbers, and this one is a diagnostic
+            // pointing at which hold, not a key anything is looked up by.
+            self.record(
+                LogKind::HOLD_NOT_STORED,
+                hold.raw() as u64,
+                self.metrics.committed,
+            );
+        }
     }
 
     /// The engine answered from state older than a decision it had already been handed. The same kind of
@@ -460,6 +501,12 @@ where
             AckOutcome::Rejected(_) => self.metrics.rejected += 1,
             AckOutcome::Duplicate => self.metrics.duplicates += 1,
             AckOutcome::Committed => {}
+        }
+        // The ledger does not answer itself. An expiry void was nobody's request, so an ack for it would
+        // put a transaction id no client sent into the client's stream. The reserved top bit is what makes
+        // this readable off the id, so no stage has to carry a flag saying whose work this was.
+        if item.tx.id.is_ledger_origin() {
+            return;
         }
         self.outbox.emit(Ack {
             tx_id: item.tx.id,

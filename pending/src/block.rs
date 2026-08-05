@@ -129,6 +129,11 @@ pub trait BlockStore {
     fn poll(&mut self, now: u64, into: &mut [u8]) -> Option<u64>;
     fn blocks(&self) -> usize;
     fn inflight(&self) -> usize;
+    /// Drops every block of a segment and answers how many there were. The one way the store shrinks:
+    /// blocks are written once and never rewritten, so space comes back a whole day at a time, and only
+    /// once nothing in the index points into that day. The segment is in the address, so what belongs to a
+    /// day is the store's own to find — no caller has to remember which blocks it handed over.
+    fn free_segment(&mut self, segment: u8) -> usize;
 }
 
 /// The exact store: it keeps what it was given and adds no latency. Every other store is measured
@@ -180,6 +185,16 @@ impl BlockStore for MemBlockStore {
     fn inflight(&self) -> usize {
         self.submitted.len()
     }
+
+    fn free_segment(&mut self, segment: u8) -> usize {
+        let before = self.blocks.len();
+        // The segment is in the key, so what belongs to a day is the store's own to find. A scan of the
+        // map, which a day's worth of freeing can afford: it happens once per day and off any request's
+        // path. A real device would have an extent per segment and free it in one call.
+        self.blocks
+            .retain(|key, _| BlockAddr::from_raw(*key).segment() != segment);
+        before - self.blocks.len()
+    }
 }
 
 /// The one segment that is on no disk: an address in it is a record still in the writeback buffer,
@@ -187,6 +202,12 @@ impl BlockStore for MemBlockStore {
 /// field is free for this — and making the two forms distinguishable is what lets the buffer hand out
 /// addresses before it knows where a record will end up.
 pub const BUFFER_SEGMENT: u8 = (1 << 6) - 1;
+
+/// Segments a stored record can be in: every value of the six-bit field but the one above. A segment is
+/// a day and its number is the day modulo this, so it is also the ceiling on how many days of records can
+/// be live at once — past it two live segments would share a number and expiry would drop the wrong day's
+/// records. `MemoryPendingConfig::validate` refuses a lifetime that reaches it.
+pub const SEGMENTS: u64 = BUFFER_SEGMENT as u64;
 
 impl BlockAddr {
     pub const fn buffered(ordinal: u64, index: u8) -> Self {
@@ -301,6 +322,12 @@ impl BlockStore for LatencyBlockStore {
     fn inflight(&self) -> usize {
         self.inflight.len()
     }
+
+    /// Freeing costs the device nothing this model charges for: it is off any request's path, and a device
+    /// that made it expensive would be one whose extents this store does not model.
+    fn free_segment(&mut self, segment: u8) -> usize {
+        self.inner.free_segment(segment)
+    }
 }
 
 /// The records: a writeback buffer of recent blocks, the blocks flushed out of it that are still worth
@@ -352,6 +379,8 @@ pub struct RecordLog {
     appended: u64,
     died_in_buffer: u64,
     flushed: u64,
+    /// Blocks handed back to the store, which is the only way it shrinks.
+    freed: u64,
     left_memory: u64,
     buffer_reads: u64,
     resident_reads: u64,
@@ -398,6 +427,7 @@ impl RecordLog {
             appended: 0,
             died_in_buffer: 0,
             flushed: 0,
+            freed: 0,
             left_memory: 0,
             buffer_reads: 0,
             resident_reads: 0,
@@ -426,6 +456,43 @@ impl RecordLog {
     /// Whether the buffer is over its flush window and its oldest block is due to be compacted.
     pub fn over_window(&self) -> bool {
         self.buffer.len() > self.flush_blocks
+    }
+
+    /// Which day the records being written now belong to. A segment is a day, and its number is the day
+    /// modulo the segments the address field has — unambiguous because only a lifetime's worth of days is
+    /// ever live, which `MemoryPendingConfig::validate` is what guarantees.
+    pub fn segment(&self) -> u8 {
+        self.segment
+    }
+
+    /// Hands a day's blocks back, and answers how many. The caller decides *when*: only once nothing in
+    /// the index points into that day, which is the one moment they are known to be dead.
+    ///
+    /// Residency is not touched, and it does not have to be: it holds the most recently written blocks,
+    /// and a day old enough to be freed left it long before. A configuration that kept records in memory
+    /// longer than they are allowed to exist is refused at startup rather than handled here.
+    pub fn free_segment(&mut self, segment: u8) -> usize {
+        let freed = self.store.free_segment(segment);
+        self.freed += freed as u64;
+        freed
+    }
+
+    /// Moves to a new day. The open store block is sealed first: it was promised addresses in the old
+    /// segment, and a block whose records straddled two segments could not be deleted by either.
+    ///
+    /// Block numbers keep counting across the boundary rather than restarting, so an address stays unique
+    /// on the block field alone and everything that finds a block by number — residency, the store —
+    /// needs no notion of segments at all. The segment field is then purely the label saying which day a
+    /// record belongs to, which is what expiry deletes by.
+    pub fn open_day(&mut self, day: u64) {
+        let segment = (day % SEGMENTS) as u8;
+        if segment == self.segment {
+            return;
+        }
+        if self.store_open.filled > 0 {
+            self.seal_store_block();
+        }
+        self.segment = segment;
     }
 
     /// The records of the oldest buffered block, for the caller to sort into survivors and casualties.
@@ -473,9 +540,10 @@ impl RecordLog {
             let slot = addr.block().checked_sub(self.oldest)? as usize;
             return self.buffer.get(slot)?.get(index, addr);
         }
-        if addr.segment() != self.segment {
-            return None;
-        }
+        // No segment check: block numbers count on across day boundaries, so the number alone says
+        // where a block is, and the two bounds below are what decide whether it is still in memory. A
+        // segment check here would send yesterday's resident blocks to the store while they sat in
+        // memory.
         if addr.block() == self.next_block {
             self.buffer_reads += 1;
             return self.store_open.get(index, addr);
@@ -492,8 +560,26 @@ impl RecordLog {
         if let Some(found) = self.try_read(addr) {
             return Some(found);
         }
-        self.store_reads += 1;
         self.apply_store_reads += 1;
+        self.read_from_store(addr)
+    }
+
+    /// The same, for the expiry sweep. Separate only so the read is not counted against the apply path:
+    /// that counter is the one a read cache would remove, and the sweep is not on it.
+    ///
+    /// Synchronous, which the sweep can afford and apply cannot for a different reason — it is background
+    /// work, bounded per round, and a record it declined to read would be one it never expired, leaving a
+    /// pending column reserved for good. Against a real device this should submit and harvest like a lookup
+    /// does; with the store in memory it is a move, and the bound is what keeps it honest.
+    pub fn read_background(&mut self, addr: BlockAddr) -> Option<(TxId, HoldData)> {
+        if let Some(found) = self.try_read(addr) {
+            return Some(found);
+        }
+        self.read_from_store(addr)
+    }
+
+    fn read_from_store(&mut self, addr: BlockAddr) -> Option<(TxId, HoldData)> {
+        self.store_reads += 1;
         if !self.store.read(addr, &mut self.scratch) {
             return None;
         }
@@ -538,6 +624,7 @@ impl RecordLog {
             store_reads: self.store_reads,
             apply_store_reads: self.apply_store_reads,
             inflight_peak: self.inflight_peak,
+            freed: self.freed,
             ..LogTraffic::default()
         }
     }
@@ -594,6 +681,9 @@ pub struct LogTraffic {
     /// Records that fell out of the residency window, so only the store has them now. A read of one of
     /// these is the IO the window exists to prevent.
     pub left_memory: u64,
+    /// Blocks handed back once nothing in the index pointed into their day. The only way the store shrinks,
+    /// and what makes its size a steady state rather than a total.
+    pub freed: u64,
     pub buffer_reads: u64,
     /// Reads answered from a block that is on the store already and still in memory. The second window's
     /// whole return, and zero would mean it is not earning its size.
@@ -612,6 +702,11 @@ pub struct LogTraffic {
     /// Holds whose fingerprint turned out to be shared, and inserts the table could not take at all.
     pub ambiguous: u64,
     pub overflowed: u64,
+    /// The day records are being written into, as a segment number, and whether the day that ran out is
+    /// still being emptied. A sweep still going when the next day arrives is deleting late — safe, but it
+    /// is the number that says the expiry rate is short, so a run has to be able to see it.
+    pub segment: u8,
+    pub sweeping: bool,
 }
 
 #[cfg(test)]

@@ -534,16 +534,38 @@ mod tests {
         let mut committed = 0;
         let mut served = 0;
         let mut overflows = 0;
+        let mut sealed_for_overflow = 0;
         let mut store_reads = 0;
+        let mut exempt_lookups = 0;
+        let mut expiries = 0;
         let mut stale = 0;
-        for seed in 1..=16 {
+        // Thirty-two rather than sixteen, because about a third of seeds are *meant* to stop serving —
+        // that is what a fault that quarantines enough lanes or seals the apply path does — and a
+        // sixteen-seed sample of a one-in-three event swings wide enough to fail on the draw rather than
+        // on the ledger. Measured: at sixteen seeds the halted count moved between three and nine without
+        // anything about the ledger changing, while at sixty-four it sat at seventeen either way.
+        const SEEDS: u64 = 32;
+        for seed in 1..=SEEDS {
             match super::check(seed, 200) {
                 Ok(report) => {
                     committed += report.metrics.committed;
                     served += u64::from(!report.halted);
                     overflows += report.overflowed;
                     store_reads += report.store_reads;
+                    exempt_lookups += report.exempt_lookups;
+                    expiries += report.expiries_offered;
                     stale += report.metrics.stale_answers;
+                    // Rule 19 as a test: an index that could not take a committed hold has to have
+                    // stopped this node, not been counted and stepped over. Checked per seed, because
+                    // one seed sealing would otherwise cover for another that did not.
+                    if report.overflowed > 0 {
+                        assert!(
+                            report.metrics.holds_not_stored > 0 && report.halted,
+                            "seed {seed} overflowed its index {} times and kept serving",
+                            report.overflowed
+                        );
+                        sealed_for_overflow += 1;
+                    }
                 }
                 Err(failure) => panic!(
                     "seed {} broke {:?} at step {} with {:?}",
@@ -552,10 +574,16 @@ mod tests {
             }
         }
         // Without this the sweep could pass by exercising nothing at all.
-        assert!(served >= 8, "only {served} of 16 seeds kept serving");
-        assert_eq!(
-            overflows, 0,
-            "the engine's index could not take a hold the log says exists"
+        assert!(
+            served >= SEEDS / 2,
+            "only {served} of {SEEDS} seeds kept serving"
+        );
+        // Not "this never happens" any more, but "the ledger answers it when it does". A sweep where no
+        // seed overflowed would be reporting that the seal holds about a path it never entered.
+        assert!(
+            sealed_for_overflow > 0,
+            "no seed outgrew its index, so the notice channel and its seal are untested here \
+             ({overflows} overflows seen)"
         );
         assert!(
             committed > 1_000,
@@ -567,6 +595,19 @@ mod tests {
         assert!(
             store_reads > 0,
             "no seed reached the store, so the fetch path is untested"
+        );
+        // An exempt resolution's reply keeps no place in its lane, so it exercises the exemption
+        // itself — the path where the data check is all that stands in for the order check.
+        assert!(
+            exempt_lookups > 0,
+            "no seed resolved a hold on an unconstrained account, so the order exemption is untested"
+        );
+        // Retention is what makes the index's declared maximum true rather than assumed, and the void it
+        // produces moves money — so a sweep that crossed no day would be reporting that the identities
+        // hold about a path it never entered.
+        assert!(
+            expiries > 0,
+            "no seed outlived its retention, so expiry and the void it proposes are untested"
         );
         // Not asserted here: sixteen seeds never draw the stale-answer fault, and raising its odds to
         // make them would shift every other fault's draw to buy one assertion. The mechanism is asserted
@@ -593,6 +634,11 @@ mod tests {
             idem_nanos: 1_000,
             raft_nanos: 2_000,
             raft_tail_nanos: 1_000,
+            // No day passes: this test is about a device's tail, and a background sweep would add
+            // traffic that has nothing to do with what it is measuring.
+            day_nanos: 0,
+            lifetime_days: 1,
+            expiry_per_round: 0,
         };
         let faults = |violate| crate::fakes::Faults {
             violate_order_every: violate,
@@ -659,6 +705,9 @@ mod tests {
             // lets a pair of them be answered in the wrong order.
             raft_nanos: 8_000,
             raft_tail_nanos: 0,
+            day_nanos: 0,
+            lifetime_days: 1,
+            expiry_per_round: 0,
         };
         let faults = crate::fakes::Faults {
             reorder_every: 2,

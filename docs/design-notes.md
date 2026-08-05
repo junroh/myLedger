@@ -892,9 +892,11 @@ old version for it. But the request already has it: the record it was answered w
 until it is answered, so the decision carries the hold's original size along with the new remainder and
 what it consumed, and the engine appends without reading. A resolution judged inside the chain that
 created the hold was never answered with a record, so that one still reads — an optimisation with a
-fallback, like the location token. Nothing exercises that fallback outside a unit test: no workload here
-creates a hold and partially settles it inside one chain, so its cost is unmeasured, which is stated
-rather than assumed to be nil.
+fallback, like the location token. The `linked` workload exercises it: half its chains create a hold
+and resolve it inside the chain (partial settle, then void of the rest), so every such settle is a
+`Reduce` carrying no original size and the engine reads the version it appended moments ago. The run
+reports those as unwritten-block reads, one per in-chain settle — reproduce with
+`ledgerfio run --workload linked`.
 
 What it did not remove is the floor. A resolution that follows a partial one arrives with a stale
 location: the record moved when the new version was appended, and the sequencer cannot know where, because
@@ -926,3 +928,186 @@ first — how much of what was written never had to be written out, and how many
 buffer. `ledgerfio` reports both, and the first is the number the source design's own inputs disagree
 about: its settle-age distribution implies almost everything is resolved within a day, while its
 survivor fraction implies half of it lives for the full retention. A run now says which.
+
+## 13. The engine speaks first, and what it is allowed to say
+
+Every method on the pending port was call-and-reply: the sequencer sends, the engine answers, and the
+answer carries the `Correlation` of the request that asked. Two things need the engine to start the
+conversation instead — sealing when a committed hold cannot be stored, and expiry — and neither could
+be built without a direction that does not exist.
+
+**Why not a reply.** The obvious economy is to carry the news on the existing reply channel. It does
+not work, and the reason is not the channel but the payload: a reply names a work slot, and there is
+no slot behind a hold the index could not take. A sentinel correlation would make one field mean two
+things, which is the shape rule 18 exists to forbid. The second reason is separation: replies are on
+a request's latency path and a notice is not, so putting them in one queue makes a slow reader of the
+one delay the other (rule 10).
+
+**Why a queue rather than a flag.** For the one notice built here a flag would do — `HoldNotStored`
+means the node stops, so a single atomic bool could never overflow and could never be lost. It was
+refused because expiry is the other user of this direction, and an expiry proposal carries a hold id
+that a flag cannot hold. Building the flag now would mean building the queue later, and then "the
+engine speaks first" would exist as two mechanisms (rule 3). So it is a queue, and expiry lands on it
+without a new one.
+
+**Why the queue is bounded and the news is still not lost.** Rule 12 says every backlog has a limit,
+and a full notice queue would be exactly the hole this change closes. So the worker latches a notice
+it cannot hand over and retries it every round — the same shape as the command it defers when the
+store is busy. The latch is one slot, not a queue, and that is a deliberate limit rather than an
+oversight: the only notice there is means the node stops, so a second one is the same news, and the
+count the report prints comes from the engine's own counter. Something that has to deliver *every*
+notice needs a queue in that slot, and expiry is the change that will put one there. A run makes the
+asymmetry visible rather than hiding it: at a declared maximum of twenty-four the engine reports
+twenty thousand overflows and the sequencer reports one seal, printed side by side.
+
+**Why it is drained first in the tick and has no stage of its own.** A sixth stage would add a column
+to every `--cpu` report — and §10's "two `--cpu` runs are comparable only when both match" would gain
+one — for something that happens once in the life of a node. `drain_backlogs` already runs before
+every other stage, which is what a seal needs: one decided this tick has to be in effect before this
+tick applies anything.
+
+### Why a hold the store could not take is the apply path's problem
+
+§9 has two ways the ledger can be wrong about itself. This is a third of the same kind, and it is
+worth stating why rather than asserting it. The effect was applied: the columns moved, and the client
+was told the hold committed. Neither can be taken back. What can never happen now is the resolution
+that brings that pending column back down, because no resolution of a hold the store does not have can
+be answered. So the money is reserved for good and this node's state has stopped following the log —
+the same conclusion as a committed effect that cannot be applied, reached from the other end. A
+follower replaying the same log with the same sizing stops in the same place, which is what makes
+stopping right rather than merely safe.
+
+There is deliberately no operator action, for the reason §11 gives about the table never growing: the
+index is sized from a declared maximum, so passing it is a business change. The remedy is a
+configuration change and a rolling restart, and the index is a derived structure rebuilt on the way
+back up. What makes that tolerable is that the limit is visible long before it is reached — load
+against the target, worst cascade against the cap, both printed by `ledgerfio` — and the load-factor
+alarm that would warn on the same channel is still not built.
+
+Exercised rather than argued, like the other three: `ledgersim check` gives one seed in five an index
+of a few dozen slots, and the sweep asserts per seed that every overflow was answered by a seal. That
+replaced an assertion that overflows never happen, which was a statement about a path the sweep never
+entered. Reproduce the whole thing in one run with
+`ledgerfio run --workload hold-settle --daily-arrivals 24`, which seals in about thirty milliseconds
+and exits 1.
+
+## 14. Retention is a promise, so expiry rounds late
+
+The thirty-two days is not an internal window. It is told to the customer — *your pending data is kept
+for at most thirty-two days, then deleted* — and a promise like that has two edges, only one of which is
+safe to miss.
+
+- **Keeping a record longer** breaks the deletion half of the promise. It costs space.
+- **Deleting it sooner** refuses a resolution that was still entitled to arrive. That is a wrong answer.
+
+So every rounding in this mechanism goes late, and one configured number — `grace_days`, a day by
+default — pays for all of it at once. What it buys is worth listing, because the temptation is to price
+it against segment coarseness alone:
+
+| where an early deletion could come from | what the grace does |
+|---|---|
+| a segment is a whole day, so holds in it differ in age by up to one | covers it |
+| a wall clock jumping forward (NTP) | covers it, up to the grace |
+| a record written after midnight for a hold created before it | already late, and inside the flush window |
+| the sweep not having run, or not keeping up | already late |
+
+The bottom two are safe by construction; the top two are what the number is for. **Raising it is the
+answer to any of them**, and the price is linear and only ever space: the index and the store are sized
+for `retention + grace`, which at thirty-two plus one is three percent.
+
+### Nothing about a hold's lifetime is stored
+
+A record carries no timestamp and stays eighty bytes. Expiry is computed:
+
+```
+a segment's records are deleted at (that segment's day) + retention_days + grace_days
+```
+
+This was not the first answer. A per-record expiry timestamp was, and the argument that killed it is not
+the four bytes — it is that a retention window is **configuration**, and a configuration changed and
+restarted has to apply to the records already written. A stored deadline is one computed under the old
+policy; the new one could only reach it by rewriting every record. Derived, it just applies.
+
+The same rule refuses two other placements, and neither of them on cost. A per-segment *lifetime* makes a
+hold's deadline depend on which block it happened to land in — the log-position idea in disguise, and
+early under load for the same reason. A separate durable structure keyed by deadline puts part of what a
+hold *is* under a second owner with nothing to say which is true (rule 18), and it would need its own
+liveness rule, compaction and recovery, when the one the records have is a single sentence.
+
+**And the day needs no storage either.** A segment number *is* its day, modulo the sixty-three the address
+field has room for, and only a lifetime's worth of days is ever live — so the day is recoverable from the
+number. `MemoryPendingConfig::validate` refuses a lifetime that would make two live days share a number,
+because that is not a slow degradation but expiry deleting the wrong day's records. The bound is a
+retention of sixty-one days against the thirty-two the design asks for; past it, a small per-segment table
+of days is what removes the bound.
+
+### The clock, and how little of one is needed
+
+Design notes §12 says the engine has no clock and should not grow one *for the window*, and that stands:
+the window is still a count of blocks. Retention is different in kind — it was always a duration, because
+it is a calendar promise — and what it needs is one reading per day.
+
+The distinction that matters is not whether the engine knows the time but whether it **owns a clock**. It
+does not, and it did not before: `begin_lookup` and `harvest` are handed `now`, and expiry is handed
+`today`. That is what makes it testable, and the reason is concrete rather than tidy: `ledgersim` drives
+`PendingEngine` directly and never runs the worker, so a wheel in the worker would be invisible to every
+fault-injection seed. A retention window measured in days is also one no test could reach by waiting, so
+the day is injectable (`DaySource`) exactly as the reactor's `Clock` is, and `ledgersim` compresses a day
+to a few hundred virtual microseconds.
+
+It has to be **wall** time, not the monotonic clock the rest of the engine runs on: an origin-relative
+clock restarts at zero, and a promise in calendar terms has to outlive a restart. Read to the day, so
+drift of minutes changes nothing.
+
+**There is no timing wheel.** The trigger is a segment running out, which is an event the engine already
+processes, and only per-hold deadlines firing at arbitrary times would need one. Nothing can express a
+per-hold lifetime today — `Transfer` is sixty-four bytes and full, and a hold's `pending_ref` already
+means its budget group — so a wheel would be a structure for a feature that cannot be asked for (rule 4).
+
+### The survivors identify themselves, and the void is judged
+
+A day's records are found through the index, not the store: a record is alive exactly when the index
+points at it, which is the same sentence compaction rests on. So the dead are never read. What the index
+cannot give is the *key* — a slot holds a fingerprint — so the survivors' records are read, which the void
+needs anyway to name the two accounts it moves between. The read goes through to the store when residency
+has dropped the record, counted apart from the apply path's reads: the sweep can wait and apply cannot,
+and a record the sweep declined to read would be a hold it never expired and a pending column reserved for
+good.
+
+The void is then **judged like any other resolution, not applied**. It has to be: a settle the client
+submitted may be in flight for the same hold, and only the judge sees both. So it takes a slot, a place in
+its lane and a lookup, and it is refused by the same rules — a hold already resolved, a quarantined lane, a
+sealed apply path — with the sweep offering it again next time round.
+
+Two things follow that are worth stating because they are wire-visible:
+
+**The top bit of a transaction id is the ledger's.** An expiry void's id is *derived* from the hold it
+resolves, so that two leaders propose the same one and the second is a duplicate rather than a second void.
+Derived means not unique by construction, so it needs a space of its own — a client colliding with one
+would have a real transfer answered as a duplicate. `Transfer::validate` stays shape-only and the
+refusal lives at the client boundary in `admit`, because a ledger-origin id is perfectly well shaped and
+the ledger submits one.
+
+**The ledger does not ack itself.** Nobody sent the void, so an ack for it would put a transaction id no
+client sent into the client's stream. The reserved bit is what makes that readable off the id, so no stage
+has to carry a flag saying whose work a request was.
+
+### Weighed and refused: the two negative answers
+
+The engine's design document asks for a negative answer split in two — a hold that was resolved or
+expired, against one that never existed. It is refused, and not for cost.
+
+Answering "expired" means keeping something about that hold past its retention, and **a tombstone is
+exactly the data the promise says is deleted**. There is no way to infer it either: a `TxId` is
+client-chosen and carries no time, so an unknown id cannot be dated; the dedup map's window is an hour
+against thirty-two days; and the consensus log is compacted and not queryable by id. So the split cannot
+be built without breaking the promise it exists to serve.
+
+What it was really for is the client's reconciliation — *I created hold H for a hundred; where is it?* —
+and that is served better by telling the client **when the void happens** than by answering questions
+about it for ever. The ledger has no outbound channel for that yet, which is the honest gap; the current
+single negative answer at least makes no false claim, since `PendingRefNotFound` says "not found" rather
+than "never existed".
+
+Reproduce the whole mechanism with `ledgersim check --seeds 64`, whose coverage line reports expiry
+offered, admitted and refused, and whose sweep test fails if no seed outlived its retention.

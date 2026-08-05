@@ -401,7 +401,18 @@ pub struct Coverage {
     chains_rejected: u64,
     fences: u64,
     exempt: u64,
+    exempt_lookups: u64,
     overflowed: u64,
+    /// Committed holds the engine could not store, as the *ledger* saw them. Beside `overflowed`, which
+    /// is the same event counted from outside, so a sweep says whether every one of them reached the
+    /// node that has to stop for it.
+    not_stored: u64,
+    /// Holds whose retention ran out: what the engine offered, what the sequencer admitted, and what it
+    /// could not take yet. The third is not a loss — nobody asked for those and the sweep offers them
+    /// again — but it is what says the expiry rate is short.
+    expiries_offered: u64,
+    expired: u64,
+    expiry_refused: u64,
     store_reads: u64,
     stale_answers: u64,
     lookups: u64,
@@ -422,7 +433,12 @@ impl Coverage {
         self.chains_rejected += m.linked_chains_rejected;
         self.fences += m.fences;
         self.exempt += m.order_exempt;
+        self.exempt_lookups += report.exempt_lookups;
         self.overflowed += report.overflowed;
+        self.not_stored += m.holds_not_stored;
+        self.expiries_offered += report.expiries_offered;
+        self.expired += m.holds_expired;
+        self.expiry_refused += m.expiry_refused;
         self.store_reads += report.store_reads;
         self.stale_answers += report.metrics.stale_answers;
         self.lookups += m.pending_lookups;
@@ -439,9 +455,20 @@ impl Coverage {
             self.committed, self.rejected, self.duplicates, self.chains, self.chains_rejected
         );
         println!(
-            "           fences {} exempt {} lookups {} overlay evicted {} store reads {} \
-             index overflows {}",
-            self.fences, self.exempt, self.lookups, self.evicted, self.store_reads, self.overflowed
+            "           fences {} exempt {} (lookups {}) lookups {} overlay evicted {} \
+             store reads {} index overflows {} (sealed {})",
+            self.fences,
+            self.exempt,
+            self.exempt_lookups,
+            self.lookups,
+            self.evicted,
+            self.store_reads,
+            self.overflowed,
+            self.not_stored
+        );
+        println!(
+            "           expiry offered {} admitted {} refused {}",
+            self.expiries_offered, self.expired, self.expiry_refused
         );
         println!(
             "           seq gaps {} stale answers {} quarantines {} refused commits {} \

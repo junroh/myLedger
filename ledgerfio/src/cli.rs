@@ -233,6 +233,7 @@ impl Cli {
             "resolve-after" => options.resolve_after = Self::count(value)? as usize,
             "daily-arrivals" => options.capacity.daily_arrivals = Self::count(value)?,
             "retention-days" => options.capacity.retention_days = Self::count(value)?,
+            "grace-days" => options.capacity.grace_days = Self::count(value)?,
             "survivor-share" => options.capacity.worst_survivor_share = Self::ratio(value)?,
             "flush-survivors" => options.capacity.survives_flush_window = Self::ratio(value)?,
             "flush-window" => options.capacity.flush_window_hours = Self::count(value)?,

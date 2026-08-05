@@ -8,11 +8,14 @@ use std::rc::Rc;
 
 use ledger_base::ports::{
     IdemReply, IdemRequest, IdemVerdict, IdempotencyPort, OverlayState, PendingCommand,
-    PendingEffect, PendingOverlay, PendingPort, PendingReply, RaftCommit, RaftOutcome, RaftPort,
-    RaftProposal,
+    PendingEffect, PendingNotice, PendingOverlay, PendingPort, PendingReply, RaftCommit,
+    RaftOutcome, RaftPort, RaftProposal,
 };
-use ledger_base::{Amount, FxHashMap, Prng, TxId};
-use ledger_pending::{HoldOverlay, PendingEngine, DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS};
+use ledger_base::{Amount, FxHashMap, Prng, Transfer, TxId, UNORDERED};
+use ledger_pending::{
+    HoldOverlay, MemBlockStore, PendingEngine, DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS,
+    DEFAULT_SLOTS,
+};
 use ledger_stubkit::{LaneOrderer, Server, ServerStats};
 
 /// How fast each component answers, and how much it keeps. Nothing here misbehaves — a slow component
@@ -43,6 +46,15 @@ pub struct Timings {
     /// The mean of consensus's tail. A fixed round trip makes every batch equally late, which is the
     /// one thing a real quorum never is.
     pub raft_tail_nanos: u64,
+    /// How long a day is on the virtual clock. Retention is the one thing in the engine measured in days,
+    /// and a real day is many orders of magnitude past a two-thousand-step run — so the day is compressed
+    /// here, which is the whole reason the engine is *told* the day instead of reading a clock. Zero means
+    /// no day ever passes, which is what a capacity run wants: its question is not expiry.
+    pub day_nanos: u64,
+    /// Days a record lives: the promise plus the grace that keeps deletion from being early.
+    pub lifetime_days: u64,
+    /// Expiry voids offered per step, so a day's worth spreads out instead of arriving as one burst.
+    pub expiry_per_round: usize,
 }
 
 /// What misbehaves, and by how much. Every one of these is off in `capacity`, whose question is what
@@ -63,6 +75,11 @@ pub struct Faults {
     pub inbox_depth: usize,
     /// Stop reading acks every nth step, so the ack backlog fills and backpressure reaches the client.
     pub slow_client_every: u64,
+    /// Slots the engine's index gets, zero for the default sizing. A handful means the declared maximum
+    /// is passed within a run, which is a hold the log says exists and the store cannot take — the one
+    /// thing the engine reports without being asked, and the seal that answers it. A fault rather than a
+    /// timing, because the declaration being wrong is a misbehaviour, not a speed.
+    pub index_slots: usize,
 }
 
 impl Timings {
@@ -92,6 +109,16 @@ impl Timings {
             idem_nanos: pick(3) * step_nanos,
             raft_nanos: (1 + pick(4)) * step_nanos,
             raft_tail_nanos: pick(3) * step_nanos,
+            // A day short enough that a run crosses several of them, so retention actually runs out and
+            // the auto-void it produces is judged while the faults are on. One seed in four keeps the day
+            // long enough never to pass, because a ledger nothing expires in is also a shape to cover.
+            day_nanos: if pick(4) == 0 {
+                0
+            } else {
+                (40 + pick(120)) * step_nanos
+            },
+            lifetime_days: 1 + pick(3),
+            expiry_per_round: 1 + pick(8) as usize,
         }
     }
 }
@@ -110,6 +137,11 @@ impl From<&crate::sim::Plan> for Timings {
             idem_nanos: plan.idem_nanos,
             raft_nanos: plan.raft_nanos,
             raft_tail_nanos: plan.raft_tail_nanos,
+            // No day ever passes: a capacity run asks what the ledger does against components of a given
+            // speed, and a background sweep competing with the traffic would answer a different question.
+            day_nanos: 0,
+            lifetime_days: 1,
+            expiry_per_round: 0,
         }
     }
 }
@@ -131,6 +163,15 @@ impl Faults {
                 64 + pick(256) as usize
             },
             slow_client_every: if pick(3) == 0 { 2 + pick(8) } else { 0 },
+            // Some seeds are asked to outgrow their index, so the notice channel and the seal it causes
+            // are explored alongside every other fault rather than only in a unit test. Rare, and roomy
+            // enough that the seed runs a while first: a node that seals on its second hold spends the
+            // rest of its steps sealed, which explores nothing else.
+            index_slots: if pick(8) == 0 {
+                64 + pick(192) as usize
+            } else {
+                0
+            },
         }
     }
 
@@ -160,6 +201,15 @@ struct PendingState {
     /// Claim to have applied less than it has, every nth answer.
     stale_answer_every: u32,
     answers: u64,
+    /// Replies that kept no place in a lane: an exempt resolution's lookup. What says a sweep
+    /// exercised the order exemption itself, not only the data check that covers it.
+    exempt_replies: u64,
+    /// What the engine has to say without being asked. Its own queue for the same reason the real one
+    /// has: a notice answers no command, so it neither waits behind a reply nor delays one.
+    notices: VecDeque<PendingNotice>,
+    /// Reused by every sweep round, so expiry allocates nothing.
+    expiring: Vec<Transfer>,
+    expiries_offered: u64,
     ready: VecDeque<PendingReply>,
     now: u64,
     /// The engine, as the sequencer sees it: a service with a latency, a tail and a rate. Every
@@ -167,7 +217,7 @@ struct PendingState {
     /// memory saves is IO below this, which is `ledgerfio`'s store model rather than one number here.
     engine: Server,
     prng: Prng,
-    order_wait: OrderWait,
+    order_wait: FakeOrderWait,
     depth: usize,
     /// When this component next has anything to do. Kept rather than recomputed, because a capacity
     /// run takes a step every few hundred nanoseconds and a component answers every few
@@ -179,7 +229,7 @@ struct PendingState {
 /// that finished in a millisecond and then waited nine for an earlier read on its lane is a speed
 /// problem no per-read bound covers.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct OrderWait {
+pub struct FakeOrderWait {
     pub released: u64,
     pub waited_nanos: u64,
     pub worst_nanos: u64,
@@ -190,11 +240,24 @@ impl PendingFake {
     pub fn new(timings: Timings, faults: Faults, seed: u64) -> Self {
         Self(Rc::new(RefCell::new(PendingState {
             overlay: HoldOverlay::new(64, timings.resident_holds, 64),
-            store: PendingEngine::with_windows(timings.flush_blocks, timings.resident_blocks),
+            store: PendingEngine::sized(
+                if faults.index_slots > 0 {
+                    faults.index_slots
+                } else {
+                    DEFAULT_SLOTS
+                },
+                timings.flush_blocks,
+                timings.resident_blocks,
+                Box::new(MemBlockStore::default()),
+            ),
             inbox: VecDeque::new(),
             orderer: LaneOrderer::new(faults.violate_order_every),
             stale_answer_every: faults.stale_answer_every,
             answers: 0,
+            exempt_replies: 0,
+            notices: VecDeque::new(),
+            expiring: Vec::new(),
+            expiries_offered: 0,
             ready: VecDeque::new(),
             now: 0,
             engine: Server::new(
@@ -203,7 +266,7 @@ impl PendingFake {
                 timings.pending_rate,
             ),
             prng: Prng::new(seed),
-            order_wait: OrderWait::default(),
+            order_wait: FakeOrderWait::default(),
             depth: faults.inbox_depth,
             earliest: None,
         })))
@@ -233,11 +296,51 @@ impl PendingFake {
         self.0.borrow().store.traffic().store_reads
     }
 
+    /// Replies that kept no place in a lane — the lookups of order-exempt resolutions.
+    pub fn exempt_replies(&self) -> u64 {
+        self.0.borrow().exempt_replies
+    }
+
+    /// Expiry voids the engine has offered. Here rather than on the virtual clock's own day count, because
+    /// what matters is whether the sweep found anything for the sequencer to judge.
+    pub fn expiries_offered(&self) -> u64 {
+        self.0.borrow().expiries_offered
+    }
+
+    /// Moves the engine's day on, which is the whole of what a clock does for retention. Driven by the
+    /// simulation rather than read from a wall clock: expiry that could only be reached by waiting a day
+    /// would be explored by no seed at all.
+    pub fn open_day(&self, day: u64, lifetime_days: u64) {
+        let mut state = self.0.borrow_mut();
+        state.store.open_day(day, lifetime_days);
+        // Something to do now, so an idle clock does not skip past the sweep.
+        state.earliest = Some(state.earliest.map_or(state.now, |due| due.min(state.now)));
+    }
+
+    /// Offers the next slice of whatever ran out, as the voids that release it. Bounded per call for the
+    /// same reason the real worker bounds it: a day's expiry must not arrive as one burst.
+    pub fn sweep_expiry(&self, per_round: usize) {
+        let mut state = self.0.borrow_mut();
+        if !state.store.sweeping() || !state.notices.is_empty() {
+            return;
+        }
+        let mut found = std::mem::take(&mut state.expiring);
+        found.clear();
+        state.store.expiring(per_round, &mut found);
+        state.expiries_offered += found.len() as u64;
+        for void in &found {
+            state
+                .notices
+                .push_back(PendingNotice::HoldExpired { void: *void });
+        }
+        state.expiring = found;
+    }
+
     pub fn engine(&self) -> ServerStats {
         self.0.borrow().engine.stats()
     }
 
-    pub fn order_wait(&self) -> OrderWait {
+    pub fn order_wait(&self) -> FakeOrderWait {
         self.0.borrow().order_wait
     }
 
@@ -247,7 +350,7 @@ impl PendingFake {
     pub fn reset_stats(&self) {
         let mut state = self.0.borrow_mut();
         state.engine.reset_stats();
-        state.order_wait = OrderWait::default();
+        state.order_wait = FakeOrderWait::default();
     }
 
     pub fn drive(&self, now: u64) {
@@ -264,7 +367,11 @@ impl PendingFake {
                 // after it either way, and the engine's queue is what the write actually costs.
                 PendingCommand::Apply(effect) => {
                     state.engine_time();
-                    state.store.write(effect);
+                    if let Err(not_stored) = state.store.write(effect) {
+                        state.notices.push_back(PendingNotice::HoldNotStored {
+                            hold: not_stored.hold,
+                        });
+                    }
                 }
                 PendingCommand::Lookup(lookup) => {
                     let found = state.store.lookup(lookup.pending_ref);
@@ -323,9 +430,15 @@ impl PendingFake {
 
 impl PendingState {
     /// A reply is finished at `at` — when it *leaves* is the orderer's business, which is the whole
-    /// point: the lane's order is the component's work, and breaking it on purpose is a fault.
+    /// point: the lane's order is the component's work, and breaking it on purpose is a fault. An
+    /// order-exempt reply keeps no place, so it leaves as soon as its own work is done.
     fn emit(&mut self, reply: PendingReply, at: u64) {
-        self.orderer.push(reply.lane, at, (at, reply));
+        if reply.seq == UNORDERED {
+            self.exempt_replies += 1;
+            self.orderer.push_unordered(at, (at, reply));
+        } else {
+            self.orderer.push(reply.lane, at, (at, reply));
+        }
     }
 
     /// What this answer says the engine had applied. Truthful unless the fault is on.
@@ -381,6 +494,10 @@ impl PendingPort for PendingFake {
 
     fn poll(&self) -> Option<PendingReply> {
         self.0.borrow_mut().ready.pop_front()
+    }
+
+    fn notices(&self) -> Option<PendingNotice> {
+        self.0.borrow_mut().notices.pop_front()
     }
 }
 
@@ -499,16 +616,18 @@ impl IdempotencyPort for IdemFake {
             Some(_) => IdemVerdict::DuplicateDifferentBody,
         };
         let due = state.now + state.delay;
-        state.orderer.push(
-            request.lane,
-            due,
-            IdemReply {
-                correlation: request.correlation,
-                lane: request.lane,
-                seq: request.seq,
-                verdict,
-            },
-        );
+        let reply = IdemReply {
+            correlation: request.correlation,
+            lane: request.lane,
+            seq: request.seq,
+            verdict,
+        };
+        // Same rule as the real stub: an order-exempt request's reply is not lane-ordered.
+        if request.seq == UNORDERED {
+            state.orderer.push_unordered(due, reply);
+        } else {
+            state.orderer.push(request.lane, due, reply);
+        }
         Ok(())
     }
 

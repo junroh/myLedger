@@ -3,7 +3,7 @@
 What is built and verified, and what is not. Written to be read before picking up work: the design
 reasoning lives in `design-notes.md`, the terms in `glossary.md`, and how to run things in `tools.md`.
 
-Verified at the time of writing with `cargo test` (debug, 103 tests), `cargo build --release
+Verified at the time of writing with `cargo test` (debug, 121 tests), `cargo build --release
 --workspace --all-targets`, all six `ledgerfio` workloads, all three `ledgersim` modes, `ledgerfio
 layout`, `cargo bench -p ledger-pending`, and `ledgerd` starting and draining on SIGTERM.
 
@@ -53,6 +53,34 @@ fences in one order.
 - **The overlay holds no record.** Only what the sequencer has decided and not handed over, bounded
   by requests in flight. The record belongs to the engine and the reply carries it to the slot of
   the request that asked (rule 18). Design notes §2's correction.
+- **The engine can speak first.** A third direction on the port (`notices`), with a channel of its
+  own so news the engine sends is neither behind a reply nor in front of one. Two notices exist: a
+  committed hold the index could not take seals the apply path (rule 19, where it used to be
+  detect-and-report), and a hold that outlived its retention is proposed for release. Design notes
+  §13.
+
+### Retention, and the expiry that makes it true
+
+A segment is a day, its number is the day modulo the segments an address has room for, and a day that
+runs out is emptied by releasing whatever survived it. Design notes §14.
+
+- **Deletion is never early, and that is the edge that matters.** Late costs space; early refuses a
+  resolution still entitled to arrive, which is a wrong answer. `grace_days` (default 1) is the one
+  number that buys away every source of early deletion — a segment's own coarseness, a wall clock
+  jumping forward, a sweep that has not run — and it costs exactly that many days of capacity, which
+  `declared_maximum` is sized for.
+- **The deadline is computed, not stored.** A record carries no timestamp and stays 80 bytes: expiry
+  is `segment's day + retention + grace`, read from the current configuration. So a configuration
+  changed and restarted applies to records already written, which is what a retention promise needs.
+- **Expiry is what makes the index's declared maximum true.** Without it a hold never leaves the
+  index, and a long-running node eventually passes the maximum it was sized for and seals.
+- **The void is judged, not applied.** A settle the client submitted may be in flight for the same
+  hold, and only the judge sees both. Its id is derived from the hold, so two leaders propose the
+  same one and the second is a duplicate — which is why the top bit of a transaction id is reserved
+  and clients are refused it.
+- **The engine is told the day rather than reading a clock.** One reading per day, wall time because
+  retention is a calendar promise that outlives a restart, and injectable (`DaySource`) because a
+  window measured in days is one no test could otherwise reach.
 
 ### The tools
 
@@ -68,26 +96,32 @@ test asserts the store was reached.
 
 ## Not built
 
-### Waiting on one thing: the engine cannot speak first
+### Keeping a mass expiry behind live traffic
 
-Every port method is call-and-reply. Two things need the engine to start a conversation, and neither
-can be built without it:
+Expiry itself is built (below). What is not is a rate limiter, so the only thing keeping a day's
+worth of voids from competing with client traffic is `expiry_per_round` — a bound, not a policy.
+Falling behind deletes late, which is the safe direction, so this is a capacity question rather
+than a correctness one. The requirement is derived rather than guessed:
 
-1. **Sealing on index overflow.** An insert the index cannot take is a hold the log says exists and
-   the store does not have. It is counted, reported, and fails a run in both tools — but the node
-   does not seal, because a write carries no reply to bring the news back. Rule 19 says detect and
-   stop; this detects and reports.
-2. **Expiry.** The timing wheel and the auto-void the engine proposes to the sequencer. Nothing of
-   it exists.
+```
+drain rate >= a day's survivors / a day
+```
 
-This is the largest structural addition left: a variant on `poll()` or a separate low-priority
-channel.
+What is missing to size it is the measurement: what a day's worth of voids does to the tail while
+clients are being served.
 
-### Retention is not real
+### Blocks are not freed yet
 
-`segment` never advances and no block is ever freed, so the 32-day window exists only as a number
-the index is sized from. Segment expiry brings with it the split the engine's design asks for
-between "resolved or expired" and "never existed" — today there is one negative answer.
+Expiry releases the holds a day's records belonged to, so the records themselves die with the
+`Remove` that resolves them — but nothing yet hands a wholly empty segment's blocks back to the
+store. The bound on *holds* is real; the bound on bytes waits on that.
+
+**The split the engine's design asks for is refused, not deferred.** It wanted a negative answer that
+tells "resolved or expired" from "never existed". Under the retention promise that is
+unimplementable: answering "expired" needs per-hold state kept past retention, and a tombstone is
+exactly the data the promise says is deleted. Design notes §14 has the argument and what serves the
+need instead — telling the client when the void happens, which needs a push channel the ledger does
+not have.
 
 ### Recovery is not real
 
@@ -98,16 +132,17 @@ the split exists and that residency keeps IO off resolutions inside it.
 ### Smaller, and each with a reason
 
 - **The load-factor alarm is reporting only.** The index reports its load against the target and
-  its worst cascade, but nothing warns or refuses before an insert fails.
-- **The in-chain fallback read is unmeasured.** No workload creates a hold and partially settles it
-  inside one chain, so the cost of that path is covered by a unit test and nothing else.
-- **`OrderWait` exists twice under one name** — `pending/src/orderer.rs` for the real orderer and
-  `ledgersim/src/fakes.rs` for the stub's. Two orderers, one name, which rule 3 forbids.
-- **`idempotency` lane-orders even unordered replies**, which is order-wait bought for nothing.
-- **The simulator never resolves on an unconstrained account**, so `check` does not exercise the
-  order exemption itself — only the data check that covers it.
+  its worst cascade, but nothing warns or refuses before an insert fails. The channel it would warn
+  over now exists; what is missing is the threshold and what a warning should make the node do,
+  which is a question about operations rather than about the code.
 - **Consensus is an echo**, the dedup map has no expiry, and the log has no compaction. All three
   grow with a run, which the tools say out loud.
+
+Four earlier entries are closed: the in-chain fallback read is now exercised by the `linked`
+workload (half its chains create a hold and resolve it inside the chain), the stub orderer's
+metrics struct is `FakeOrderWait` so `OrderWait` names one thing, unordered replies skip lane
+ordering in the dedup stub and both fakes, and the simulator now creates holds on the unconstrained
+account so `check` exercises the order exemption itself — the sweep test asserts it did.
 
 ## Where the numbers live
 

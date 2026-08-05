@@ -166,8 +166,9 @@ impl RunReport {
             && self.metrics.seq_gaps == 0
             && self.metrics.invariant_breaks == 0
             // An insert the index could not take is a hold the log says exists and the store does not
-            // have. The engine cannot stop the node for it yet — a write has no reply to carry the news
-            // back on — so the least this tool can do is refuse to call the run a pass.
+            // have. The node now seals for it, so `fail_stop` below would fail the run anyway; this is
+            // kept because it names the cause, and because it is counted where it happened — the engine
+            // — rather than where it was answered.
             && self.pending_traffic.overflowed == 0
             && !self.fail_stop
     }
@@ -357,15 +358,15 @@ impl RunReport {
         if !reached.is_empty() {
             println!("                ceilings reached: {}", reached.join(", "));
         }
-        // A property of the design, not of this run, and the reason a total here is not a steady
-        // state: the structures that grow fastest have nothing to bound them yet. The engine's record
-        // blocks are append-only by choice — a hold whose remainder changed is written again rather
-        // than in place — so their space comes back only when a segment expires, and expiry is not
-        // built. Until it is, the blocks grow with holds created rather than holds alive.
+        // A property of the design, not of this run, and the reason a total here is not a steady state:
+        // the structures that grow fastest have nothing to bound them yet. The engine's blocks are no
+        // longer among them — expiry releases the holds that outlive their retention and the records go
+        // with them — but a run measured in seconds crosses no day, so a run's own total still shows the
+        // unbounded shape rather than the steady state expiry produces.
         println!(
             "                unbounded so far: the dedup map has no expiry and the log no compaction, so \
-             both grow with the run; the engine's blocks drop what died in the buffer and keep every \
-             survivor, because segment expiry is not built"
+             both grow with the run; the engine's blocks are bounded by retention, which no run this \
+             short reaches"
         );
         // The log is append-only and this design has no snapshot or compaction, so what it appended is
         // what it would occupy. Priced at the effect's in-memory size because there is no wire format
@@ -482,6 +483,21 @@ impl RunReport {
             println!(
                 "  BOOKKEEPING   {} invariant breaks: the node sealed its apply path",
                 self.metrics.invariant_breaks
+            );
+        }
+        if self.metrics.holds_expired + self.metrics.expiry_refused > 0 {
+            println!(
+                "  retention     {} holds released for outliving it, {} offered and refused (already \
+                 resolved, or no room yet — the sweep offers those again)",
+                self.metrics.holds_expired, self.metrics.expiry_refused
+            );
+        }
+        if self.metrics.holds_not_stored > 0 {
+            println!(
+                "  SEALED        {} committed holds the engine could not store: its index was sized \
+                 for a declared maximum this run passed, so the node stopped applying. Raise \
+                 --daily-arrivals or --index-budget.",
+                self.metrics.holds_not_stored
             );
         }
         println!(

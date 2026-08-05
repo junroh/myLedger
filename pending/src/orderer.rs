@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use ledger_base::{AccountId, FxHashMap, Seq};
+use ledger_base::{AccountId, FxHashMap, Seq, UNORDERED};
 
 /// Contract 1 is the engine's to keep: a lane's replies leave in the seq order the sequencer issued,
 /// however they completed. The sequencer only checks, so anything that leaves here out of order becomes
@@ -63,10 +63,6 @@ struct Held<T> {
     blocked: bool,
     value: T,
 }
-
-/// A seq of zero is not a place in the lane: an order-exempt request keeps none, so its reply leaves as
-/// soon as its own work is done.
-const UNORDERED: Seq = 0;
 
 impl<T> Orderer<T> {
     pub fn new(violate_every: u32) -> Self {

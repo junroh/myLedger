@@ -1,7 +1,7 @@
 use ledger_base::ports::{HoldData, PendingEffect};
-use ledger_base::{Amount, BudgetGroup, FxHashMap, MapGauge, TxId};
+use ledger_base::{Amount, BudgetGroup, FxHashMap, MapGauge, Transfer, TransferFlags, TxId};
 
-use crate::block::{BlockAddr, BlockStore, LogTraffic, MemBlockStore, RecordLog};
+use crate::block::{BlockAddr, BlockStore, LogTraffic, MemBlockStore, RecordLog, SEGMENTS};
 use crate::index::{Candidates, HoldTable};
 
 /// What the pending engine keeps: every hold it was told to create, and the budget groups those
@@ -19,6 +19,17 @@ pub struct PendingEngine {
     survivors: Vec<(TxId, HoldData, BlockAddr)>,
     /// Lookups waiting on the store, with the rest of their candidate walk.
     fetches: FxHashMap<u64, Fetch>,
+    /// The day whose records are being written, and how far the expiry sweep has walked the index looking
+    /// for the day that has run out. The day itself is not stored anywhere: a segment's number *is* its
+    /// day modulo the segments available, and only a lifetime's worth is ever live, so it is recoverable
+    /// from the number alone.
+    today: u64,
+    /// Days a record may live, as the caller last declared it. Kept beside the day rather than passed to
+    /// every call, because it is what decides whether the sweep's day has run out yet.
+    lifetime_days: u64,
+    sweep: Sweep,
+    /// Reused by every sweep round, so expiry allocates nothing however often it is asked.
+    expiring: Vec<BlockAddr>,
     overflowed: u64,
     /// Committed decisions applied, counted so an answer can say which of them it reflects. The
     /// sequencer knows how many it had sent when it asked, and an answer from before one of them is a
@@ -42,6 +53,43 @@ pub enum Started {
     Answered(Option<HoldData>),
     Fetching,
     Busy,
+}
+
+/// Where the expiry sweep has got to. Nothing here is durable: a sweep interrupted by a restart starts
+/// again, which costs a walk and loses nothing — the index is the authority on what survived.
+///
+/// One cursor, not one per day. The oldest day that is not finished is the only one worked on, and it is
+/// finished when a whole pass over the index finds nothing pointing into it — which is the same moment its
+/// blocks can be handed back. Days therefore cannot be skipped: an earlier version restarted the walk at
+/// whatever had just expired, so a day still being walked when the next arrived was abandoned and its holds
+/// were never released at all. Falling behind here is late, which costs space rather than correctness.
+#[derive(Debug, Clone, Copy, Default)]
+struct Sweep {
+    /// The oldest day whose holds are not all released and whose blocks are not handed back. `None` until
+    /// the engine has been told what day it is: a fresh one has no history, and a cursor starting at day
+    /// zero would walk days that predate it — and step over the day its own records are in on the way.
+    day: Option<u64>,
+    /// Slots already walked in this pass, so a round is bounded and the next resumes rather than
+    /// restarting.
+    at: usize,
+    /// Whether this pass has found anything still pointing into the day. A pass that finds nothing is what
+    /// says the day is empty.
+    found: bool,
+    /// Live index entries as of a pass that ended with holds still in the day. While that number has not
+    /// moved, nothing has been released, so walking again would offer the same voids a second time — and
+    /// each of those takes a slot and a lane place for the judge to refuse, which at a small index outruns
+    /// the commits and fills the pool with work that cannot succeed. So the sweep waits for the index to
+    /// move rather than spinning against it.
+    waiting_at: Option<usize>,
+}
+
+/// A hold the index could not take, on its way out of the engine. Named rather than returned as a bare
+/// `TxId` because what the caller has to do with it is not retry — there is nowhere for the hold to go,
+/// the table was sized for a declared maximum and that maximum has been passed — but tell the sequencer,
+/// which stops applying.
+#[derive(Debug, Clone, Copy)]
+pub struct NotStored {
+    pub hold: TxId,
 }
 
 /// The group as the store knows it. Membership is why the sequencer can tell a partial
@@ -180,7 +228,10 @@ impl PendingEngine {
         self.applied
     }
 
-    pub fn write(&mut self, effect: PendingEffect) {
+    /// `Err` is the one thing a write can fail at: an index that cannot take a new hold. Only a
+    /// `Create` inserts — a `Reduce` repoints an existing slot and a `Remove` frees one — so it is the
+    /// only variant that can report it.
+    pub fn write(&mut self, effect: PendingEffect) -> Result<(), NotStored> {
         self.applied += 1;
         match effect {
             PendingEffect::Create {
@@ -191,7 +242,7 @@ impl PendingEngine {
                 ledger,
                 budget,
             } => {
-                self.put(
+                let stored = self.put(
                     tx_id,
                     HoldData {
                         debit_account,
@@ -209,6 +260,9 @@ impl PendingEngine {
                     let state = self.budgets.entry(budget).or_default();
                     state.members += 1;
                     state.remaining += amount;
+                }
+                if !stored {
+                    return Err(NotStored { hold: tx_id });
                 }
             }
             // Nothing is read when the overlay still had the record: append-only needs the whole record
@@ -232,7 +286,7 @@ impl PendingEngine {
                 } else {
                     match self.read(pending_ref) {
                         Some(old) => old.amount,
-                        None => return,
+                        None => return Ok(()),
                     }
                 };
                 let hold = HoldData {
@@ -245,6 +299,7 @@ impl PendingEngine {
                     budget_members: 0,
                     budget_remaining: 0,
                 };
+                // A repoint, not an insert: the slot is already there, so this cannot overflow.
                 self.put(pending_ref, hold, false);
                 if let Some(state) = self.budgets.get_mut(&budget) {
                     state.remaining -= consumed;
@@ -260,13 +315,13 @@ impl PendingEngine {
                 let Self { index, records, .. } = self;
                 let mut verify = Self::verifier(records, pending_ref);
                 if index.remove(pending_ref, &mut verify).is_none() {
-                    return;
+                    return Ok(());
                 }
                 if budget.is_absent() {
-                    return;
+                    return Ok(());
                 }
                 let Some(state) = self.budgets.get_mut(&budget) else {
-                    return;
+                    return Ok(());
                 };
                 state.members = state.members.saturating_sub(1);
                 state.remaining -= released;
@@ -275,6 +330,7 @@ impl PendingEngine {
                 }
             }
         }
+        Ok(())
     }
 
     /// The maps are the engine's own, so their size is its to report; the gauges are where another
@@ -288,7 +344,7 @@ impl PendingEngine {
         buffer: &MapGauge,
         resident: &MapGauge,
     ) {
-        holds.publish(self.index.len(), self.index.slots());
+        holds.publish(self.index.live(), self.index.slots());
         budgets.publish(self.budgets.len(), self.budgets.capacity());
         let (buffered, in_memory, stored) = self.records.blocks();
         let (flush_window, resident_window) = self.records.windows();
@@ -302,11 +358,13 @@ impl PendingEngine {
     pub fn traffic(&self) -> LogTraffic {
         let (_, worst_cascade) = self.index.kick_stats();
         LogTraffic {
-            index_live: self.index.len(),
+            index_live: self.index.live(),
             index_slots: self.index.slots(),
             worst_cascade,
             ambiguous: self.index.ambiguous(),
             overflowed: self.overflowed,
+            segment: self.records.segment(),
+            sweeping: self.sweeping(),
             ..self.records.traffic()
         }
     }
@@ -340,21 +398,148 @@ impl PendingEngine {
     ///
     /// `fresh` is what lets the index check uniqueness: a hold the store has never held is the one moment
     /// a shared fingerprint can be noticed for free.
-    fn put(&mut self, key: TxId, hold: HoldData, fresh: bool) {
+    ///
+    /// False when the index could not take it. The counter and the caller's answer are set by this one
+    /// call, so the number a report prints and the news the sequencer acts on cannot disagree.
+    fn put(&mut self, key: TxId, hold: HoldData, fresh: bool) -> bool {
         let addr = self.records.append(key, &hold);
         let Self { index, records, .. } = self;
         if fresh {
             if index.insert_new(key, addr).is_err() {
                 // The table was sized for a maximum this has passed. Nothing here can fix it, and the
-                // hold is not written down — which is why the count is reported rather than swallowed.
+                // hold is not written down — so it is both counted, for the report, and handed back, so
+                // the sequencer can stop applying decisions it cannot store.
                 self.overflowed += 1;
-                return;
+                return false;
             }
         } else {
             let mut verify = Self::verifier(records, key);
             index.repoint(key, addr, &mut verify);
         }
         self.compact();
+        true
+    }
+
+    /// Moves the engine to a new day, and marks the day that has now run out for the sweep below.
+    ///
+    /// One clock reading per day, taken by whoever runs the loop and handed in — the engine keeps no clock
+    /// of its own, exactly as it keeps none for a lookup's `now`. A day rather than a finer unit because a
+    /// segment is what space is reclaimed in, and `grace_days` is what makes a whole-day granularity safe:
+    /// deletion lands between `retention` and `retention + grace`, so it is never early.
+    ///
+    /// A segment is the day a record was **written**, not the day its hold was created: a record gets its
+    /// address when the writeback buffer compacts it out, up to a flush window later. That only ever
+    /// delays expiry — a hold created at 23:59 and flushed after midnight is deleted with the next day's
+    /// segment — and delay is the safe direction. The flush window is an hour against a grace of a day, so
+    /// this rounding is inside the slack that is already paid for.
+    ///
+    /// Returns false when the day has not changed, so a caller may ask every round.
+    pub fn open_day(&mut self, day: u64, lifetime_days: u64) -> bool {
+        // Both of these are set even when the day has not moved, because a caller may ask every round and
+        // the first ask is where the engine learns them. Leaving the lifetime at zero until the day changed
+        // was a real defect: the sweep read "day zero has already run out", walked forward past the day its
+        // own records were about to land in, and then never came back to it.
+        self.lifetime_days = lifetime_days;
+        self.sweep
+            .day
+            .get_or_insert_with(|| day.saturating_sub(lifetime_days));
+        if day == self.today {
+            return false;
+        }
+        self.today = day;
+        self.records.open_day(day);
+        true
+    }
+
+    /// The next holds whose retention has run out, as the resolutions that release them. Bounded per call,
+    /// so a day's expiry is spread over the day rather than arriving as one burst — falling behind deletes
+    /// late, which is safe, so this is a capacity dial and not a correctness one.
+    ///
+    /// The survivors identify themselves: a record is alive exactly when the index points at it, so
+    /// scanning the index for addresses in the expiring segment finds them without reading a single dead
+    /// record. What the index cannot give is the key — a slot holds a fingerprint — so the records these
+    /// addresses name are read, which is needed anyway to name the two accounts the void moves between.
+    ///
+    /// A pass that goes all the way round finding nothing is what says the day is done: nothing points into
+    /// it, so its holds are all released and its blocks can be handed back. Until then the pass starts over,
+    /// which re-offers voids still in flight — harmless, because their ids are derived from the holds and
+    /// the judge refuses a second resolution of one already taken.
+    pub fn expiring(&mut self, want: usize, into: &mut Vec<Transfer>) {
+        let Some(segment) = self.expiring_segment() else {
+            return;
+        };
+        // The last pass left holds behind and nothing has been released since. Offering them again would be
+        // the same voids for the judge to refuse a second time.
+        if self.sweep.waiting_at == Some(self.index.live()) {
+            return;
+        }
+        self.expiring.clear();
+        let mut addrs = std::mem::take(&mut self.expiring);
+        self.sweep.at = self
+            .index
+            .addresses_in_segment(segment, self.sweep.at, want, &mut addrs);
+        self.sweep.found |= !addrs.is_empty();
+        for &addr in &addrs {
+            // Read through to the store rather than only from memory: a record the sweep declined to read
+            // is a hold it never expires, and its pending column would stay reserved for good.
+            let Some((key, hold)) = self.records.read_background(addr) else {
+                continue;
+            };
+            into.push(Transfer {
+                id: TxId::ledger_resolution_of(key),
+                pending_ref: key,
+                debit_account: hold.debit_account,
+                credit_account: hold.credit_account,
+                // A void releases whatever is left, so it names no amount — which is also what makes it
+                // safe to offer twice: the second is judged against a hold that is already gone.
+                amount: 0,
+                ledger: hold.ledger,
+                flags: TransferFlags::VOID_PENDING,
+            });
+        }
+        self.expiring = addrs;
+        if self.sweep.at < self.index.slots() {
+            return;
+        }
+        if self.sweep.found {
+            // Something is still there: those voids are in flight, or the judge refused them. Wait for the
+            // index to move before walking again — the day stays open, which is late rather than wrong.
+            self.sweep = Sweep {
+                day: self.sweep.day,
+                at: 0,
+                found: false,
+                waiting_at: Some(self.index.live()),
+            };
+            return;
+        }
+        // A whole pass found nothing pointing into the day, which is the one moment its blocks are known
+        // to be dead. Handing them back is the only place the store shrinks.
+        self.records.free_segment(segment);
+        self.sweep = Sweep {
+            day: self.sweep.day.map(|day| day + 1),
+            at: 0,
+            found: false,
+            waiting_at: None,
+        };
+    }
+
+    /// The segment being emptied, if a day has run out. Days are finished in order, so this is the oldest
+    /// unfinished one rather than whatever expired most recently.
+    fn expiring_segment(&self) -> Option<u8> {
+        let day = self.sweep.day?;
+        let expired_through = self.today.checked_sub(self.lifetime_days)?;
+        (day <= expired_through).then_some((day % SEGMENTS) as u8)
+    }
+
+    /// Whether a day is still waiting to be emptied. What says the sweep is keeping up.
+    pub fn sweeping(&self) -> bool {
+        self.expiring_segment().is_some()
+    }
+
+    /// Blocks handed back to the store, which is the only way it shrinks. Read from the log rather than
+    /// counted again here: it is the one that frees them.
+    pub fn freed_blocks(&self) -> u64 {
+        self.records.traffic().freed
     }
 
     fn read(&mut self, key: TxId) -> Option<HoldData> {
@@ -364,6 +549,24 @@ impl PendingEngine {
             index.addr_of(key, &mut verify)?
         };
         self.records.read(addr).map(|(_, hold)| hold)
+    }
+}
+
+/// Every test in this file is about what the engine does with a decision it *took*, so each one
+/// asserts the insert landed rather than ignoring the answer: a setup whose index silently overflowed
+/// would be a test about nothing. One place, because all four test modules need it.
+#[cfg(test)]
+mod test_support {
+    use super::{PendingEffect, PendingEngine};
+
+    pub trait Stored {
+        fn stored(&mut self, effect: PendingEffect);
+    }
+
+    impl Stored for PendingEngine {
+        fn stored(&mut self, effect: PendingEffect) {
+            self.write(effect).expect("the index took the hold");
+        }
     }
 }
 
@@ -385,6 +588,8 @@ mod tests {
         }
     }
 
+    use crate::engine::test_support::Stored;
+
     /// The decision blocks are written once buys: a partial resolution appends a new version and the
     /// index follows it, instead of a block being read, changed and written back. What the engine
     /// answers has to be the new remainder, and the old record has to still be sitting there — that
@@ -392,10 +597,10 @@ mod tests {
     #[test]
     fn a_partial_resolution_appends_a_version_rather_than_rewriting_one() {
         let mut engine = PendingEngine::default();
-        engine.write(create(TxId(9), 100, BudgetGroup::ABSENT));
+        engine.stored(create(TxId(9), 100, BudgetGroup::ABSENT));
         let (_, after_create) = (engine.records.blocks(), engine.records.appended());
 
-        engine.write(PendingEffect::Reduce {
+        engine.stored(PendingEffect::Reduce {
             pending_ref: TxId(9),
             debit_account: AccountId(1),
             credit_account: AccountId(2),
@@ -412,7 +617,7 @@ mod tests {
         );
         assert_eq!(engine.lookup(TxId(9)).map(|hold| hold.remaining), Some(40));
 
-        engine.write(PendingEffect::Reduce {
+        engine.stored(PendingEffect::Reduce {
             pending_ref: TxId(9),
             debit_account: AccountId(1),
             credit_account: AccountId(2),
@@ -425,7 +630,7 @@ mod tests {
         assert_eq!(engine.records.appended(), after_create + 2);
         assert_eq!(engine.lookup(TxId(9)).map(|hold| hold.remaining), Some(10));
 
-        engine.write(PendingEffect::Remove {
+        engine.stored(PendingEffect::Remove {
             pending_ref: TxId(9),
             budget: BudgetGroup::ABSENT,
             released: 10,
@@ -450,13 +655,13 @@ mod tests {
         let mut engine = PendingEngine::default();
         let members = RECORDS_PER_BLOCK + 3;
         for member in 0..members {
-            engine.write(create(TxId(member as u128 + 1), 10, group));
+            engine.stored(create(TxId(member as u128 + 1), 10, group));
         }
         let hold = engine.lookup(TxId(1)).expect("the first member");
         assert_eq!(hold.budget_members, members as u32);
         assert_eq!(hold.budget_remaining, members as Amount * 10);
 
-        engine.write(PendingEffect::Reduce {
+        engine.stored(PendingEffect::Reduce {
             pending_ref: TxId(1),
             debit_account: AccountId(1),
             credit_account: AccountId(2),
@@ -472,10 +677,31 @@ mod tests {
         assert_eq!(last.budget_remaining, members as Amount * 10 - 6);
         assert_eq!(last.budget_members, members as u32);
     }
+
+    /// The index does not grow, so an insert past its declared maximum has nowhere to go. It is named
+    /// back to the caller rather than absorbed, because a hold the log says exists and the store does not
+    /// have is not a number to report — it is news the sequencer has to stop on.
+    #[test]
+    fn a_hold_the_index_cannot_take_is_named_back_to_the_caller() {
+        let mut engine = PendingEngine::sized(8, 64, 64, Box::new(MemBlockStore::default()));
+        let mut refused = None;
+        for index in 0..256u128 {
+            if let Err(not_stored) = engine.write(create(TxId(index + 1), 10, BudgetGroup::ABSENT))
+            {
+                refused = Some(not_stored.hold);
+                break;
+            }
+        }
+        let refused = refused.expect("an index of eight slots cannot take 256 holds");
+        // The hold it names is the one that was lost, which is what a diagnostic has to point at.
+        assert!(engine.lookup(refused).is_none());
+        assert_eq!(engine.traffic().overflowed, 1);
+    }
 }
 
 #[cfg(test)]
 mod apply_tests {
+    use crate::engine::test_support::Stored;
     use ledger_base::{AccountId, BudgetGroup, TxId};
 
     use super::*;
@@ -500,16 +726,16 @@ mod apply_tests {
     fn applying_a_decision_never_reads_the_store() {
         let mut engine = PendingEngine::with_windows(1, 1);
         let cold = TxId(1);
-        engine.write(create(cold, 500));
+        engine.stored(create(cold, 500));
         let hold_amount = engine.lookup(cold).expect("created").amount;
 
         // Push it out of the buffer and into the store, then forget what that cost.
         for index in 0..RECORDS_PER_BLOCK * 3 {
-            engine.write(create(TxId(1_000 + index as u128), 10));
+            engine.stored(create(TxId(1_000 + index as u128), 10));
         }
         let before = engine.traffic().apply_store_reads;
 
-        engine.write(PendingEffect::Reduce {
+        engine.stored(PendingEffect::Reduce {
             pending_ref: cold,
             debit_account: AccountId(1),
             credit_account: AccountId(2),
@@ -519,7 +745,7 @@ mod apply_tests {
             ledger: 1,
             budget: BudgetGroup::ABSENT,
         });
-        engine.write(PendingEffect::Remove {
+        engine.stored(PendingEffect::Remove {
             pending_ref: cold,
             budget: BudgetGroup::ABSENT,
             released: 300,
@@ -539,14 +765,14 @@ mod apply_tests {
     fn a_decision_without_the_record_falls_back_to_reading_it() {
         let mut engine = PendingEngine::with_windows(1, 1);
         let cold = TxId(2);
-        engine.write(create(cold, 500));
+        engine.stored(create(cold, 500));
         for index in 0..RECORDS_PER_BLOCK * 3 {
-            engine.write(create(TxId(2_000 + index as u128), 10));
+            engine.stored(create(TxId(2_000 + index as u128), 10));
         }
         let before = engine.traffic().apply_store_reads;
 
         // No original size supplied, which is what sends the engine to the record it already has.
-        engine.write(PendingEffect::Reduce {
+        engine.stored(PendingEffect::Reduce {
             pending_ref: cold,
             debit_account: AccountId(1),
             credit_account: AccountId(2),
@@ -573,11 +799,11 @@ mod apply_tests {
         // lands in the store and stays readable, until two blocks' worth of later survivors push it out.
         let mut engine = PendingEngine::with_windows(1, 2);
         let survivor = TxId(7);
-        engine.write(create(survivor, 500));
+        engine.stored(create(survivor, 500));
         // Enough later holds to compact the survivor's block out of the buffer, but not enough to fill
         // residency: three blocks of survivors would, so two is the most that can be asked for here.
         for index in 0..RECORDS_PER_BLOCK * 2 {
-            engine.write(create(TxId(1_000 + index as u128), 10));
+            engine.stored(create(TxId(1_000 + index as u128), 10));
         }
 
         let carried = engine.traffic().flushed;
@@ -600,7 +826,7 @@ mod apply_tests {
         // Now push it past residency. Its content is on the store, so nothing is lost — but answering
         // for it is an IO from here on, which is exactly what `left_memory` counts.
         for index in 0..RECORDS_PER_BLOCK * 6 {
-            engine.write(create(TxId(9_000 + index as u128), 10));
+            engine.stored(create(TxId(9_000 + index as u128), 10));
         }
         assert!(
             engine.traffic().left_memory > 0,
@@ -617,6 +843,7 @@ mod apply_tests {
 
 #[cfg(test)]
 mod buffer_tests {
+    use crate::engine::test_support::Stored;
     use ledger_base::{AccountId, BudgetGroup, TxId};
 
     use super::*;
@@ -650,17 +877,17 @@ mod buffer_tests {
         let mut engine = PendingEngine::with_windows(1, 1);
         let holds = RECORDS_PER_BLOCK;
         for index in 0..holds {
-            engine.write(create(TxId(index as u128 + 1), 10));
+            engine.stored(create(TxId(index as u128 + 1), 10));
         }
         // Every one of them resolved while still buffered.
         for index in 0..holds {
             let key = TxId(index as u128 + 1);
-            engine.write(resolve(key, 10));
+            engine.stored(resolve(key, 10));
         }
         // One more record starts a second block, which is what puts the first one over the window.
         // Only that far: filling the second block too would compact live records and the count below
         // would be measuring those instead.
-        engine.write(create(TxId(1_000_000), 10));
+        engine.stored(create(TxId(1_000_000), 10));
         let traffic = engine.traffic();
         assert!(
             traffic.died_in_buffer >= holds as u64,
@@ -680,11 +907,11 @@ mod buffer_tests {
     fn a_survivor_is_carried_on_and_still_found_at_its_new_address() {
         let mut engine = PendingEngine::with_windows(1, 1);
         let survivor = TxId(7);
-        engine.write(create(survivor, 500));
+        engine.stored(create(survivor, 500));
 
         // Fill two blocks past it, so its block is compacted out.
         for index in 0..RECORDS_PER_BLOCK * 2 + 2 {
-            engine.write(create(TxId(1_000 + index as u128), 10));
+            engine.stored(create(TxId(1_000 + index as u128), 10));
         }
         let after = engine
             .lookup(survivor)
@@ -696,7 +923,7 @@ mod buffer_tests {
         );
 
         // And it is still the hold the index says it is, at whatever address compaction gave it.
-        engine.write(resolve(survivor, 500));
+        engine.stored(resolve(survivor, 500));
         assert!(
             engine.lookup(survivor).is_none(),
             "the survivor was not resolved"
@@ -710,9 +937,9 @@ mod buffer_tests {
     fn a_superseded_version_is_dropped_without_being_tracked() {
         let mut engine = PendingEngine::with_windows(1, 1);
         let hold = TxId(11);
-        engine.write(create(hold, 100));
+        engine.stored(create(hold, 100));
         let hold_amount = engine.lookup(hold).expect("created").amount;
-        engine.write(PendingEffect::Reduce {
+        engine.stored(PendingEffect::Reduce {
             pending_ref: hold,
             debit_account: AccountId(1),
             credit_account: AccountId(2),
@@ -724,7 +951,7 @@ mod buffer_tests {
         });
 
         for index in 0..RECORDS_PER_BLOCK * 2 + 2 {
-            engine.write(create(TxId(2_000 + index as u128), 10));
+            engine.stored(create(TxId(2_000 + index as u128), 10));
         }
         assert_eq!(engine.lookup(hold).map(|found| found.remaining), Some(60));
         let traffic = engine.traffic();
@@ -737,6 +964,7 @@ mod buffer_tests {
 
 #[cfg(test)]
 mod fetch_tests {
+    use crate::engine::test_support::Stored;
     use ledger_base::{AccountId, BudgetGroup, TxId};
 
     use super::*;
@@ -756,7 +984,7 @@ mod fetch_tests {
     /// Pushes enough records through that everything written before is compacted into the store.
     fn cool(engine: &mut PendingEngine, from: u128) {
         for index in 0..RECORDS_PER_BLOCK * 3 {
-            engine.write(create(TxId(from + index as u128), 10));
+            engine.stored(create(TxId(from + index as u128), 10));
         }
     }
 
@@ -772,7 +1000,7 @@ mod fetch_tests {
     #[test]
     fn a_buffered_hold_is_answered_without_a_fetch() {
         let mut engine = PendingEngine::with_windows(8, 8);
-        engine.write(create(TxId(3), 100));
+        engine.stored(create(TxId(3), 100));
         let found = answered(engine.begin_lookup(1, TxId(3), 0));
         assert_eq!(found.map(|hold| hold.remaining), Some(100));
         assert_eq!(engine.inflight(), 0, "a buffered hold should need no fetch");
@@ -784,7 +1012,7 @@ mod fetch_tests {
     fn a_cold_hold_is_fetched_and_answered_when_it_completes() {
         let mut engine = PendingEngine::with_windows(1, 1);
         let cold = TxId(1);
-        engine.write(create(cold, 250));
+        engine.stored(create(cold, 250));
         cool(&mut engine, 1_000);
 
         match engine.begin_lookup(7, cold, 0) {
@@ -808,5 +1036,236 @@ mod fetch_tests {
         cool(&mut engine, 1);
         assert!(answered(engine.begin_lookup(1, TxId(999_999), 0)).is_none());
         assert_eq!(engine.inflight(), 0);
+    }
+}
+
+/// Retention as the engine keeps it: a segment is a day, a day that runs out is emptied by releasing
+/// whatever survived it, and the blocks go back once nothing points into them.
+#[cfg(test)]
+mod expiry_tests {
+    use crate::block::RECORDS_PER_BLOCK;
+    use crate::engine::test_support::Stored;
+    use ledger_base::{AccountId, BudgetGroup, TxId};
+
+    use super::*;
+
+    /// One day of promised retention plus one of grace.
+    const LIFETIME: u64 = 2;
+
+    fn create(tx_id: TxId, amount: Amount) -> PendingEffect {
+        PendingEffect::Create {
+            tx_id,
+            debit_account: AccountId(1),
+            credit_account: AccountId(2),
+            amount,
+            ledger: 1,
+            budget: BudgetGroup::ABSENT,
+        }
+    }
+
+    /// A record belongs to a day only once the writeback buffer has compacted it out, so a test about what
+    /// day a record belongs to writes more than a block's worth. What is left in the open block has no
+    /// segment yet, which is correct: an unwritten record is not one retention has reached.
+    fn written_on_day_zero() -> (PendingEngine, usize) {
+        let mut engine = PendingEngine::with_windows(1, 64);
+        let holds = RECORDS_PER_BLOCK * 2 + 1;
+        for id in 1..=holds {
+            engine.stored(create(TxId(id as u128), 10));
+        }
+        (engine, holds - holds % RECORDS_PER_BLOCK)
+    }
+
+    fn offered(engine: &mut PendingEngine, want: usize) -> Vec<Transfer> {
+        let mut voids = Vec::new();
+        engine.expiring(want, &mut voids);
+        voids
+    }
+
+    /// What the sequencer does with an offered void once it commits: the hold is gone and its index entry
+    /// with it. Nothing advances without this, which is the point — a day is finished when its holds are
+    /// actually released, not when they have been offered.
+    fn commit(engine: &mut PendingEngine, voids: &[Transfer]) {
+        for void in voids {
+            engine.stored(PendingEffect::Remove {
+                pending_ref: void.pending_ref,
+                budget: BudgetGroup::ABSENT,
+                released: 10,
+            });
+        }
+    }
+
+    /// Offers and commits until the day is done, answering how many holds were released and in how many
+    /// rounds. Bounded, so a sweep that never converged fails rather than hanging.
+    fn empty_the_day(engine: &mut PendingEngine, per_round: usize) -> (usize, usize) {
+        let mut released = 0;
+        let mut rounds = 0;
+        while engine.sweeping() {
+            let voids = offered(engine, per_round);
+            assert!(voids.len() <= per_round, "a round offered more than asked");
+            commit(engine, &voids);
+            released += voids.len();
+            rounds += 1;
+            assert!(rounds < 100_000, "the sweep never finished");
+        }
+        (released, rounds)
+    }
+
+    /// A day is a segment, and moving to a new day moves where records are written. Block numbers carry on
+    /// across the boundary rather than restarting, which is what keeps an address unique on the block field
+    /// alone — everything that finds a block by number then needs no notion of segments.
+    #[test]
+    fn a_new_day_is_a_new_segment_and_records_stay_findable_across_it() {
+        let mut engine = PendingEngine::with_windows(1, 64);
+        engine.stored(create(TxId(1), 100));
+        let first = engine.records.segment();
+
+        assert!(engine.open_day(1, LIFETIME));
+        assert_ne!(engine.records.segment(), first, "the day did not move");
+        assert!(!engine.open_day(1, LIFETIME), "the same day opened twice");
+
+        engine.stored(create(TxId(2), 100));
+        assert!(
+            engine.lookup(TxId(1)).is_some(),
+            "yesterday's hold was lost"
+        );
+        assert!(engine.lookup(TxId(2)).is_some(), "today's hold was lost");
+    }
+
+    /// The edge that matters. Deleting late costs space; deleting early refuses a resolution that was still
+    /// entitled to arrive, which is a wrong answer — so nothing is offered until the promise and its grace
+    /// have both passed.
+    #[test]
+    fn nothing_is_released_before_the_promise_and_its_grace_have_passed() {
+        let (mut engine, _) = written_on_day_zero();
+        for day in 1..LIFETIME {
+            engine.open_day(day, LIFETIME);
+            assert!(!engine.sweeping(), "day {day} thought a day had run out");
+            assert!(
+                offered(&mut engine, 1024).is_empty(),
+                "day {day} released a hold whose lifetime had not run out"
+            );
+        }
+    }
+
+    /// Once it has, every survivor of that day is offered as a void naming both its accounts — which is why
+    /// the sweep reads the record rather than working from the index alone. The id is derived from the hold,
+    /// so two leaders propose the same one and the second is a duplicate rather than a second void.
+    #[test]
+    fn an_outlived_hold_is_offered_as_a_void_with_a_derived_id() {
+        let (mut engine, written) = written_on_day_zero();
+        engine.open_day(LIFETIME, LIFETIME);
+
+        let voids = offered(&mut engine, 1024);
+        assert_eq!(
+            voids.len(),
+            written,
+            "not every survivor of the day was offered"
+        );
+        let void = voids[0];
+        assert_eq!(void.id, TxId::ledger_resolution_of(void.pending_ref));
+        assert!(void.id.is_ledger_origin());
+        assert_eq!(void.debit_account, AccountId(1));
+        assert_eq!(void.credit_account, AccountId(2));
+        // A void releases whatever is left, so it names no amount — which is also what makes offering the
+        // same one twice harmless.
+        assert_eq!(void.amount, 0);
+        assert_eq!(void.flags, TransferFlags::VOID_PENDING);
+    }
+
+    /// A hold resolved before its retention ran out is not offered: the index no longer points at its
+    /// record, which is the same test compaction uses. The dead are never read.
+    #[test]
+    fn a_resolved_hold_is_never_offered() {
+        let (mut engine, written) = written_on_day_zero();
+        engine.stored(PendingEffect::Remove {
+            pending_ref: TxId(1),
+            budget: BudgetGroup::ABSENT,
+            released: 10,
+        });
+        engine.open_day(LIFETIME, LIFETIME);
+
+        let voids = offered(&mut engine, 1024);
+        assert_eq!(voids.len(), written - 1, "the resolved hold was offered");
+        assert!(
+            voids.iter().all(|void| void.pending_ref != TxId(1)),
+            "the resolved hold was offered"
+        );
+    }
+
+    /// A day's holds are offered a bounded number at a time and the sweep resumes where it stopped, so a
+    /// day's expiry spreads over the day instead of arriving as one burst. Falling behind releases late,
+    /// which is safe — so this is a capacity dial and not a correctness one.
+    #[test]
+    fn a_days_holds_are_released_a_bounded_number_at_a_time() {
+        let (mut engine, written) = written_on_day_zero();
+        engine.open_day(LIFETIME, LIFETIME);
+
+        let per_round = 8;
+        let (released, rounds) = empty_the_day(&mut engine, per_round);
+        assert_eq!(released, written, "the sweep lost holds along the way");
+        assert!(
+            rounds > written / per_round,
+            "the day came in too few rounds"
+        );
+    }
+
+    /// The blocks go back only once nothing points into the day, which is the one moment they are known to
+    /// be dead. This is the only way the store shrinks — records are written once and never rewritten — so
+    /// without it a run's total is holds created rather than holds alive.
+    #[test]
+    fn a_days_blocks_go_back_once_nothing_points_into_it() {
+        let (mut engine, written) = written_on_day_zero();
+        assert_eq!(engine.freed_blocks(), 0, "blocks went back too early");
+
+        // Counted after the day has moved, because moving it seals the open block: a block whose records
+        // straddled two segments could be freed by neither day.
+        engine.open_day(LIFETIME, LIFETIME);
+        let blocks = engine.records.blocks().2;
+        assert!(blocks > 0, "the test wrote no blocks to free");
+
+        let (released, _) = empty_the_day(&mut engine, 1024);
+
+        assert_eq!(released, written);
+        assert_eq!(
+            engine.freed_blocks(),
+            blocks as u64,
+            "the day emptied and its blocks did not go back"
+        );
+        assert_eq!(engine.records.blocks().2, 0, "the store did not shrink");
+    }
+
+    /// A day is not finished while any of its holds is still there, and a hold nothing releases keeps its
+    /// day open for ever rather than being skipped. An earlier version restarted the walk at whatever had
+    /// just expired, so a day still being walked when the next arrived was abandoned — and its holds were
+    /// never released at all.
+    #[test]
+    fn a_day_with_a_hold_left_is_never_finished_or_skipped() {
+        let (mut engine, _) = written_on_day_zero();
+        engine.open_day(LIFETIME, LIFETIME);
+
+        // Offer and commit everything but one, then let several more days arrive.
+        let voids = offered(&mut engine, 1024);
+        let (keep, release) = voids.split_first().expect("voids to commit");
+        commit(&mut engine, release);
+        for day in LIFETIME + 1..LIFETIME + 4 {
+            engine.open_day(day, LIFETIME);
+            let again = offered(&mut engine, 1024);
+            assert!(
+                again
+                    .iter()
+                    .all(|void| void.pending_ref == keep.pending_ref),
+                "a later day was worked on while an earlier one still had a hold"
+            );
+        }
+        assert!(engine.sweeping(), "the unfinished day was abandoned");
+        assert_eq!(
+            engine.freed_blocks(),
+            0,
+            "blocks went back with a hold left"
+        );
+
+        commit(&mut engine, std::slice::from_ref(keep));
+        empty_the_day(&mut engine, 1024);
+        assert!(engine.freed_blocks() > 0, "the blocks never went back");
     }
 }

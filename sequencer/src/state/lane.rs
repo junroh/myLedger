@@ -37,10 +37,6 @@ impl LaneState {
     /// Capped so the counter cannot wrap and under-report, which would break lane ordering.
     pub const MAX_PENDING_REPLIES: u16 = u16::MAX;
 
-    /// The seq of a request that keeps no place in the lane order. Counters start at 1, so zero
-    /// cannot collide with an issued seq.
-    pub const UNORDERED: Seq = 0;
-
     pub const fn last_seq(&self) -> Seq {
         self.last_seq
     }

@@ -39,7 +39,7 @@ group. The two meet only where a chain resolves a group, which is the coverage c
 | **quarantine** | isolating one lane after a gap. | `LaneState::quarantine`, `Safety` |
 | **fail-stop** | halting the sequencer when the fault is not confined to one lane. | `Safety::fail_stop`, `LedgerError::FailStop` |
 | **fence** | an ordering token on the pending path for a request that needs no hold data. | `PendingFence`, `Metrics::fences` |
-| **order exemption** | a request whose debit account is unconstrained: it keeps no place in the lane order, so it never fences and nothing queues behind it. One clause, because the lane exists to protect a balance. A resolution is included, and what it gives up is covered by **stale answer**. | `LaneState::UNORDERED`, `WorkItem::keeps_lane_place`, `Metrics::order_exempt` |
+| **order exemption** | a request whose debit account is unconstrained: it keeps no place in the lane order, so it never fences and nothing queues behind it. One clause, because the lane exists to protect a balance. A resolution is included, and what it gives up is covered by **stale answer**. | `ledger_base::UNORDERED`, `WorkItem::keeps_lane_place`, `Metrics::order_exempt` |
 
 ## The judging view
 
@@ -80,10 +80,17 @@ neither mentions any of these.
 |---|---|---|
 | **inline contract** | the half of the pending port answered on the caller's thread, immediately, and unable to refuse. It is the overlay and nothing else: the sequencer's own decisions, which need no round trip because they are already here. | `PendingOverlay` |
 | **queued contract** | the other half: send and move on, a full queue is backpressure, replies come back in each lane's seq order. | `PendingPort`, `PendingCommand`, `PendingReply` |
+| **notice** | the engine speaking first: news that answers no command and names no request, so it travels its own channel rather than as a reply. Two exist: a committed hold the index could not take, and a hold that outlived its retention. | `PendingNotice`, `PendingPort::notices` |
 | **hold index** | where a hold is, by transaction id. Fingerprints and addresses only, so a shared fingerprint has to be told apart by reading a record — and the index says when that is necessary. | `HoldTable`, `Candidates` |
 | **ambiguity bit** | a slot saying its fingerprint is shared with another live key in the same bucket. Set when the second of the pair is inserted, which is the one moment it can be noticed for free. | `insert_new`, `HoldTable::ambiguous` |
 | **cascade cap** | the most relocations one insert may make. A hop is a random read and an insert is on the apply path, so this is a latency budget rather than a dial. | `MAX_HOPS` |
-| **declared maximum** | the live holds the configuration says the worst case reaches: arrivals x worst-case survivor fraction x retention. The index is sized from it and never grows. | `LOAD_TARGET`, `DEFAULT_SLOTS` |
+| **declared maximum** | the live holds the configuration says the worst case reaches: arrivals x worst-case survivor fraction x retention. The index is sized from it and never grows, so passing it is a hold that cannot be stored. | `LOAD_TARGET`, `DEFAULT_SLOTS`, `PendingCapacity::declared_maximum` |
+| **not stored** | a committed hold the index could not take. The log says it exists, so the pending column it reserved can never come back down — this node's state has stopped following the log, and the apply path seals. | `NotStored`, `PendingNotice::HoldNotStored` |
+| **segment** | a day of records, and the unit space is reclaimed in. Its number is the day modulo the segments an address has room for, so the day itself needs no storage. | `BlockAddr::segment`, `RecordLog::open_day`, `SEGMENTS` |
+| **retention** | how long a hold's record is kept: a promise to the customer, so expiry rounds late and never early. | `PendingCapacity::retention_days` |
+| **grace** | days of slack added before deletion. The one number covering every source of *early* deletion — a segment's coarseness, a clock jumping forward, a sweep behind — priced in days of capacity. | `PendingCapacity::grace_days`, `lifetime_days` |
+| **expiry** | releasing what is left of a hold whose retention ran out. The engine proposes it and the sequencer judges it, because a client's resolution may be in flight for the same hold. | `PendingNotice::HoldExpired`, `PendingEngine::expiring`, `Reactor::admit_expiry` |
+| **ledger-origin id** | a transaction the ledger made up rather than a client: the top bit of the id. Derived from the hold it resolves, so two leaders propose the same one — which is why clients are refused the bit, and why no stage needs a flag saying whose work a request was. | `TxId::ledger_resolution_of`, `is_ledger_origin`, `LedgerError::ReservedTransactionId` |
 | **record** | what a hold is, on a block: its key and the hold, packed and little-endian. | `encode`, `decode`, `RECORD_BYTES` |
 | **block** | what one read fetches, and so the unit the speed contract is written against. Written once, never rewritten. | `BLOCK_BYTES`, `BlockStore` |
 | **address** | segment, block, and which record of the block, in the bits an index slot has spare. | `BlockAddr` |

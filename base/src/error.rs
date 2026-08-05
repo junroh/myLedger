@@ -3,6 +3,8 @@ use crate::ids::{AccountId, Amount, Seq, TxId};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LedgerError {
     InvalidFlags,
+    /// The top bit of a transaction id is reserved for the resolutions the ledger proposes itself.
+    ReservedTransactionId,
     InvalidAmount,
     SameAccount,
     UnknownAccount(AccountId),
@@ -45,6 +47,7 @@ impl LedgerError {
     pub const fn name(&self) -> &'static str {
         match self {
             Self::InvalidFlags => "InvalidFlags",
+            Self::ReservedTransactionId => "ReservedTransactionId",
             Self::InvalidAmount => "InvalidAmount",
             Self::SameAccount => "SameAccount",
             Self::UnknownAccount(_) => "UnknownAccount",

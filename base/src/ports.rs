@@ -7,7 +7,7 @@ pub use account::{AccountFlags, AccountPort, AccountRecord, LedgerTotals};
 pub use idempotency::{IdemReply, IdemRequest, IdemVerdict, IdempotencyPort};
 pub use pending::{
     HoldData, HoldView, OverlayState, PendingCommand, PendingEffect, PendingFence, PendingLookup,
-    PendingOverlay, PendingPort, PendingReply,
+    PendingNotice, PendingOverlay, PendingPort, PendingReply,
 };
 pub use raft::{RaftCommit, RaftOutcome, RaftPort, RaftProposal};
 

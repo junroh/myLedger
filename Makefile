@@ -7,7 +7,8 @@ help:
 	@echo "  make sim ARGS='...' - cargo run --release -p ledgersim -- <args>"
 	@echo "  make fio-hold      - cargo run --release -p ledgerfio -- run --workload hold-settle --duration 3s --accounts 100000"
 	@echo "  make sim-check     - cargo run --release -p ledgersim -- check --seeds 16"
-	test-all:
+
+test-all:
 	cargo test --workspace --quiet
 
 fio:

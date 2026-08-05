@@ -1,22 +1,23 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ledger_base::ports::HoldData;
 use ledger_base::ports::{
-    OverlayState, PendingCommand, PendingEffect, PendingLookup, PendingOverlay, PendingPort,
-    PendingReply,
+    OverlayState, PendingCommand, PendingEffect, PendingLookup, PendingNotice, PendingOverlay,
+    PendingPort, PendingReply,
 };
 use ledger_base::BudgetGroup;
 use ledger_base::{
     channel, Amount, Consumer, Footprint, FxHashMap, LedgerError, MapGauge, Prng, Producer,
-    StagedProducer, TxId,
+    StagedProducer, Transfer, TxId,
 };
 use ledger_stubkit::{IdleBackoff, LatencyRange, WorkerThread};
 
 use crate::block::{
     BlockAddr, BlockStore, LatencyBlockStore, LogTraffic, MemBlockStore, BLOCK_BYTES,
-    RECORDS_PER_BLOCK,
+    RECORDS_PER_BLOCK, SEGMENTS,
 };
 use crate::engine::{BudgetState, PendingEngine, Started};
 use crate::index::{LOAD_TARGET, SLOT_BYTES};
@@ -53,6 +54,44 @@ pub struct MemoryPendingConfig {
     /// The most the index may take. A configuration whose declared worst case needs more than this is
     /// refused at the start rather than discovered as an allocation nobody planned.
     pub index_budget_bytes: usize,
+    /// Expiry voids offered per round, so a day's worth spreads over the day instead of arriving as one
+    /// burst that competes with live traffic. Falling behind deletes late, which is safe, so this trades
+    /// promptness for headroom rather than correctness for speed.
+    pub expiry_per_round: usize,
+}
+
+/// Where the engine gets the day retention is measured in.
+///
+/// Wall time rather than the monotonic clock the rest of the engine runs on: retention is a promise in
+/// calendar terms and has to survive a restart, which an origin-relative clock cannot do. Read to the day,
+/// so a clock that drifts by minutes changes nothing and one that jumps forward is absorbed by
+/// `grace_days`.
+///
+/// Injectable for the same reason `Clock` is: a retention window is measured in days, and a test or a
+/// simulation that could only reach the end of one by waiting would never reach it at all.
+#[derive(Clone)]
+pub enum DaySource {
+    WallClock,
+    /// Moved by hand. Shared, so the caller advances it while the worker reads it.
+    Fixed(Arc<AtomicU64>),
+}
+
+impl DaySource {
+    /// A day source the caller can move, and the handle to move it with.
+    pub fn manual(day: u64) -> (Self, Arc<AtomicU64>) {
+        let shared = Arc::new(AtomicU64::new(day));
+        (Self::Fixed(Arc::clone(&shared)), shared)
+    }
+
+    fn today(&self) -> u64 {
+        match self {
+            Self::WallClock => SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|since| since.as_secs() / 86_400)
+                .unwrap_or(0),
+            Self::Fixed(day) => day.load(Ordering::Relaxed),
+        }
+    }
 }
 
 /// How the block store behaves. Zero base latency is the exact store — memory, no delay — which is what
@@ -96,7 +135,19 @@ pub struct PendingCapacity {
     /// The share of a day's transfers that are still unresolved when the retention window ends — the
     /// worst case, not the expected one.
     pub worst_survivor_share: f64,
+    /// How long a hold's record is kept. A promise to the customer with two edges: keeping it longer
+    /// breaks the deletion promise, and deleting it sooner refuses a resolution that was still entitled
+    /// to arrive. The second is a wrong answer, so expiry errs late — see `grace_days`.
     pub retention_days: u64,
+    /// Days of slack added before a record is deleted, so deletion is never early.
+    ///
+    /// Records are deleted a whole segment at a time and a segment is a day, so a hold created at
+    /// 23:59:59 shares its segment with one created at 00:00:00. Without slack the younger one would be
+    /// deleted a day short of its retention. One day of slack costs a day of capacity — the index and
+    /// the store are sized for `retention + grace` — and buys away every source of *early* deletion at
+    /// once: the segment's own coarseness, a wall clock jumping forward, and a sweep that has not run
+    /// yet. Raising it is the answer to any of them; the price is linear and only ever space.
+    pub grace_days: u64,
     /// The share of a day's transfers still unresolved when their block reaches the end of the flush
     /// window. Larger than `worst_survivor_share`, because a hold alive after thirty-two days was alive
     /// after an hour. A run measures the same quantity as `died in buffer`, so the declared value is
@@ -120,6 +171,7 @@ impl Default for PendingCapacity {
             daily_arrivals: 1_000_000,
             worst_survivor_share: 0.5,
             retention_days: 2,
+            grace_days: 1,
             survives_flush_window: 0.5,
             flush_window_hours: 1,
             residency_hours: 24,
@@ -128,9 +180,22 @@ impl Default for PendingCapacity {
 }
 
 impl PendingCapacity {
+    /// Days a record may live: what was promised, plus the slack that keeps deletion from being early.
+    /// Every size that follows from a lifetime uses this rather than `retention_days` — the index sized
+    /// for the promise alone would be a day short of what the grace lets live, and the declared maximum
+    /// would go back to being a hope.
+    pub fn lifetime_days(&self) -> u64 {
+        self.retention_days + self.grace_days
+    }
+
+    /// Segments live at once: one per day of lifetime, plus the day being filled.
+    pub fn live_segments(&self) -> u64 {
+        self.lifetime_days() + 1
+    }
+
     /// Holds alive at once in the worst case the configuration declares.
     pub fn declared_maximum(&self) -> u64 {
-        (self.daily_arrivals as f64 * self.worst_survivor_share) as u64 * self.retention_days
+        (self.daily_arrivals as f64 * self.worst_survivor_share) as u64 * self.lifetime_days()
     }
 
     /// Slots the index needs to hold that maximum at the load factor the cascade was measured against.
@@ -177,9 +242,19 @@ impl MemoryPendingConfig {
             && capacity.survives_flush_window >= capacity.worst_survivor_share
             && capacity.survives_flush_window <= 1.0
             && capacity.flush_window_hours > 0
+            // Deletion is a whole segment at a time and a segment is a day, so without slack the
+            // youngest hold in a segment would be deleted a day short of the retention it was promised.
+            && capacity.grace_days > 0
+            // A segment's number is its day modulo the segments available, so a lifetime that needs
+            // more of them than exist would give two live days one number, and expiry would delete the
+            // wrong day's records. Refused here rather than discovered as lost holds.
+            && capacity.live_segments() <= SEGMENTS
             // Residency shorter than the flush window would mean records leaving memory before they are
             // written, which is not a window at all.
             && capacity.residency_hours >= capacity.flush_window_hours
+            // Nor longer than a record is allowed to exist: keeping one in memory past the day its blocks
+            // are handed back would leave residency answering from a block the store no longer has.
+            && capacity.residency_hours <= capacity.lifetime_days() * 24
             && capacity.slots() * SLOT_BYTES <= self.index_budget_bytes;
         if sane {
             Ok(())
@@ -201,6 +276,7 @@ impl Default for MemoryPendingConfig {
             eviction_per_round: 4096,
             capacity: PendingCapacity::default(),
             index_budget_bytes: 1 << 30,
+            expiry_per_round: 64,
             store: StoreModel {
                 queue_depth: 128,
                 ..StoreModel::default()
@@ -209,12 +285,19 @@ impl Default for MemoryPendingConfig {
     }
 }
 
+/// Depth of the notice queue. Small on purpose: a notice is rare, and the worker latches one it
+/// cannot hand over, so depth is promptness rather than safety.
+const NOTICE_QUEUE: usize = 64;
+
 /// In-memory tier of the pending engine: it stores what the sequencer committed and
 /// provides what a settle or void asks for, and judges nothing. The disk tier for holds
 /// that outlive memory is not built yet.
 pub struct MemoryPending {
     commands: Producer<PendingCommand>,
     results: Consumer<PendingReply>,
+    /// What the engine says without being asked. A queue of its own, because a notice answers no
+    /// command and must not sit behind — or delay — a reply that a request is waiting for.
+    notices: Consumer<PendingNotice>,
     /// Read inline, on the caller's own thread.
     overlay: HoldOverlay,
     /// What the store is holding, published by the worker because the store lives on its thread.
@@ -231,6 +314,7 @@ struct TrafficGauge {
     appended: AtomicU64,
     died_in_buffer: AtomicU64,
     flushed: AtomicU64,
+    freed: AtomicU64,
     left_memory: AtomicU64,
     buffer_reads: AtomicU64,
     resident_reads: AtomicU64,
@@ -242,6 +326,8 @@ struct TrafficGauge {
     worst_cascade: AtomicU64,
     ambiguous: AtomicU64,
     overflowed: AtomicU64,
+    segment: AtomicU64,
+    sweeping: AtomicBool,
 }
 
 impl TrafficGauge {
@@ -250,6 +336,7 @@ impl TrafficGauge {
         self.died_in_buffer
             .store(traffic.died_in_buffer, Ordering::Relaxed);
         self.flushed.store(traffic.flushed, Ordering::Relaxed);
+        self.freed.store(traffic.freed, Ordering::Relaxed);
         self.left_memory
             .store(traffic.left_memory, Ordering::Relaxed);
         self.buffer_reads
@@ -270,6 +357,9 @@ impl TrafficGauge {
             .store(u64::from(traffic.worst_cascade), Ordering::Relaxed);
         self.ambiguous.store(traffic.ambiguous, Ordering::Relaxed);
         self.overflowed.store(traffic.overflowed, Ordering::Relaxed);
+        self.segment
+            .store(u64::from(traffic.segment), Ordering::Relaxed);
+        self.sweeping.store(traffic.sweeping, Ordering::Relaxed);
     }
 
     fn read(&self) -> LogTraffic {
@@ -277,6 +367,7 @@ impl TrafficGauge {
             appended: self.appended.load(Ordering::Relaxed),
             died_in_buffer: self.died_in_buffer.load(Ordering::Relaxed),
             flushed: self.flushed.load(Ordering::Relaxed),
+            freed: self.freed.load(Ordering::Relaxed),
             left_memory: self.left_memory.load(Ordering::Relaxed),
             buffer_reads: self.buffer_reads.load(Ordering::Relaxed),
             resident_reads: self.resident_reads.load(Ordering::Relaxed),
@@ -288,6 +379,8 @@ impl TrafficGauge {
             worst_cascade: self.worst_cascade.load(Ordering::Relaxed) as u32,
             ambiguous: self.ambiguous.load(Ordering::Relaxed),
             overflowed: self.overflowed.load(Ordering::Relaxed),
+            segment: self.segment.load(Ordering::Relaxed) as u8,
+            sweeping: self.sweeping.load(Ordering::Relaxed),
         }
     }
 }
@@ -353,9 +446,20 @@ impl MemoryPending {
     /// `Reactor::new` does — the sizes here are derived from declared inputs, so an incoherent
     /// declaration has to be an error at the start rather than a window nobody meant.
     pub fn start(config: MemoryPendingConfig) -> Result<Self, LedgerError> {
+        Self::start_with_days(config, DaySource::WallClock)
+    }
+
+    /// The same, with the day handed in. A retention window is measured in days, so a test or a simulation
+    /// that had to wait for one to pass would never exercise expiry at all — the same reason `Reactor`
+    /// takes a `Clock`.
+    pub fn start_with_days(
+        config: MemoryPendingConfig,
+        days: DaySource,
+    ) -> Result<Self, LedgerError> {
         config.validate()?;
         let (commands, command_rx) = channel(config.queue_capacity);
         let (result_tx, results) = channel(config.queue_capacity);
+        let (notice_tx, notices) = channel(NOTICE_QUEUE);
         let occupancy = Arc::new(Occupancy::default());
         let worker_occupancy = Arc::clone(&occupancy);
         let thread = WorkerThread::spawn("pending", move |shutdown| {
@@ -369,6 +473,12 @@ impl MemoryPending {
                     config.store.build(config.seed ^ 0xb10c),
                 ),
                 occupancy: worker_occupancy,
+                notices: notice_tx,
+                owed: VecDeque::new(),
+                expiring: Vec::new(),
+                lifetime_days: config.capacity.lifetime_days(),
+                expiry_per_round: config.expiry_per_round,
+                days,
                 orderer: Orderer::new(config.violate_order_every),
                 stale_answer_every: config.stale_answer_every,
                 answers: 0,
@@ -384,6 +494,7 @@ impl MemoryPending {
         Ok(Self {
             commands,
             results,
+            notices,
             overlay: HoldOverlay::new(
                 config.queue_capacity,
                 config.overlay_soft_limit,
@@ -484,6 +595,10 @@ impl PendingPort for MemoryPending {
     fn poll(&self) -> Option<PendingReply> {
         self.results.pop()
     }
+
+    fn notices(&self) -> Option<PendingNotice> {
+        self.notices.pop()
+    }
 }
 
 impl PendingOverlay for MemoryPending {
@@ -542,6 +657,19 @@ struct PendingWorker {
     results: StagedProducer<PendingReply>,
     store: PendingEngine,
     occupancy: Arc<Occupancy>,
+    /// The engine's own end of the notice channel.
+    notices: Producer<PendingNotice>,
+    /// Notices the queue would not take yet. Expiry is what makes this a queue rather than one slot: a
+    /// seal is the same news however often it is said, but every expired hold is a different one, and a
+    /// dropped one would leave a pending column reserved for good.
+    owed: VecDeque<PendingNotice>,
+    /// Voids the sweep has found and not handed over. Reused, so a sweep round allocates nothing.
+    expiring: Vec<Transfer>,
+    /// How long a record may live and how many expiry voids one round may offer. The second is what
+    /// keeps a day's expiry from arriving as a burst; falling behind deletes late, which is safe.
+    lifetime_days: u64,
+    expiry_per_round: usize,
+    days: DaySource,
     orderer: Orderer<PendingReply>,
     /// Claim to have applied less than it has, every nth answer. A fault: the data check on the reply is
     /// what has to catch it, because a request keeping no place in its lane has no order to be checked.
@@ -566,9 +694,61 @@ impl PendingWorker {
     fn run(mut self, shutdown: Arc<AtomicBool>) {
         let mut backoff = IdleBackoff::new();
         while !shutdown.load(Ordering::Relaxed) {
-            let progress = self.drain_commands() | self.harvest() | self.deliver();
+            let progress = self.hand_over_notices()
+                | self.sweep_expiry()
+                | self.drain_commands()
+                | self.harvest()
+                | self.deliver();
             backoff.record(progress);
         }
+    }
+
+    /// First in the round, and it retries until each notice lands: news the sequencer has to act on may
+    /// not be dropped because a queue was momentarily full.
+    fn hand_over_notices(&mut self) -> bool {
+        let mut progress = false;
+        while let Some(notice) = self.owed.front() {
+            if self.notices.push(*notice).is_err() {
+                break;
+            }
+            self.owed.pop_front();
+            progress = true;
+        }
+        progress
+    }
+
+    /// Queued rather than sent from where it was found, so the one place that pushes is the one place that
+    /// retries.
+    fn owe(&mut self, notice: PendingNotice) {
+        self.owed.push_back(notice);
+    }
+
+    /// Moves the day on when the wall clock says it has, and offers a bounded slice of whatever ran out.
+    ///
+    /// Wall time, not the monotonic clock the rest of this file runs on: retention is a promise in calendar
+    /// terms and has to survive a restart, which an origin-relative clock cannot do. Read once a round and
+    /// only to the day, so the cost is nothing and a jump forward is absorbed by `grace_days`.
+    fn sweep_expiry(&mut self) -> bool {
+        let day = self.days.today();
+        let opened = self.store.open_day(day, self.lifetime_days);
+        if !self.store.sweeping() {
+            return opened;
+        }
+        // Owed notices are still waiting, so the sequencer has not kept up with the last slice; offering
+        // more would grow this queue rather than release anything sooner.
+        if !self.owed.is_empty() {
+            return opened;
+        }
+        self.expiring.clear();
+        let mut found = std::mem::take(&mut self.expiring);
+        self.store.expiring(self.expiry_per_round, &mut found);
+        for void in &found {
+            self.owed
+                .push_back(PendingNotice::HoldExpired { void: *void });
+        }
+        let offered = !found.is_empty();
+        self.expiring = found;
+        opened || offered
     }
 
     /// Once per round rather than once per command: the store's size is asked for by a report at the
@@ -649,7 +829,13 @@ impl PendingWorker {
                     self.orderer.expect(fence.lane, fence.seq);
                     self.orderer.fill(fence.lane, fence.seq, ready_at, result);
                 }
-                PendingCommand::Apply(effect) => self.store.write(effect),
+                PendingCommand::Apply(effect) => {
+                    if let Err(not_stored) = self.store.write(effect) {
+                        self.owe(PendingNotice::HoldNotStored {
+                            hold: not_stored.hold,
+                        });
+                    }
+                }
             }
         }
         true
@@ -727,5 +913,165 @@ impl PendingWorker {
             }
         }
         progress
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The promise has two edges and only one of them is safe to miss. Deletion happens a whole segment
+    /// at a time and a segment is a day, so every size that follows from a lifetime has to be sized for
+    /// `retention + grace`: sized for the promise alone, the index would be a day short of what the grace
+    /// lets live, and the declared maximum would go back to being a hope.
+    #[test]
+    fn every_size_follows_the_lifetime_the_grace_extends() {
+        let promised = PendingCapacity {
+            daily_arrivals: 1_000_000,
+            worst_survivor_share: 0.5,
+            retention_days: 32,
+            grace_days: 0,
+            ..PendingCapacity::default()
+        };
+        let with_grace = PendingCapacity {
+            grace_days: 1,
+            ..promised
+        };
+        assert_eq!(promised.lifetime_days(), 32);
+        assert_eq!(with_grace.lifetime_days(), 33);
+        assert_eq!(with_grace.declared_maximum(), 500_000 * 33);
+        assert!(with_grace.slots() > promised.slots());
+    }
+
+    /// A segment's number is its day modulo the segments the address field has, so a lifetime needing
+    /// more of them than exist would give two live days one number and expiry would delete the wrong
+    /// day's records. Refused at startup rather than discovered as lost holds.
+    #[test]
+    fn a_lifetime_longer_than_the_segments_available_is_refused() {
+        let fits = MemoryPendingConfig {
+            capacity: PendingCapacity {
+                retention_days: SEGMENTS - 2,
+                grace_days: 1,
+                ..PendingCapacity::default()
+            },
+            index_budget_bytes: usize::MAX,
+            ..MemoryPendingConfig::default()
+        };
+        assert_eq!(fits.capacity.live_segments(), SEGMENTS);
+        assert_eq!(fits.validate(), Ok(()));
+
+        let one_day_too_many = MemoryPendingConfig {
+            capacity: PendingCapacity {
+                retention_days: SEGMENTS - 1,
+                ..fits.capacity
+            },
+            ..fits
+        };
+        assert_eq!(
+            one_day_too_many.validate(),
+            Err(LedgerError::ConfigInvalid),
+            "a lifetime that outruns the segment field was accepted"
+        );
+    }
+
+    /// Zero grace is what makes deletion early, so it is a configuration error rather than a choice.
+    #[test]
+    fn no_grace_at_all_is_refused() {
+        let config = MemoryPendingConfig {
+            capacity: PendingCapacity {
+                grace_days: 0,
+                ..PendingCapacity::default()
+            },
+            ..MemoryPendingConfig::default()
+        };
+        assert_eq!(config.validate(), Err(LedgerError::ConfigInvalid));
+    }
+}
+
+/// The worker's own wiring: the engine core is unit-tested and the whole stack is covered by the
+/// sequencer's integration tests, but what the thread in between does with a day was not.
+#[cfg(test)]
+mod worker_tests {
+    use super::*;
+    use crate::block::RECORDS_PER_BLOCK;
+    use ledger_base::ports::PendingEffect;
+    use ledger_base::AccountId;
+
+    fn config() -> MemoryPendingConfig {
+        MemoryPendingConfig {
+            capacity: PendingCapacity {
+                // An hour of arrivals is one block, so a block's worth of holds reaches a segment.
+                daily_arrivals: RECORDS_PER_BLOCK as u64 * 24,
+                worst_survivor_share: 0.5,
+                retention_days: 1,
+                grace_days: 1,
+                survives_flush_window: 0.5,
+                flush_window_hours: 1,
+                residency_hours: 1,
+            },
+            ..MemoryPendingConfig::default()
+        }
+    }
+
+    fn create(tx_id: TxId) -> PendingCommand {
+        PendingCommand::Apply(PendingEffect::Create {
+            tx_id,
+            debit_account: AccountId(1),
+            credit_account: AccountId(2),
+            amount: 10,
+            ledger: 1,
+            budget: BudgetGroup::ABSENT,
+        })
+    }
+
+    /// A day that runs out reaches the port as notices. Driven through the real worker thread, because the
+    /// engine offering a void and the worker handing it over are different things and only the second is
+    /// what the sequencer ever sees.
+    #[test]
+    fn a_day_that_runs_out_arrives_as_notices_on_the_port() {
+        let (days, day) = DaySource::manual(0);
+        let mut engine = MemoryPending::start_with_days(config(), days).expect("a test config");
+
+        let holds = RECORDS_PER_BLOCK + 1;
+        for id in 1..=holds {
+            let mut command = create(TxId(id as u128));
+            while engine.send(command).is_err() {
+                command = create(TxId(id as u128));
+            }
+        }
+        // A record's segment is the day it was **written**, and writing happens on the engine's thread. So
+        // the day may not move until the writes have landed, or the records belong to the next day and this
+        // test would be waiting for an expiry two days out.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.traffic().flushed < RECORDS_PER_BLOCK as u64 {
+            assert!(
+                Instant::now() < deadline,
+                "the engine never wrote the holds"
+            );
+        }
+
+        // Nothing has run out yet, and nothing may be released before it has.
+        day.store(1, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_millis(200);
+        while Instant::now() < deadline {
+            assert!(
+                engine.notices().is_none(),
+                "a hold was offered before its lifetime ran out"
+            );
+        }
+
+        day.store(2, Ordering::Relaxed);
+        let mut offered = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while offered < RECORDS_PER_BLOCK && Instant::now() < deadline {
+            if let Some(PendingNotice::HoldExpired { void }) = engine.notices() {
+                assert!(void.id.is_ledger_origin());
+                offered += 1;
+            }
+        }
+        assert_eq!(
+            offered, RECORDS_PER_BLOCK,
+            "the worker handed over {offered} of {RECORDS_PER_BLOCK} expired holds"
+        );
     }
 }

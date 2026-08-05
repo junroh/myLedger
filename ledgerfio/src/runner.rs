@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
-use ledger_base::{Ack, AckOutcome, Transfer};
+use ledger_base::{Ack, AckOutcome, LedgerError, Transfer};
 use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
 use ledger_pending::{MemoryPending, MemoryPendingConfig, StoreModel};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
@@ -266,6 +266,10 @@ struct Driver {
     duplicates: u64,
     rejected: u64,
     reject_kinds: BTreeMap<&'static str, u64>,
+    /// The ledger has answered a request with `FailStop`, which is it saying it will answer nothing
+    /// more. What the drain below exits on, because a request outstanding across a seal is waiting for
+    /// a commit that is never coming.
+    sealed: bool,
 }
 
 impl Driver {
@@ -281,6 +285,7 @@ impl Driver {
             duplicates: 0,
             rejected: 0,
             reject_kinds: BTreeMap::new(),
+            sealed: false,
         }
     }
 
@@ -300,7 +305,9 @@ impl Driver {
 
     fn measure(&mut self, workload: &mut Workload, options: &Options) -> Duration {
         let started = Instant::now();
-        while started.elapsed() < options.duration && !Signals::requested() {
+        // A sealed ledger ends the run: the rest of the requested duration would measure a node that
+        // answers everything with `FailStop`, and the report says which it was.
+        while started.elapsed() < options.duration && !Signals::requested() && !self.sealed {
             if self.outstanding() >= options.in_flight {
                 self.collect(workload, true);
                 continue;
@@ -378,9 +385,13 @@ impl Driver {
 
     /// Collects what the ledger still owes. A second signal is not waited for: an operator who
     /// asks twice wants out now.
+    /// Exits on the ledger's terminal state rather than only on a timeout. A sealed apply path means no
+    /// commit is ever coming for what is still outstanding — that is the design working — and a loop
+    /// that waited for one anyway would spin out its timeout and then report the wrong thing. The
+    /// timeout stays for everything that is merely slow.
     fn drain(&mut self, workload: &mut Workload, record: bool) {
         let deadline = Instant::now() + DRAIN_TIMEOUT;
-        while self.outstanding() > 0 && Instant::now() < deadline {
+        while self.outstanding() > 0 && !self.sealed && Instant::now() < deadline {
             if self.collect(workload, record) == 0 {
                 std::hint::spin_loop();
             }
@@ -393,6 +404,7 @@ impl Driver {
             AckOutcome::Duplicate => self.duplicates += 1,
             AckOutcome::Rejected(err) => {
                 self.rejected += 1;
+                self.sealed |= err == LedgerError::FailStop;
                 *self.reject_kinds.entry(err.name()).or_insert(0) += 1;
             }
         }

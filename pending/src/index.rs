@@ -203,6 +203,37 @@ impl HoldTable {
         true
     }
 
+    /// Addresses in a segment, resumed from `from` and stopping once `want` of them are found or the
+    /// table runs out. Answers where scanning got to, so a sweep is bounded per round and never walks the
+    /// whole table at once — the table is tens of millions of slots and expiry is background work.
+    ///
+    /// This is the same principle compaction rests on: a record is alive exactly when the index points at
+    /// it, so the survivors of an expiring day identify themselves and the dead are never touched. What it
+    /// cannot give is the keys — a slot holds a fingerprint, not a key — so the caller reads the records
+    /// these addresses name, which it needs anyway to build the resolution.
+    pub fn addresses_in_segment(
+        &self,
+        segment: u8,
+        from: usize,
+        want: usize,
+        into: &mut Vec<BlockAddr>,
+    ) -> usize {
+        let slots = self.buckets.len() * WAYS;
+        let mut at = from;
+        while at < slots && into.len() < want {
+            let slot = self.buckets[at / WAYS].slots[at % WAYS];
+            at += 1;
+            if slot == EMPTY {
+                continue;
+            }
+            let addr = address_of(slot);
+            if addr.segment() == segment {
+                into.push(addr);
+            }
+        }
+        at
+    }
+
     fn slot_at(&self, key: TxId, addr: BlockAddr) -> Option<(usize, usize)> {
         let (_, home, alternate) = self.locate(key);
         for bucket in [home, alternate] {
@@ -295,7 +326,11 @@ impl HoldTable {
         Some(address_of(slot))
     }
 
-    pub fn len(&self) -> usize {
+    /// Entries the table is holding. `live` rather than `len` because that is what the number is called
+    /// everywhere else it appears — the field behind it, and `LogTraffic::index_live` — and because an
+    /// index that is empty is not a state anything asks about: what is asked is how full it is against
+    /// what it was sized for.
+    pub fn live(&self) -> usize {
         self.live
     }
 
@@ -458,13 +493,13 @@ mod tests {
         // What a partial resolution does: the record is appended again and the index follows it.
         let second = BlockAddr::new(0, 9, 3);
         assert!(table.repoint(TxId(7), second, &mut never));
-        assert_eq!(table.len(), 1, "a repoint is not a second entry");
+        assert_eq!(table.live(), 1, "a repoint is not a second entry");
         assert_eq!(table.addr_of(TxId(7), &mut never), Some(second));
 
         assert_eq!(table.remove(TxId(7), &mut never), Some(second));
         assert_eq!(table.addr_of(TxId(7), &mut never), None);
         assert_eq!(table.remove(TxId(7), &mut never), None);
-        assert_eq!(table.len(), 0);
+        assert_eq!(table.live(), 0);
     }
 
     /// The property the whole structure rests on: every key that went in comes back pointing at its own
@@ -488,7 +523,7 @@ mod tests {
             refused, 0,
             "a table at its target load factor refused an insert"
         );
-        assert_eq!(table.len(), holds as usize);
+        assert_eq!(table.live(), holds as usize);
         for key in 1..=holds {
             assert_eq!(
                 table.addr_of(TxId(u128::from(key)), &mut never),
