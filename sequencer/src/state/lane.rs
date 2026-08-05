@@ -153,6 +153,13 @@ impl LaneTable {
         }
     }
 
+    /// The lane if this account has one. A lane is made the first time an account is debited, so one
+    /// that has only ever been credited has none yet — asking is a report's business, which is why `get`
+    /// below still indexes without checking.
+    pub fn try_get(&self, handle: AcctHandle) -> Option<&LaneState> {
+        self.lanes.get(handle.index())
+    }
+
     pub fn get(&self, handle: AcctHandle) -> &LaneState {
         debug_assert!(handle.index() < self.lanes.len());
         &self.lanes[handle.index()]

@@ -38,6 +38,10 @@ pub enum LedgerError {
     PartialResolutionNotAllowed,
     SharedBudgetGroupIncomplete,
     BalanceOverflow,
+    /// A column was asked to go below zero. Not a rejection: a column is a running total of money
+    /// reserved or moved, so a negative one says the ledger released something it never held. Whoever
+    /// applies it seals, because the effect that did it was already committed.
+    ColumnWentNegative,
     RaftCommitFailed,
     Overloaded,
 }
@@ -72,6 +76,7 @@ impl LedgerError {
             Self::PartialResolutionNotAllowed => "PartialResolutionNotAllowed",
             Self::SharedBudgetGroupIncomplete => "SharedBudgetGroupIncomplete",
             Self::BalanceOverflow => "BalanceOverflow",
+            Self::ColumnWentNegative => "ColumnWentNegative",
             Self::RaftCommitFailed => "RaftCommitFailed",
             Self::Overloaded => "Overloaded",
         }

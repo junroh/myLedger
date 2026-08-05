@@ -325,10 +325,31 @@ impl<C: Clock> Harness<C> {
             self.reactor.tick();
             assert!(
                 Instant::now() < deadline,
-                "{reason}\n  {:?}",
+                "{reason}\n  {}\n  {:?}",
+                self.lanes_now(),
                 self.reactor.metrics()
             );
         }
+    }
+
+    /// The lanes a test moves money on, for the message above. Counters say a run stopped; only this says
+    /// whether it stopped because a lane is stuck — a seq issued and never judged holds up everything
+    /// behind it, and no counter distinguishes that from a lane with nothing left to do.
+    fn lanes_now(&self) -> String {
+        [ALICE, BOB]
+            .iter()
+            .filter_map(|&account| self.reactor.lane(account).map(|lane| (account, lane)))
+            .map(|(account, lane)| {
+                format!(
+                    "lane {account:?} last_seq={} in_flight={} awaits_pending={} quarantined={}",
+                    lane.last_seq(),
+                    lane.in_flight(),
+                    lane.awaits_pending_reply(),
+                    lane.is_quarantined()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n  ")
     }
 
     /// Ticks until `wanted` acks have come back, whatever they say.

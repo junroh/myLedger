@@ -82,16 +82,15 @@ impl AccountRecord {
         self.credits_posted - self.debits_posted - self.debits_pending
     }
 
-    /// Whether this side can take the delta at all. Asked before anything is written, because half
-    /// an effect cannot be taken back: the batch is already committed.
-    pub const fn fits_debit(&self, columns: ColumnDelta) -> bool {
-        self.debits_posted.checked_add(columns.posted).is_some()
-            && self.debits_pending.checked_add(columns.pending).is_some()
-    }
-
-    pub const fn fits_credit(&self, columns: ColumnDelta) -> bool {
-        self.credits_posted.checked_add(columns.posted).is_some()
-            && self.credits_pending.checked_add(columns.pending).is_some()
+    /// Whether this side can take the delta at all, and why not when it cannot. Asked before anything
+    /// is written, because half an effect cannot be taken back: the batch is already committed. The
+    /// debit side has no twin here — its own `apply_debit` computes both columns before assigning
+    /// either, so it is its own check.
+    pub const fn can_credit(&self, columns: ColumnDelta) -> Result<(), LedgerError> {
+        if let Err(err) = Self::check(self.credits_posted, columns.posted) {
+            return Err(err);
+        }
+        Self::check(self.credits_pending, columns.pending)
     }
 
     /// Both of this side's columns move or neither does.
@@ -112,7 +111,20 @@ impl AccountRecord {
     }
 
     fn sum(value: Amount, delta: Amount) -> Result<Amount, LedgerError> {
-        value.checked_add(delta).ok_or(LedgerError::BalanceOverflow)
+        Self::check(value, delta)?;
+        Ok(value + delta)
+    }
+
+    /// Both ways a column can be asked for something it cannot give. Below zero is the one that matters:
+    /// a column is a running total of money reserved or moved, so a negative one is not a large number
+    /// but a claim that the ledger released what it never held. Checked here, at the only place a column
+    /// changes, rather than by walking every account — that walk is `audit`, and it runs between ticks.
+    const fn check(value: Amount, delta: Amount) -> Result<(), LedgerError> {
+        match value.checked_add(delta) {
+            None => Err(LedgerError::BalanceOverflow),
+            Some(total) if total < 0 => Err(LedgerError::ColumnWentNegative),
+            Some(_) => Ok(()),
+        }
     }
 }
 

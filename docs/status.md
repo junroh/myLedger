@@ -12,17 +12,31 @@ draining on SIGTERM, both run by hand.
 
 ## Broken
 
-**`hold_expiry::a_hold_the_client_resolved_is_never_resolved_twice` fails about one run in twenty.** It
-stalls rather than asserting: the pending column never comes down to what one unwritten hold should
-still be holding, and `tick_until` gives up after twenty-seven million ticks with nothing moving. A
-captured failure had 109 expiry voids admitted, none refused at intake, nine requests rejected, and 154
-effects committed — so the sweep was offering and the judge was refusing in a loop while one hold stayed
-reserved. A permanent stall on one lane is the shape to look for: a void that takes a lane seq and never
-completes stops everything behind it, and a lane whose seq never advances is a lane that never drains.
+**`hold_expiry::a_hold_the_client_resolved_is_never_resolved_twice` fails about one run in fifty.** Found
+by `make verify` on its first run, which is the argument for the target. Present at `3bdda52`, before the
+change that gave the ledger's own resolutions an idempotency dependency, so that change did not
+introduce it.
 
-Found by `make verify` on its first run, which is the argument for the target. Present at `3bdda52`,
-which is before the change that gave the ledger's own resolutions an idempotency dependency, so that
-change did not introduce it — at a rate this low, twenty-run samples cannot say more than that.
+What a captured failure says, with the lane state the harness now prints:
+
+```
+lane AccountId(10) last_seq=145 in_flight=38 awaits_pending=false quarantined=false
+judged: 143  committed: 105  proposed_batches: 8  commit_failures: 0
+holds_expired: 101  expiry_refused: 11  pending_removes: 52
+```
+
+Thirty-eight judged effects were never committed, which is exactly the lane's `in_flight`, and eight
+proposals were made against a `batching.in_flight` of eight. So consensus is holding every proposal it
+is allowed to hold and answering none, and nothing else can be proposed behind them. Not a lane stuck on
+a component — no pending reply is outstanding and the lane is not quarantined — and not a refused
+commit. A leak in what counts as a proposal in flight would look exactly like this, and so would an echo
+that loses one.
+
+**A second shape, seen before the negative-column check below and not since.** The same test reached a
+pending column of **-80** against an expected 5: sixty-seven voids judged good against fifty-one written
+holds, sixteen too many, each releasing five. The ledger released reservations it did not hold. Whether
+that and the stall above are one defect or two is not established — the check turns the write into a
+seal, so the next occurrence will stop at the cause instead of drifting past it.
 
 ## Built
 

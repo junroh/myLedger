@@ -132,9 +132,7 @@ impl MemoryAccounts {
         effect: &Effect,
     ) -> Result<(), LedgerError> {
         let columns = effect.columns();
-        if !self.records[credit.index()].fits_credit(columns) {
-            return Err(LedgerError::BalanceOverflow);
-        }
+        self.records[credit.index()].can_credit(columns)?;
         self.records[debit.index()].apply_debit(columns)?;
         self.records[credit.index()].apply_credit(columns)?;
         self.applied += 1;

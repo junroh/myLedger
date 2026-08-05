@@ -16,7 +16,7 @@ use crate::rules::linked::LinkedChains;
 use crate::state::batcher::Batcher;
 use crate::state::cascade::Cascade;
 use crate::state::expiry::ExpiryQueue;
-use crate::state::lane::LaneTable;
+use crate::state::lane::{LaneState, LaneTable};
 use crate::state::outbox::Outbox;
 use crate::state::pending::PendingChannel;
 use crate::state::pipeline::Pipeline;
@@ -318,6 +318,15 @@ where
 
     pub fn accounts(&self) -> &A {
         &self.accounts
+    }
+
+    /// One account's lane, for a test that has to say *why* nothing is moving. A stall shows up here and
+    /// almost nowhere else: a seq issued and never judged stops everything behind it, and the counters a
+    /// report prints cannot tell that from a lane with nothing to do.
+    pub fn lane(&self, account: AccountId) -> Option<&LaneState> {
+        self.accounts
+            .resolve(account)
+            .and_then(|at| self.lanes.try_get(at))
     }
 
     pub fn raft(&self) -> &R {

@@ -28,7 +28,7 @@ pub use config::{BatchPolicy, Capacity, LinkedPolicy, ReactorConfig, SafetyPolic
 pub use log_kind::LogKind;
 pub use metrics::{Metrics, StageTimes};
 pub use reactor::{Backpressure, Broken, Reactor, Transport};
-pub use state::lane::LaneTable;
+pub use state::lane::{LaneState, LaneTable};
 
 use ledger_base::{layouts_are_sound, TypeLayout};
 
