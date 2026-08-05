@@ -192,6 +192,9 @@ pub struct PendingFake(Rc<RefCell<PendingState>>);
 
 struct PendingState {
     overlay: HoldOverlay,
+    /// Applies handed over, so a removal's marker can be stamped and retired the way the real port
+    /// does it — this fake shares the engine, so it has to share the rule too.
+    applies_sent: u64,
     /// The engine's own store, shared with the real one: a simulation that kept its own copy would
     /// be exercising something else.
     store: PendingEngine,
@@ -241,6 +244,7 @@ impl PendingFake {
     pub fn new(timings: Timings, faults: Faults, seed: u64) -> Self {
         Self(Rc::new(RefCell::new(PendingState {
             overlay: HoldOverlay::new(64, timings.resident_holds, 64),
+            applies_sent: 0,
             store: PendingEngine::sized(
                 if faults.index_slots > 0 {
                     faults.index_slots
@@ -481,7 +485,10 @@ impl PendingState {
                 remaining,
                 ..
             } => self.overlay.note_remaining(pending_ref, remaining),
-            PendingEffect::Remove { pending_ref, .. } => self.overlay.forget(pending_ref),
+            PendingEffect::Remove { pending_ref, .. } => {
+                self.applies_sent += 1;
+                self.overlay.forget(pending_ref, self.applies_sent)
+            }
         }
     }
 }
@@ -557,7 +564,9 @@ impl PendingOverlay for PendingFake {
     }
 
     fn maintain(&mut self) -> usize {
-        self.0.borrow_mut().overlay.maintain()
+        let mut state = self.0.borrow_mut();
+        let applied = state.store.applied();
+        state.overlay.maintain(applied)
     }
 
     fn overlay_len(&self) -> usize {

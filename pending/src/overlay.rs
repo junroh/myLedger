@@ -28,11 +28,18 @@ enum Entry {
     Missing {
         pinned: u32,
     },
-    /// A committed removal took the hold away while a request in flight still had it pinned. Answers
-    /// the same as `Missing` — the hold is gone — but exists only to carry those pins, so it goes with
-    /// the last of them instead of being kept for the next lookup to find.
+    /// A committed removal took the hold away. Answers the same as `Missing` — the hold is gone — and
+    /// it is the **only** thing that says so until the engine has applied the removal: the sequencer
+    /// erases this the moment it hands the write over, and the engine clears its index a queue later.
+    /// A lookup answered inside that gap carries the hold as it was, with its remainder intact, and
+    /// without this marker it would decide a live entry from that answer and resolve the hold twice.
+    ///
+    /// So it lives until the engine has caught up. `safe_after` is the number of applies this side had
+    /// sent when the removal went; once the engine reports at least that many, its index no longer
+    /// points at the hold and a lookup misses on its own.
     Removed {
         pinned: u32,
+        safe_after: u64,
     },
     Decided(Hold),
 }
@@ -40,18 +47,18 @@ enum Entry {
 impl Entry {
     fn pins(&mut self) -> &mut u32 {
         match self {
-            Entry::Watched { pinned } | Entry::Missing { pinned } | Entry::Removed { pinned } => {
-                pinned
-            }
+            Entry::Watched { pinned }
+            | Entry::Missing { pinned }
+            | Entry::Removed { pinned, .. } => pinned,
             Entry::Decided(hold) => &mut hold.pinned,
         }
     }
 
     fn pinned(&self) -> u32 {
         match self {
-            Entry::Watched { pinned } | Entry::Missing { pinned } | Entry::Removed { pinned } => {
-                *pinned
-            }
+            Entry::Watched { pinned }
+            | Entry::Missing { pinned }
+            | Entry::Removed { pinned, .. } => *pinned,
             Entry::Decided(hold) => hold.pinned,
         }
     }
@@ -112,14 +119,10 @@ impl HoldOverlay {
         // while a request is still coming for it.
         debug_assert!(*pins > 0, "unpin without a pin");
         *pins = pins.saturating_sub(1);
-        // A removal's marker exists only to carry pins, so it goes with the last of them. Left to
-        // housekeeping instead, a workload that resolves every hold would leave a marker per hold
-        // until the soft limit was reached. A `Missing` from a lookup is a different thing and stays:
-        // asking again would get the same answer.
-        let retire = *pins == 0 && matches!(entry, Entry::Removed { .. });
-        if retire {
-            self.entries.remove(&hold);
-        }
+        // A removal's marker used to go with the last pin, on the reading that it existed only to carry
+        // them. It does not: until the engine has applied the removal, it is the only thing that says
+        // the hold is gone, and the lookup it has to answer for may not have started. Housekeeping
+        // retires it once the engine has caught up — see `forget` and `maintain`.
     }
 
     /// The answer's remainder, or that the hold is not there. Either way it is dropped if a decision
@@ -128,6 +131,13 @@ impl HoldOverlay {
     /// can be the one before a settle that has already committed.
     pub fn admit_lookup(&mut self, hold: TxId, remaining: Option<Amount>) {
         if self.decided(hold).is_some() {
+            return;
+        }
+        // A removal is a decision like any other, and the same rule applies: this answer was taken
+        // before it, so it may not be believed. Believing it was the defect — the answer still carries
+        // the hold with its whole remainder, because the engine has not applied the removal yet, and
+        // deciding a live hold from it resolves the hold a second time.
+        if matches!(self.entries.get(&hold), Some(Entry::Removed { .. })) {
             return;
         }
         match remaining {
@@ -154,13 +164,22 @@ impl HoldOverlay {
     }
 
     pub fn overlay(&self, hold: TxId) -> OverlayState {
-        match self.decided(hold) {
-            Some(decided) => OverlayState {
+        match self.entries.get(&hold) {
+            Some(Entry::Decided(decided)) => OverlayState {
                 remaining: Some(decided.committed_remaining),
                 taken: decided.reserved,
                 resolved: decided.resolved,
             },
-            None => OverlayState::default(),
+            // A removal the engine has not applied yet. Whoever asks is composing a view from a record
+            // a lookup brought back, and that record still shows the hold alive with its whole
+            // remainder — the engine's index has not been cleared. So the answer has to come from here:
+            // resolved, nothing left, whatever the record says.
+            Some(Entry::Removed { .. }) => OverlayState {
+                remaining: Some(0),
+                taken: 0,
+                resolved: true,
+            },
+            _ => OverlayState::default(),
         }
     }
 
@@ -201,23 +220,18 @@ impl HoldOverlay {
         }
     }
 
-    /// A committed removal takes the hold away. While a request that pinned it is still in flight the
-    /// entry stays, as `Missing`: dropping it would drop that request's pin with it, and the next
-    /// lookup would recreate the entry at zero pins — so the in-flight request's unpin would come off
-    /// whatever pin another request had since taken, and eviction could then take an entry still to be
-    /// read. `maintain` already refuses to drop a pinned entry; this is that invariant on the other
-    /// path. `Missing` is also the truthful state: the hold is gone, and a request still coming for it
-    /// should be told so rather than pay a lookup to be told the same.
-    pub fn forget(&mut self, hold: TxId) {
-        let Some(entry) = self.entries.get_mut(&hold) else {
-            return;
-        };
-        match entry.pinned() {
-            0 => {
-                self.entries.remove(&hold);
-            }
-            pinned => *entry = Entry::Removed { pinned },
-        }
+    /// A committed removal takes the hold away, and this is where that becomes known. The marker is
+    /// left **always**, not only while something has the hold pinned: pins are about a request still
+    /// coming for the answer, and this is about the engine not having applied the removal yet. Those
+    /// are different questions, and answering the second with the first is what let a hold be resolved
+    /// twice — the marker went at hand-over, the engine's index cleared a queue later, and a lookup
+    /// answered in between said the hold was alive with its whole remainder.
+    ///
+    /// An entry is made even where there was none, for the same reason: the lookup that will be told
+    /// the wrong thing may not have started yet.
+    pub fn forget(&mut self, hold: TxId, safe_after: u64) {
+        let pinned = self.entries.get_mut(&hold).map_or(0, |entry| *entry.pins());
+        self.keep(hold, Entry::Removed { pinned, safe_after });
     }
 
     pub fn compensate(&mut self, hold: TxId, amount: Amount, resolves: bool) {
@@ -229,8 +243,9 @@ impl HoldOverlay {
         }
     }
 
-    /// Idle entries can be dropped; a later request looks them up again.
-    pub fn maintain(&mut self) -> usize {
+    /// Idle entries can be dropped; a later request looks them up again. `applied` is what the engine
+    /// says it has got through, which is the one thing that makes a removal's marker droppable.
+    pub fn maintain(&mut self, applied: u64) -> usize {
         if self.entries.len() <= self.soft_limit {
             return 0;
         }
@@ -246,11 +261,14 @@ impl HoldOverlay {
             // A decision nothing is waiting on can go: what the hold has left is in the engine's own
             // record by then, and a later request looks it up again. A negative answer can go any
             // time, and so can a placeholder nothing pinned — the answer it was waiting for either
-            // arrived or belongs to a request that is gone. A removal's marker is unreachable here: it
-            // only exists while pinned, and this arm is past the pinned check.
+            // arrived or belongs to a request that is gone. A removal's marker is the exception, and
+            // the only entry here whose life is not about pins: it may go once the engine has applied
+            // the removal it stands for, and not before, or a lookup already in flight can still be
+            // answered from a record the engine has not cleared.
             let idle = match entry {
                 Entry::Decided(decided) => decided.reserved == 0 && !decided.resolved,
-                Entry::Watched { .. } | Entry::Missing { .. } | Entry::Removed { .. } => true,
+                Entry::Removed { safe_after, .. } => applied >= *safe_after,
+                Entry::Watched { .. } | Entry::Missing { .. } => true,
             };
             if idle {
                 evicted += 1;
@@ -324,39 +342,60 @@ mod tests {
     /// and eviction could take an entry still to be read. Nothing in the ledger's own audit sees that,
     /// which is why it survived until a debug build was run under fault injection.
     #[test]
-    fn a_removal_keeps_a_pinned_entry_and_gives_it_up_once_unpinned() {
+    fn a_removal_is_remembered_until_the_engine_has_applied_it() {
         // A soft limit of zero, so housekeeping evicts whatever it is allowed to.
         let mut overlay = HoldOverlay::new(4, 0, 4);
-        // An entry exists because a request looked the hold up, which is the only thing that makes one.
         overlay.admit_lookup(HOLD, Some(100));
         overlay.pin(HOLD);
 
-        overlay.forget(HOLD);
+        // The tenth apply handed over is this removal.
+        overlay.forget(HOLD, 10);
 
-        // The hold is gone, so the truthful answer is that it is not there — but the entry stays,
-        // because the pin does.
         assert!(overlay.hold_is_missing(HOLD));
-        overlay.maintain();
+        overlay.maintain(9);
         assert!(
             overlay.hold_is_missing(HOLD),
             "a pinned entry may not be evicted"
         );
 
-        // The marker exists only to carry the pin, so it goes with it rather than waiting for
-        // housekeeping: a workload that resolves every hold would otherwise leave one per hold.
+        // Unpinning is not what makes it droppable. The engine is still one apply short of this
+        // removal, so a lookup answered now would carry the hold as it was — which is the whole reason
+        // the marker exists.
         overlay.unpin(HOLD);
-        assert!(!overlay.hold_is_missing(HOLD), "unpinned, it goes at once");
+        overlay.maintain(9);
+        assert!(
+            overlay.hold_is_missing(HOLD),
+            "the marker went before the engine had applied the removal"
+        );
+
+        // Now the engine has it, so its index no longer points at the hold and a lookup misses on its
+        // own. The marker has nothing left to say.
+        overlay.maintain(10);
+        assert!(!overlay.hold_is_missing(HOLD));
         assert!(overlay.is_empty());
     }
 
-    /// The ordinary case still costs nothing: with nobody reading it, a removal is a removal.
+    /// A removal with nothing reading it is remembered too, and that is the case the ledger got wrong:
+    /// the marker was dropped at once, the engine cleared its index a queue later, and a lookup that
+    /// started in between decided a live hold from an answer taken before the removal — resolving it a
+    /// second time and taking the money twice.
     #[test]
-    fn a_removal_with_no_pin_takes_the_entry_away_at_once() {
-        let mut overlay = HoldOverlay::new(4, 1 << 10, 4);
+    fn a_removal_with_no_pin_is_remembered_too() {
+        let mut overlay = HoldOverlay::new(4, 0, 4);
         overlay.admit_lookup(HOLD, Some(100));
-        overlay.forget(HOLD);
+
+        overlay.forget(HOLD, 3);
+        assert!(overlay.hold_is_missing(HOLD), "dropped with nobody reading");
+
+        // The answer that crosses the removal. Without the marker this decides a hold with 100 left.
+        overlay.admit_lookup(HOLD, Some(100));
+        assert!(
+            overlay.hold_is_missing(HOLD),
+            "an answer from before the removal brought the hold back"
+        );
+
+        overlay.maintain(3);
         assert!(!overlay.hold_is_missing(HOLD));
-        assert!(overlay.is_empty());
     }
 
     /// An answer is a reading of the store taken when the lookup was served; a decision is taken the

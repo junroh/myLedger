@@ -10,52 +10,6 @@ commits unnoticed, since `cargo test` runs for milliseconds and reaching that de
 release build. What `make verify` still does not cover is `cargo bench -p ledger-pending` and `ledgerd`
 draining on SIGTERM, both run by hand.
 
-## Broken
-
-**`hold_expiry::a_hold_the_client_resolved_is_never_resolved_twice` fails about one run in fifty.** Found
-by `make verify` on its first run, which is the argument for the target. Present at `3bdda52`, before the
-change that gave the ledger's own resolutions an idempotency dependency, so that change did not
-introduce it.
-
-**The defect is a hold resolved twice**, and everything else about the failure is the ledger reacting to
-it correctly. What a captured failure says, with the state the harness now prints:
-
-```
-sealed=true  lane AccountId(10) last_seq=154 in_flight=9 awaits_pending=false quarantined=false
-judged: 114  committed: 105  proposed_batches: 7  holds_expired: 141  rejected: 81
-```
-
-`sealed=true` is the whole story. A second void for a hold already resolved reaches the apply path, the
-column it would move is asked to go below zero, the effect is refused and the apply path seals — rule 19,
-working. Everything after that is a stopped node: effects judged and never committed, proposals
-outstanding and never answered, a lane holding requests that will never move. None of that is a defect of
-its own, and reading it as one costs an afternoon.
-
-Before that check existed the same runs went the other way: the negative column was written and the
-pending column reached **-80** against an expected 5 — sixty-seven voids judged good against fifty-one
-written holds, sixteen too many at five apiece. The ledger released reservations it did not hold and said
-nothing.
-
-**The mechanism, as far as reading the code takes it.** A stale lookup reply can resurrect a hold the
-ledger has already removed.
-
-1. A committed removal calls `HoldOverlay::forget`. With nothing pinned it **drops the entry**; only a
-   pinned hold is kept, as `Removed`. The comment there is about not dropping another request's pin, and
-   the state is doing double duty — it is also the only memory that the hold is gone.
-2. A second void for the same hold has a lookup already in flight. Its pin comes off when its reply
-   arrives, before the judge runs.
-3. `admit_lookup` finds no decided entry, so it **decides one from the reply** — a record the engine had
-   not applied the removal to yet, with the full remainder still on it.
-4. `HoldView::compose` takes `resolved` from the overlay and only from the overlay. A fresh entry says
-   `resolved: false`, so the judge sees a live hold with money on it and voids it a second time.
-
-So the tombstone lives exactly as long as a pin, and the window is between the removal committing and
-the engine applying it. `stale_answers` does not cover it: that check compares what the engine had
-applied against what this request was dispatched behind, and this reply is not late by that measure.
-
-What it needs is a decision rather than a patch: how long a removed hold has to stay known-removed. Long
-enough for every lookup that could still answer for it, which is not the same as "while pinned".
-
 ## Built
 
 ### The sequencer
@@ -102,6 +56,13 @@ fences in one order.
 - **The overlay holds no record.** Only what the sequencer has decided and not handed over, bounded
   by requests in flight. The record belongs to the engine and the reply carries it to the slot of
   the request that asked (rule 18). Design notes §2's correction.
+- **A removal is remembered until the engine has applied it.** The sequencer erases what it knows the
+  moment it hands a write over, and the engine clears its index a queue later; a lookup answered in
+  between carries the hold as it was, remainder intact. That gap resolved holds twice and put the
+  second resolution in the log. The marker now outlives the hand-over — stamped with the applies sent
+  and retired when the engine reports it has got that far — and it is visible to all three readers: a
+  request is told the hold is missing, an answer that crossed the removal is not believed, and the
+  judge is told it is resolved. One of the three left open is enough to lose the money.
 - **The engine can speak first.** A third direction on the port (`notices`), with a channel of its
   own so news the engine sends is neither behind a reply nor in front of one. Two notices exist: a
   committed hold the index could not take seals the apply path (rule 19, where it used to be

@@ -300,6 +300,9 @@ pub struct MemoryPending {
     notices: Consumer<PendingNotice>,
     /// Read inline, on the caller's own thread.
     overlay: HoldOverlay,
+    /// Applies handed to the engine. A removal's marker is stamped with this so the overlay knows when
+    /// the engine has caught up with it; the engine counts the same sequence as it applies them.
+    applies_sent: u64,
     /// What the store is holding, published by the worker because the store lives on its thread.
     occupancy: Arc<Occupancy>,
     _thread: WorkerThread,
@@ -398,6 +401,10 @@ struct Occupancy {
     /// Blocks written to the store and kept in memory anyway, against the residency window.
     resident: MapGauge,
     traffic: TrafficGauge,
+    /// Committed decisions the engine has applied. Published for the overlay on the other thread: a
+    /// removal's marker may go once this passes the point the removal was handed over at, and not
+    /// before — see `HoldOverlay::forget`.
+    applied: AtomicU64,
     /// What putting each lane back in order cost. Published because it is the one cost no per-read bound
     /// covers, and until now the engine computed it and nobody could read it.
     order_wait: OrderWaitGauge,
@@ -501,6 +508,7 @@ impl MemoryPending {
                 config.overlay_soft_limit,
                 config.eviction_per_round,
             ),
+            applies_sent: 0,
             occupancy,
             _thread: thread,
         })
@@ -576,6 +584,13 @@ impl PendingPort for MemoryPending {
         // What a hold has left follows the write the engine is sent, and nothing else writes it. That
         // is the whole of what the overlay keeps: the record itself is the engine's, and a lookup is
         // how a request gets one.
+        //
+        // The count is this side's half of "has the engine caught up": it numbers the applies handed
+        // over, the engine numbers the same ones as it applies them, and a removal's marker is stamped
+        // with its own number so it can be dropped when the engine reaches it.
+        if matches!(command, PendingCommand::Apply(_)) {
+            self.applies_sent += 1;
+        }
         match command {
             PendingCommand::Apply(PendingEffect::Create { tx_id, amount, .. }) => {
                 self.overlay.created(tx_id, amount)
@@ -586,7 +601,7 @@ impl PendingPort for MemoryPending {
                 ..
             }) => self.overlay.note_remaining(pending_ref, remaining),
             PendingCommand::Apply(PendingEffect::Remove { pending_ref, .. }) => {
-                self.overlay.forget(pending_ref)
+                self.overlay.forget(pending_ref, self.applies_sent)
             }
             _ => {}
         }
@@ -644,7 +659,8 @@ impl PendingOverlay for MemoryPending {
     }
 
     fn maintain(&mut self) -> usize {
-        self.overlay.maintain()
+        self.overlay
+            .maintain(self.occupancy.applied.load(Ordering::Relaxed))
     }
 
     fn overlay_len(&self) -> usize {
@@ -763,6 +779,9 @@ impl PendingWorker {
             &self.occupancy.resident,
         );
         self.occupancy.traffic.publish(self.store.traffic());
+        self.occupancy
+            .applied
+            .store(self.store.applied(), Ordering::Relaxed);
         self.occupancy.order_wait.publish(self.orderer.order_wait());
     }
 
