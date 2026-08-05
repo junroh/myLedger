@@ -269,7 +269,17 @@ impl Cli {
     fn sweep_spec(spec: &str) -> Result<(String, Vec<String>), String> {
         let (knob, values) = spec.split_once('=').ok_or("--sweep needs knob=v1,v2")?;
         let knob = knob.trim_start_matches('-').to_owned();
-        let values: Vec<String> = values.split(',').map(str::to_owned).collect();
+        // `workload=all` expands from the kinds themselves, so a run over every workload names none of
+        // them. Whoever adds the seventh gets it covered without remembering to, which is the whole
+        // reason this is here rather than in a list somewhere else.
+        let values: Vec<String> = if knob == "workload" && values == "all" {
+            WorkloadKind::all()
+                .iter()
+                .map(|kind| kind.name().to_owned())
+                .collect()
+        } else {
+            values.split(',').map(str::to_owned).collect()
+        };
         if knob.is_empty() || values.iter().any(String::is_empty) {
             return Err(format!("bad sweep `{spec}`"));
         }

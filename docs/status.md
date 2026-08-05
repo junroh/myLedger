@@ -3,9 +3,26 @@
 What is built and verified, and what is not. Written to be read before picking up work: the design
 reasoning lives in `design-notes.md`, the terms in `glossary.md`, and how to run things in `tools.md`.
 
-Verified at the time of writing with `cargo test` (debug, 124 tests), `cargo build --release
---workspace --all-targets`, all six `ledgerfio` workloads, all three `ledgersim` modes, `ledgerfio
-layout`, `cargo bench -p ledger-pending`, and `ledgerd` starting and draining on SIGTERM.
+Verified at the time of writing with **`make verify`** — the tests in debug, the release build, every
+`ledgerfio` workload, `ledgerfio layout`, and all three `ledgersim` modes. It is a target rather than a
+list here because a list here is what drifted: a workload that aborted on the reactor thread went two
+commits unnoticed, since `cargo test` runs for milliseconds and reaching that defect took a second of
+release build. What `make verify` still does not cover is `cargo bench -p ledger-pending` and `ledgerd`
+draining on SIGTERM, both run by hand.
+
+## Broken
+
+**`hold_expiry::a_hold_the_client_resolved_is_never_resolved_twice` fails about one run in twenty.** It
+stalls rather than asserting: the pending column never comes down to what one unwritten hold should
+still be holding, and `tick_until` gives up after twenty-seven million ticks with nothing moving. A
+captured failure had 109 expiry voids admitted, none refused at intake, nine requests rejected, and 154
+effects committed — so the sweep was offering and the judge was refusing in a loop while one hold stayed
+reserved. A permanent stall on one lane is the shape to look for: a void that takes a lane seq and never
+completes stops everything behind it, and a lane whose seq never advances is a lane that never drains.
+
+Found by `make verify` on its first run, which is the argument for the target. Present at `3bdda52`,
+which is before the change that gave the ledger's own resolutions an idempotency dependency, so that
+change did not introduce it — at a rate this low, twenty-run samples cannot say more than that.
 
 ## Built
 

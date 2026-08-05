@@ -83,9 +83,11 @@ sequencer's either — `Reactor::new` hands back queue endpoints and `ledgerfio`
 
 ## Invariant discipline
 
-Every integrity bug found in this code so far was at a seam, not inside a component: two things that
-had to happen together were written as two statements, and something failed or intervened between
-them. These four rules are those bugs generalised.
+Every integrity bug found in this code so far came from one of two places, and neither is inside a
+component. Most were at a **seam**: two things that had to happen together were written as two
+statements, and something failed or intervened between them. The rest only appeared under **load**:
+something latent that every short run reached the edge of and no short run crossed. These six rules are
+those bugs generalised.
 
 16. **A pairing is one call, not two statements.** Both overlays are taken by `take_overlays` and
     given back by `give_back_overlays`; an effect reaches both of an account's sides through one
@@ -106,6 +108,21 @@ them. These four rules are those bugs generalised.
     operator action — the drain that never completes is the signal to replace the leader. A
     contract-1 violation is different in kind: an external component is broken, our state is intact,
     so the lane is quarantined and the rest keeps serving.
+20. **No bound may be enforced by the stack.** Rule 12 bounds every queue; this is the same rule for a
+    backlog that is not one. A cascade of gated chains was followed by nested call, so its real ceiling —
+    the slot pool, 65,536 — was enforced by a stack that held about 1,400 of those frames, and the node
+    aborted where a queue would have applied backpressure. Making the two agree is not the answer: a
+    stack's capacity is its size over its frame size, frame size belongs to the optimiser (debug and
+    release disagreed by eight times on how long the crash took), so a limit expressed that way is one
+    nobody declared and no build can check. Depth stays constant and the ceiling lives on a structure
+    sized from the declaration — `Cascade`, and the pending index's `MAX_HOPS` cascade cap, which is this
+    rule already stated as a number.
+21. **A component's queue is part of what it does.** Idempotency records transaction ids *and* returns a
+    lane in seq order, and only the first is why anything calls it. A request that skipped the component
+    to avoid the record gave up the order with it, and then nothing ordered it against the requests that
+    had not skipped it — a seq gap of this node's own making, which the timing hid until a change widened
+    the window. Where a request needs one and not the other, ask for one and not the other
+    (`IdemAsk::Serialize`); do not skip the component.
 
 ## Layout discipline
 
@@ -134,6 +151,7 @@ Cache layout is a build-time contract, not a convention:
 `ledgerfio` drives the ledger the way `fio` drives storage: workload mixes, target rates, latency distribution. Every phase stays runnable locally with the workloads that exist at that point.
 
 ```
+make verify                    # all of it: tests in debug, then every workload and mode in release
 cargo test                     # debug, so rule 6's asserts and every debug_assert are live
 cargo run --release -p ledgerfio -- run --workload hold-settle --duration 5s --accounts 100k
 cargo run --release -p ledgerfio -- run --workload linked --repeat 3 --pin 2
