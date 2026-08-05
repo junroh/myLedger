@@ -2,6 +2,7 @@
 //! reactor itself holds a handful of fields rather than a scatter of them.
 
 pub mod batcher;
+pub mod cascade;
 pub mod expiry;
 pub mod lane;
 pub mod outbox;

@@ -14,6 +14,7 @@ use crate::metrics::{Metrics, StageTimes};
 use crate::rules::budget::BudgetCoverage;
 use crate::rules::linked::LinkedChains;
 use crate::state::batcher::Batcher;
+use crate::state::cascade::Cascade;
 use crate::state::expiry::ExpiryQueue;
 use crate::state::lane::LaneTable;
 use crate::state::outbox::Outbox;
@@ -82,6 +83,8 @@ pub struct Reactor<A: AccountPort, P: PendingPort, I: IdempotencyPort, R: RaftPo
     outbox: Outbox,
     /// Expiry voids waiting their turn, which comes after every client request this tick.
     expiry: ExpiryQueue,
+    /// Chains freed by a gate that has just opened, so a cascade of them is a loop and not a stack.
+    cascade: Cascade,
     /// The pending port and the committed decisions not yet handed to it; a queued write must
     /// precede any later lookup.
     pending: PendingChannel<P>,
@@ -161,6 +164,7 @@ where
             batcher: Batcher::new(config.batching, config.batch_headroom()),
             outbox: Outbox::new(transport.acks, capacity.ack_backlog, capacity.slots),
             expiry: ExpiryQueue::new(capacity.expiry_backlog),
+            cascade: Cascade::with_capacity(capacity.slots),
             pending: PendingChannel::new(
                 pending,
                 capacity.pending_write_backlog,

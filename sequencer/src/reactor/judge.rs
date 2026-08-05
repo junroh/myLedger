@@ -76,6 +76,24 @@ where
     /// A standalone request is judged as soon as its results are in; a linked leg waits for
     /// its whole chain, because the chain is judged and proposed as one unit.
     pub fn on_ready(&mut self, slot: SlotId) {
+        self.cascade.push(slot);
+        self.run_cascade();
+    }
+
+    /// Judges everything a gate has freed, and everything freed by judging that, in one loop. The first
+    /// caller in owns the loop; a chain judged inside it adds to the stack instead of nesting — which is
+    /// the whole point, because the run is as long as a client's backlog on one lane. See `Cascade`.
+    fn run_cascade(&mut self) {
+        if !self.cascade.enter() {
+            return;
+        }
+        while let Some(slot) = self.cascade.next() {
+            self.judge_ready(slot);
+        }
+        self.cascade.leave();
+    }
+
+    fn judge_ready(&mut self, slot: SlotId) {
         let chain = self.pipeline.item(slot).chain;
         if chain.is_absent() {
             return self.judge(slot);
@@ -113,6 +131,11 @@ where
     }
 
     pub fn judge_chain(&mut self, chain: LinkedChain) {
+        self.judge_chain_legs(chain);
+        self.run_cascade();
+    }
+
+    fn judge_chain_legs(&mut self, chain: LinkedChain) {
         let (mut effects, mut scratch) = self.linked.take_buffers();
         let mut budgets = std::mem::replace(&mut self.budgets, BudgetCoverage::new(0));
         budgets.clear();
@@ -200,10 +223,19 @@ where
         self.metrics.linked_chains_judged += 1;
     }
 
+    /// Frees what was queued behind this chain onto the cascade rather than judging it here. Reversed
+    /// because the cascade is a stack, so this is the order they were queued in.
     pub(super) fn open_gates(&mut self, chain: &LinkedChain) {
         self.linked.open_gates(chain.id);
-        for &slot in &chain.gated {
-            self.release_dep(slot, DepFlags::LINKED_CHAIN);
+        for &slot in chain.gated.iter().rev() {
+            let judgeable = {
+                let item = self.pipeline.item_mut(slot);
+                item.clear_dep(DepFlags::LINKED_CHAIN);
+                item.is_judgeable()
+            };
+            if judgeable {
+                self.cascade.push(slot);
+            }
         }
     }
 
