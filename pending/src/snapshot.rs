@@ -18,14 +18,17 @@
 //! whose slots this leaves out, so replay starts *after* coverage and creates them again. A snapshot that
 //! claimed the later position would be claiming records it does not carry.
 //!
-//! What is **not** here yet, and why:
+//! **The read is stable** while the engine keeps writing, and the reason it has to be is the kick cascade
+//! rather than the effects: an entry displaced between buckets mid-dump appears twice in the stream or
+//! nowhere, and a relocation is in no log for a replay to repair. `HoldTable::begin_snapshot` copies a bucket
+//! the snapshot has not reached before it changes, and drops the copy as it is read.
 //!
-//! - **A stable read.** Walking the index while the engine keeps writing gives a smeared view, and a kick
-//!   cascade can move an entry between buckets so it appears twice or nowhere — §15 has the two failures.
-//!   Copying the buckets about to change is the answer, and it belongs with pacing.
-//! - **The group totals' own boundary.** A group whose members straddle the frontier should carry only what
-//!   is sealed, and working that out needs the membership the engine does not index. Without coverage there
-//!   is no frontier to straddle, so the whole map goes for now and the asymmetry is noted rather than hidden.
+//! **The group totals travel with the position they reflect**, which is this snapshot's own instant and not
+//! its coverage. They are accumulated rather than derived, so a replay that did not know that would count
+//! every member created between the two a second time — see `PendingEngine::replay`.
+//!
+//! What is **not** here is where a snapshot goes: nothing writes one anywhere, and the throttle that would
+//! pace the write is a number nobody has chosen. `status.md` tracks both.
 
 use ledger_base::ports::ApplyIndex;
 use ledger_base::{Amount, BudgetGroup, FxHashMap};

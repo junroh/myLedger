@@ -395,9 +395,10 @@ An answer of "not there" is kept rather than thrown away. A write always reaches
 later lookup (that is what the write queue is for), so the answer cannot be stale, and keeping it
 means a second resolution of the same missing hold costs no second round trip — the one resolution that
 needs no record at all. The engine's own design document splits that answer in two — a hold that was
-resolved or expired versus one that never existed. The stub cannot tell them apart, because it keeps no
-history of what it removed, so it answers with one negative state; the split belongs with the segment
-expiry that is not built.
+resolved or expired versus one that never existed. The engine cannot tell them apart, because it keeps no
+history of what it removed, so it answers with one negative state — and that is now a refusal rather than a
+gap: keeping "expired" needs per-hold state past retention, which is the data the promise says is deleted.
+§14's *Weighed and refused* has the argument.
 
 ## 3. Linked groups need two mechanisms the design did not spell out
 
@@ -952,10 +953,11 @@ test rather than a heuristic. What it costs instead is
 space: the old version sits there until its segment expires. Partial resolutions are a minority of
 traffic, and this is what append-only means.
 
-**The space comes back only with segment expiry, and expiry is not built.** So the record blocks grow
-with holds *created*, not holds *alive* — a run that creates and resolves the same hold count over and
-over keeps every version. The load driver says so in the same breath as the idem map and the log,
-because a total that looks like a steady state and is not is worse than no total.
+**The space comes back only with segment expiry**, which is built: a day's blocks go back once the index has
+no entry in them (§14). Until then a resolved hold's record sits where it was written, so the blocks of a live
+day hold its dead as well as its living — that is what append-only costs, and it is bounded by retention
+rather than growing with holds created. The load driver says which totals are a steady state and which are
+not, because a figure that looks like one and is not is worse than no figure.
 
 **Growing the index reads the keys back.** A home bucket comes from the whole hash, so doubling the
 table changes it, and a slot carries only a fingerprint — the records are the only thing that knows a
@@ -1439,9 +1441,11 @@ offered, admitted and refused, and whose sweep test fails if no seed outlived it
 
 ## 15. The snapshot is the index, and the log being truncated is the only reason it exists
 
-> **Designed, not built.** Everything below is reasoning, not description: no code implements any of it.
-> It is here rather than in `status.md` because it is a chain of decisions with evidence, which is what
-> this file is for — and `status.md`'s *Recovery is not real* points at it.
+> **Partly built.** The format, the round trip, coverage, replay and the copy-on-write stable read are code
+> with tests; what is not is **where a snapshot goes** — nothing writes one anywhere, the throttle that would
+> pace it is a number nobody has chosen, and whether a cold start reads a local copy or fetches from a peer is
+> a decision. `status.md` tracks those three. Everything below is the reasoning either way, including the
+> turns that were wrong, which is what this file is for.
 >
 > **Tried** — "a checkpoint of the engine's state", taken to mean the index, the buffer, the block
 > metadata and the per-segment counts, written every N minutes.
