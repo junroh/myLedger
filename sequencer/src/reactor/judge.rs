@@ -281,7 +281,12 @@ where
             TransferKind::SinglePhase => self.direct_effect(item, EffectKind::Post, extra),
             TransferKind::Hold => self.direct_effect(item, EffectKind::Hold, extra),
             TransferKind::Settle => self.resolving_effect(slot, item, EffectKind::Settle, chain),
-            TransferKind::Void => self.resolving_effect(slot, item, EffectKind::Void, chain),
+            // One branch for both voids, which is rule 1's "share the delta rule, not the branching"
+            // read the other way round: these two are the same movement of money and the same effect, and
+            // giving them two arms here would be two places for one rule to drift.
+            TransferKind::VoidClient | TransferKind::VoidExpiry => {
+                self.resolving_effect(slot, item, EffectKind::Void, chain)
+            }
         }
     }
 

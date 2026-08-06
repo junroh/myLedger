@@ -107,6 +107,10 @@ where
         // the ledger's own, so a client using it could collide with a resolution the ledger derives and
         // idempotency would answer a real transfer as a duplicate. Not part of `Transfer::validate`,
         // which is shape only — a ledger-origin id is perfectly well shaped, and the ledger submits one.
+        //
+        // Asked of the id and not of the kind, deliberately. `TransferKind` reads that bit too, but only
+        // to tell the two voids apart, so a client sending a reserved id with *settle* flags would come
+        // back a perfectly ordinary `Settle`. What is being policed here is the id space itself.
         if request.tx.id.is_ledger_origin() {
             return self.reject_before_seq(request, LedgerError::ReservedTransactionId);
         }
@@ -306,14 +310,13 @@ where
             lane: item.lane,
             seq: item.seq,
             digest: item.digest,
-            // A resolution the ledger derived asks for the queue and not the map. Why it may not be
-            // recorded is on `IdemAsk::Serialize`; why it is here at all is the queue — a lane is put back
-            // into order by the component the request travels through, and one that travelled through
-            // neither had nothing ordering it against the requests that did.
-            ask: if item.tx.id.is_ledger_origin() {
-                IdemAsk::Serialize
-            } else {
-                IdemAsk::Check
+            // An expiry void asks for the queue and not the map. Why it may not be recorded is on
+            // `IdemAsk::Serialize`; why it is here at all is the queue — a lane is put back into order by
+            // the component the request travels through, and one that travelled through neither had
+            // nothing ordering it against the requests that did.
+            ask: match item.kind.is_client() {
+                true => IdemAsk::Check,
+                false => IdemAsk::Serialize,
             },
         };
         self.idem.dispatch(request).is_ok()

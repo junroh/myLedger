@@ -110,7 +110,7 @@ impl Timings {
             raft_nanos: (1 + pick(4)) * step_nanos,
             raft_tail_nanos: pick(3) * step_nanos,
             // A day short enough that a run crosses several of them, so retention actually runs out and
-            // the auto-void it produces is judged while the faults are on. One seed in four keeps the day
+            // the expiry void it produces is judged while the faults are on. One seed in four keeps the day
             // long enough never to pass, because a ledger nothing expires in is also a shape to cover.
             day_nanos: if pick(4) == 0 {
                 0

@@ -148,7 +148,7 @@ impl Workload {
                 None => self.hold(),
             },
             WorkloadKind::VoidHeavy => match self.due_hold() {
-                Some(hold) => self.void(hold),
+                Some(hold) => self.client_void(hold),
                 None => self.hold(),
             },
             WorkloadKind::Linked => self.chain_leg(),
@@ -334,7 +334,8 @@ impl Workload {
         transfer
     }
 
-    fn void(&mut self, hold: OpenHold) -> Transfer {
+    /// A *client* void: the driver is a client, so it never builds the expiry kind.
+    fn client_void(&mut self, hold: OpenHold) -> Transfer {
         Transfer {
             id: self.take_id(),
             pending_ref: hold.id,

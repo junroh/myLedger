@@ -536,9 +536,8 @@ where
             AckOutcome::Committed => {}
         }
         // The ledger does not answer itself. An expiry void was nobody's request, so an ack for it would
-        // put a transaction id no client sent into the client's stream. The reserved top bit is what makes
-        // this readable off the id, so no stage has to carry a flag saying whose work this was.
-        if item.tx.id.is_ledger_origin() {
+        // put a transaction id no client sent into the client's stream.
+        if !item.kind.is_client() {
             return;
         }
         self.outbox.emit(Ack {

@@ -35,18 +35,45 @@ impl core::ops::BitOr for TransferFlags {
     }
 }
 
+/// **There are two voids and they are not the same work.** A *client void* is a resolution someone
+/// submitted and is waiting for. An *expiry void* is one the ledger proposed itself, because a hold
+/// outlived its retention and the pending column it reserved has to come back down.
+///
+/// They move money identically — one `EffectKind::Void`, one delta rule, one branch in the judge and in
+/// the apply. Everything around the money differs: who is owed an ack, whether idempotency records the
+/// id, and what a refusal means. So they are two kinds rather than one kind with a flag beside it, and the
+/// reason is that the compiler then makes a reader decide. Three readers used to derive this from the id's
+/// reserved top bit, each asking a slightly different question, and they agreed only because the sole
+/// ledger-origin transfer that exists is an expiry void — a second one would have made all three quietly
+/// wrong. That is rule 18's shape: a judgment everything depends on that nothing owned.
+///
+/// Not an *origin* beside the kind, either, which was the first attempt: origin does not vary
+/// independently of kind. A hold, a settle and a single-phase transfer are always a client's, so an
+/// orthogonal axis would name eight combinations of which five cannot exist and nothing would forbid
+/// constructing them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TransferKind {
     #[default]
     SinglePhase,
     Hold,
     Settle,
-    Void,
+    /// A client asked to release the rest of a hold.
+    VoidClient,
+    /// The ledger asked, because the hold's retention ran out. Nobody is waiting for it, idempotency
+    /// records nothing — the id is derived, so a refused one has to stay offerable — and a refusal tells
+    /// no one, because there is no one to tell.
+    VoidExpiry,
 }
 
 impl TransferKind {
     pub const fn needs_pending_lookup(self) -> bool {
-        matches!(self, Self::Settle | Self::Void)
+        matches!(self, Self::Settle | Self::VoidClient | Self::VoidExpiry)
+    }
+
+    /// Whether a client submitted this. The one place the two voids are treated alike is money; this is
+    /// the one place they are asked apart without naming either.
+    pub const fn is_client(self) -> bool {
+        !matches!(self, Self::VoidExpiry)
     }
 }
 
@@ -96,12 +123,20 @@ impl Transfer {
         }
     }
 
+    /// The two voids are told apart by the id's reserved top bit rather than by a flag of their own, so
+    /// the fact has one owner. That bit has to exist regardless — a derived id needs a space a client
+    /// cannot reach, or idempotency would answer a real transfer as a duplicate — and it is exactly the
+    /// fact being asked for. A second encoding beside it would be two owners of one truth (rule 18) with
+    /// an agreement to prove; this has neither.
     pub const fn kind(&self) -> Result<TransferKind, LedgerError> {
         match self.flags.raw() & TransferFlags::PHASE_MASK {
             0 => Ok(TransferKind::SinglePhase),
             1 => Ok(TransferKind::Hold),
             2 => Ok(TransferKind::Settle),
-            4 => Ok(TransferKind::Void),
+            4 => match self.id.is_ledger_origin() {
+                true => Ok(TransferKind::VoidExpiry),
+                false => Ok(TransferKind::VoidClient),
+            },
             _ => Err(LedgerError::InvalidFlags),
         }
     }
@@ -142,7 +177,10 @@ impl Transfer {
                     return Err(LedgerError::MissingPendingRef);
                 }
             }
-            TransferKind::Void => {
+            // Both voids, together: shape is the one thing they share completely. A client submitting a
+            // `VoidExpiry` is well shaped and is refused at the client boundary instead, where the rule
+            // about the reserved id space lives — see `Reactor::admit`.
+            TransferKind::VoidClient | TransferKind::VoidExpiry => {
                 if self.pending_ref.is_absent() {
                     return Err(LedgerError::MissingPendingRef);
                 }

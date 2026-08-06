@@ -118,7 +118,7 @@ fn a_client_may_not_use_the_ids_reserved_for_the_ledgers_own_resolutions() {
     harness.fund(ALICE, FUNDING);
 
     let mut tx = harness.transfer(ALICE, BOB, 10);
-    tx.id = TxId::ledger_resolution_of(tx.id);
+    tx.id = TxId::expiry_void_of(tx.id);
     assert_eq!(
         harness.run(tx).outcome,
         AckOutcome::Rejected(LedgerError::ReservedTransactionId)

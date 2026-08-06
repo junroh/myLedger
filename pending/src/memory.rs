@@ -1042,7 +1042,7 @@ mod worker_tests {
     use super::*;
     use crate::block::RECORDS_PER_BLOCK;
     use ledger_base::ports::PendingEffect;
-    use ledger_base::AccountId;
+    use ledger_base::{AccountId, TransferKind};
 
     fn config() -> MemoryPendingConfig {
         MemoryPendingConfig {
@@ -1112,7 +1112,7 @@ mod worker_tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         while offered < RECORDS_PER_BLOCK && Instant::now() < deadline {
             if let Some(PendingNotice::HoldExpired { void }) = engine.notices() {
-                assert!(void.id.is_ledger_origin());
+                assert_eq!(void.kind(), Ok(TransferKind::VoidExpiry));
                 offered += 1;
             }
         }

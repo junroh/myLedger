@@ -11,11 +11,26 @@ code needed a distinction the design blurred, the split is recorded here.
 | **hold** | one reservation created by a pending transfer — the thing a settle or void resolves. | `HoldData`, `HoldView`, `HoldOverlay` |
 | **resolve** | the umbrella for finishing a hold, either way. | `resolving_effect`, `PartialResolutionNotAllowed` |
 | **settle** | resolve a hold by moving money to the posted column, in whole or in part. | `TransferFlags::POST_PENDING`, `EffectKind::Settle` |
-| **void** | resolve a hold by releasing whatever is left. | `TransferFlags::VOID_PENDING`, `EffectKind::Void` |
+| **void** | resolve a hold by releasing whatever is left. Never used unqualified in code: there are two, below. | `EffectKind::Void` |
+| **client void** | a void someone submitted and is waiting for. | `TransferKind::VoidClient` |
+| **expiry void** | a void the ledger proposed itself, because the hold outlived its retention. | `TransferKind::VoidExpiry`, `TxId::expiry_void_of` |
 | **single-phase** | a transfer with no hold at all: posted immediately. | `TransferKind::SinglePhase`, `EffectKind::Post` |
 
 `pending_ref` is the field whose meaning depends on the kind: the hold being resolved for a settle
 or void, the budget group being joined for a hold, absent for a single-phase transfer.
+
+**The two voids are the same money and different work**, and this is the distinction to keep straight
+because for a while the code did not: one word covered both and three readers told them apart by a bit of
+the transaction id. They share `EffectKind::Void`, one delta rule, and one branch in the judge and the
+apply — money is where they are identical, so a second branch there would be one rule in two places.
+Everything else differs, and it differs in the same direction every time: an expiry void is nobody's
+request. No ack leaves for one. Idempotency records nothing (`IdemAsk::Serialize`), because its id is
+derived from the hold rather than chosen, so a refused one must stay offerable. And a refusal tells no
+one, which is why the sweep offering it again is the only retry there is.
+
+They are two `TransferKind` variants rather than a kind plus an origin, because origin does not vary
+independently of kind: a hold, a settle and a single-phase transfer are always a client's. An orthogonal
+axis would name eight combinations of which five cannot exist. Design notes §14.
 
 ## Atomicity and grouping — two different things
 

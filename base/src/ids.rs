@@ -32,17 +32,21 @@ macro_rules! id_type {
 id_type!(TxId(u128));
 
 impl TxId {
-    /// The top bit marks a transaction the ledger made up rather than a client, and clients are refused
-    /// it (`Transfer::validate`). The reservation exists because a ledger-generated id has to be
-    /// *derivable*: a hold's auto-void must get the same id whichever leader proposes it, or a leader
+    /// The top bit marks a transaction the ledger made up rather than a client, and clients are refused it
+    /// at the client boundary (`Reactor::admit`). The reservation exists because a ledger-generated id has
+    /// to be *derivable*: an expiry void must get the same id whichever leader proposes it, or a leader
     /// change between the proposal and the commit voids the hold twice. Derived means it cannot also be
     /// unique by construction, so it needs a space of its own — colliding with a client's id would make
     /// idempotency answer a real transfer as a duplicate.
+    ///
+    /// It carries a second job because it happens to be exactly the right fact: `Transfer::kind` reads it
+    /// to tell a `VoidExpiry` from a `VoidClient`. One owner, two readers that both want the same truth.
     const LEDGER_ORIGIN: u128 = 1 << 127;
 
-    /// The id of the resolution the ledger proposes for this hold. Deterministic, so two leaders propose
-    /// the same one and the second is a duplicate rather than a second void.
-    pub const fn ledger_resolution_of(hold: Self) -> Self {
+    /// The id of the **expiry void** the ledger proposes for this hold — the one kind of transfer the
+    /// ledger submits itself. Deterministic, so two leaders propose the same one and the second is a
+    /// duplicate rather than a second void.
+    pub const fn expiry_void_of(hold: Self) -> Self {
         Self(hold.0 | Self::LEDGER_ORIGIN)
     }
 

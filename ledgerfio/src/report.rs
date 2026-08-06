@@ -485,8 +485,9 @@ impl RunReport {
                 self.metrics.invariant_breaks
             );
         }
-        // The days behind belong beside the refusals, because they are cause and effect: a void with no
-        // room is offered again next round, and a day that keeps being offered again is a day not emptied.
+        // The days behind belong beside the refusals, because they are cause and effect: an expiry void
+        // with no room is offered again next round, and a day that keeps being offered again is a day not
+        // emptied.
         // One is ordinary; more than the configured grace is the throttle behind by longer than the index
         // was sized to allow, which ends in the seal below rather than in late deletion.
         let behind = self.pending_traffic.days_behind;
@@ -500,14 +501,14 @@ impl RunReport {
                 self.metrics.expiry_dropped,
                 behind
             );
-            // Blocks read per void released is the sweep's price, and unlike the index scan it replaces it
-            // is a bounded one: a round reads the blocks it was asked for, they belong to the expiring day
+            // Blocks read per expiry void released is the sweep's price, and unlike the index scan it
+            // replaces it is bounded: a round reads the blocks it was asked for, they belong to the day
             // rather than to the whole table, and they are read in order. Ratio rather than total, because
             // what a policy has to size is the work per hold released.
             let per_void = match self.metrics.holds_expired {
                 0 => "nothing released yet".to_owned(),
                 released => format!(
-                    "{:.1} records read per void released",
+                    "{:.1} records read per expiry void released",
                     swept as f64 * ledger_pending::RECORDS_PER_BLOCK as f64 / released as f64
                 ),
             };

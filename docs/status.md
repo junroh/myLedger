@@ -100,7 +100,10 @@ runs out is emptied by releasing whatever survived it. Design notes §14.
   blocks a round leaves three orders of headroom and the binding constraint is a single round rather than
   the rate. That round is tens of microseconds at any survivor density, so there is nothing left for a
   policy to trade — which is why this stopped being an open question rather than getting an answer.
-- **The void is judged, not applied.** A settle the client submitted may be in flight for the same
+- **The expiry void is its own kind, and it is judged rather than applied.** `TransferKind::VoidExpiry`
+  beside `VoidClient`: same money, same effect, same branch, and different in everything around it — no
+  ack leaves for it, idempotency records nothing, and a refusal tells no one. It is judged because a
+  client void or a settle may be in flight for the same
   hold, and only the judge sees both. Its id is derived from the hold, so two leaders propose the
   same one and the second is a duplicate — which is why the top bit of a transaction id is reserved
   and clients are refused it.

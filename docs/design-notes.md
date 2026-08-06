@@ -1163,7 +1163,8 @@ and exits 1.
 > **Chose** — a deadline computed from the segment's own day, one wall-clock reading per day through an
 > injectable `DaySource`, the wheel reduced to one live count per day, and the survivors read out of that
 > day's own blocks a declared number at a time. One number — `grace_days` — buys away every source of
-> *early* deletion at once, and its price is linear and only ever space.
+> *early* deletion at once, and its price is linear and only ever space. The resolution it proposes is a
+> kind of its own, `VoidExpiry`, because it is nobody's request and three stages have to know that.
 
 The thirty-two days is not an internal window. It is told to the customer — *your pending data is kept
 for at most thirty-two days, then deleted* — and a promise like that has two edges, only one of which is
@@ -1272,10 +1273,24 @@ its blocks left memory long ago. Asking memory would be a test whose answer is a
 The block range each day wrote is two numbers per segment, because block numbers count on across day
 boundaries and a day's blocks are consecutive by construction (§12). Nothing else had to be remembered.
 
-The void is then **judged like any other resolution, not applied**. It has to be: a settle the client
-submitted may be in flight for the same hold, and only the judge sees both. So it takes a slot, a place in
+The expiry void is then **judged like any other resolution, not applied**. It has to be: a client void or
+a settle may be in flight for the same hold, and only the judge sees both. So it takes a slot, a place in
 its lane and a lookup, and it is refused by the same rules — a hold already resolved, a quarantined lane, a
 sealed apply path — with the sweep offering it again next time round.
+
+**And it is a kind of its own, `TransferKind::VoidExpiry`, not a void with a note attached.** For a while
+one word covered both and three stages told them apart by reading the reserved top bit of the transaction
+id, each for a slightly different question: is a client using a reserved id, does this want idempotency's
+queue rather than its map, is anyone waiting for an ack. They agreed only because the one ledger-origin
+transfer that exists is an expiry void, so a second one would have made all three quietly wrong — rule 18,
+a judgment everything depended on that nothing owned. Naming it a kind puts the decision in `kind()` and
+lets the compiler ask every reader, which is what a comment was doing before.
+
+It is not an *origin* beside the kind, which was the first attempt at this. Origin does not vary
+independently of kind — a hold, a settle and a single-phase transfer are always a client's — so an
+orthogonal axis names eight combinations of which five cannot exist and nothing forbids building them. And
+the discriminator stays the id's reserved bit rather than a flag of its own: that bit has to exist anyway,
+so reading it is one owner with two readers, where a flag beside it would be two owners of one truth.
 
 Two things follow that are worth stating because they are wire-visible:
 

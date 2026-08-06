@@ -496,8 +496,11 @@ impl PendingEngine {
             if !index.points_at(key, addr) {
                 return;
             }
+            // The one place an expiry void is built. Its id is derived from the hold, which is what makes
+            // it a `TransferKind::VoidExpiry` everywhere downstream — the void flags alone would make it a
+            // client's.
             into.push(Transfer {
-                id: TxId::ledger_resolution_of(key),
+                id: TxId::expiry_void_of(key),
                 pending_ref: key,
                 debit_account: hold.debit_account,
                 credit_account: hold.credit_account,
@@ -1082,7 +1085,7 @@ mod fetch_tests {
 mod expiry_tests {
     use crate::block::RECORDS_PER_BLOCK;
     use crate::engine::test_support::Stored;
-    use ledger_base::{AccountId, BudgetGroup, TxId};
+    use ledger_base::{AccountId, BudgetGroup, TransferKind, TxId};
 
     use super::*;
 
@@ -1194,7 +1197,7 @@ mod expiry_tests {
     /// the sweep reads the record rather than working from the index alone. The id is derived from the hold,
     /// so two leaders propose the same one and the second is a duplicate rather than a second void.
     #[test]
-    fn an_outlived_hold_is_offered_as_a_void_with_a_derived_id() {
+    fn an_outlived_hold_is_offered_as_an_expiry_void_with_a_derived_id() {
         let (mut engine, written) = written_on_day_zero();
         engine.open_day(LIFETIME, LIFETIME);
 
@@ -1205,8 +1208,11 @@ mod expiry_tests {
             "not every survivor of the day was offered"
         );
         let void = voids[0];
-        assert_eq!(void.id, TxId::ledger_resolution_of(void.pending_ref));
-        assert!(void.id.is_ledger_origin());
+        assert_eq!(void.id, TxId::expiry_void_of(void.pending_ref));
+        // The kind, not the bit it is read from: what every stage downstream branches on is that this is
+        // an expiry void and not a client's, and a build that lost the derivation would still say
+        // `VoidClient` here while every assertion about the id passed.
+        assert_eq!(void.kind(), Ok(TransferKind::VoidExpiry));
         assert_eq!(void.debit_account, AccountId(1));
         assert_eq!(void.credit_account, AccountId(2));
         // A void releases whatever is left, so it names no amount — which is also what makes offering the
