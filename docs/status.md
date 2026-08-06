@@ -317,11 +317,27 @@ unanswered, and **when that default stops being safe**. The source design's own 
   *Stops being safe:* at the point a real device goes in, when all five become live at once. That is worth
   knowing in advance rather than discovering as five surprises.
 
-**Closed, and kept here so a reader can tell a settled question from an open one.** The expiry throttle's
-slice no longer needs a policy — the requirement is met three orders over and the binding constraint is a
-single round, which is bounded by declaration. `min_live_seg_id` needs no epoch here, and a test says why.
-`SE-OQ-2` has its measurement. `SE-OQ-7` is answered by the budget group index existing and dying with the
-group it tracks.
+### Closed, and kept so a reader can tell a settled question from an open one
+
+A question that is answered leaves this list by being **moved down here with what answered it**, not by being
+deleted. That is not tidiness: twice in one session an entry was removed at the moment it was fixed, and both
+times the finding behind it went with it — including the one fact that made a declared bound worth declaring.
+An entry that vanishes reads as a question nobody ever asked.
+
+- **What should a node do once expiry has stopped working altogether?** It cannot get there any more. A
+  declined expiry void is now retried from the slice the engine keeps rather than by a re-walk gated on
+  progress, so one dropped notice no longer stops deletion for the life of the node; `set_wants_expiry` paces
+  the retry so it is not a storm; and the calendar stops before a sweep far enough behind can reuse a day's
+  segment. The three together are what closed it — none of them alone would have.
+- **Can the sweep fall far enough behind to reuse a day's segment?** No: `open_day` refuses to advance
+  first. What made this worth a declared bound rather than an accepted risk is in design notes §14 — the
+  wrap was late rather than early only by a coincidence of three unrelated details.
+- **What sizes the expiry throttle's slice?** The day does. The requirement is met three orders over and the
+  binding constraint is a single round, which is bounded by declaration rather than by density.
+- **Does the index need a `min_live_seg_id` epoch?** No, and a test says why: a day's blocks go back only
+  once the index has no entry in it, so the dead slots are gone before the blocks are.
+- **`SE-OQ-2`** — the index bench measures what cannot be placed at each load factor and cascade cap.
+- **`SE-OQ-7`** — answered by the budget group index existing and dying with the group it tracks.
 
 ## Where the numbers live
 

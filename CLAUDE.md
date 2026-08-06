@@ -31,12 +31,14 @@ source of truth for current work and outstanding gaps.
 section with four lines — what was **tried**, what **broke**, what was **weighed**, what was **chosen** —
 and the prose below is the evidence. Unsettled ones are an entry under *Decisions waiting on someone* in
 `docs/status.md`, with the question, the **default** the code takes meanwhile, and **when that default
-stops being safe**. Write the four lines when a decision closes and move the entry out; a decision left in
-prose is one nobody revisits, and a default nobody chose reads exactly like a choice.
+stops being safe**. Write the four lines when a decision closes and **move** the entry to that section's
+closed list with what answered it — deleting it takes the finding behind it with it, and an entry that
+vanished reads as a question nobody asked. A decision left in prose is one nobody revisits, and a default
+nobody chose reads exactly like a choice.
 
 ## Coding rules
 
-1. **DRY.** A rule lives in exactly one place. Exception: the four transfer kinds (single-phase / hold / settle / void) stay explicit branches in the S3-judge and S5-apply hot paths. Share the *delta rule*, not the branching.
+1. **DRY.** A rule lives in exactly one place. Exception: the transfer kinds stay explicit branches in the S3-judge and S5-apply hot paths. Share the *delta rule*, not the branching — and the two voids are the worked example in both directions: `VoidClient` and `VoidExpiry` are separate kinds because three stages have to tell them apart, and they share one arm in the judge because they are the same movement of money.
 2. **Self-explanatory code.** Names carry the meaning; comments explain *why* only. No banner comments, no restating code.
 3. **One name per concept.** `docs/glossary.md` is the list, and it matches the design documents where they have a term. Notably: *pending* is the phase, the column and the component; a *hold* is one reservation; a *chain* is the atomicity unit of a submission; a *budget group* is a lifetime property of holds — "group" alone never means a chain.
 4. **Only what is needed.** No speculative extension points, no abstraction for a future that is not here yet.
