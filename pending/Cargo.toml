@@ -11,6 +11,10 @@ harness = false
 name = "sweep"
 harness = false
 
+[[bench]]
+name = "snapshot"
+harness = false
+
 [dependencies]
 ledger-base.workspace = true
 ledger-stubkit.workspace = true

@@ -357,14 +357,12 @@ unanswered, and **when that default stops being safe**. The source design's own 
   seconds is measuring this ledger rather than the stand-in. It becomes a correctness-adjacent question
   when a node has to run for a day.
 
-- **How fast does the engine replay, and so how often must a snapshot be written?**
-  *Default:* neither exists, so neither has a value. Design notes §15 shows the interval is decided by
-  recovery time and nothing else — a long interval is nearly free in IO and a short one is not — and that
-  the missing input is the replay rate. An estimate of a million effects a second would put a 24-hour
-  replay at minutes, which would mean the design's base-plus-deltas is built for an MTTR this workload
-  does not need. An estimate is not a number.
-  *Stops being safe:* the moment an interval is chosen. Choosing before measuring adds a figure with
-  nothing behind it, which is what this file exists to prevent. Related: `SE-OQ-1`.
+- **What throttle paces the snapshot's write?**
+  *Default:* none — nothing writes one anywhere, so nothing paces it. The unit is settled (a declared number
+  of buckets per round, like every other background path) and so is the reason it is needed whatever disk the
+  snapshot lands on. What is not chosen is the number, and it is the number that sizes the copy-on-write side
+  buffer: a longer dump shadows more buckets.
+  *Stops being safe:* the first snapshot written on a node serving traffic.
 
 - **Who records the apply index on each side, and how is it restored?**
   *Default:* nobody. The seam is open — `ApplyIndex` names it, a commit carries its batch's log position,
@@ -439,6 +437,11 @@ An entry that vanishes reads as a question nobody ever asked.
 - **Can the sweep fall far enough behind to reuse a day's segment?** No: `open_day` refuses to advance
   first. What made this worth a declared bound rather than an accepted risk is in design notes §14 — the
   wrap was late rather than early only by a coincidence of three unrelated details.
+- **How often must a snapshot be written, and does it need deltas?** A long interval, and no. The replay
+  rate is measured — 16–25M effects a second, so a design day's 300M costs 12–18s of engine time against 67s
+  to read the 34GB of log it is in. Recovery is bounded by the log's bandwidth by about six to one, so a
+  snapshot a day old recovers in a minute or two and deltas would buy seconds off a read they do not shorten.
+  `cargo bench -p ledger-pending --bench snapshot`, and design notes §15 has the table.
 - **What sizes the expiry throttle's slice?** The day does. The requirement is met three orders over and the
   binding constraint is a single round, which is bounded by declaration rather than by density.
 - **Does the index need a `min_live_seg_id` epoch?** No, and a test says why: a day's blocks go back only
