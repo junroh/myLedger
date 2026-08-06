@@ -1530,10 +1530,19 @@ produces one of two silent wrong answers:
 - the other way: it appears **nowhere**. Its `Create` is before coverage, so replay does not restore it.
 
 Hence the dump needs a stable view of the array. Not two copies of it: copy the buckets that are about to
-change, and let the dumper read the pre-image. At the design's rates the dump takes about eighty-five
-seconds against a 500MB/s device, and the index takes a few thousand writes a second, so the side buffer
-holds tens of megabytes — against 42.7GB for a second array. Its size follows the *dump's duration*, which
-is set by the device rather than by the interval, so a longer interval does not make it bigger.
+change, and let the dumper read the pre-image. At the design's rates the index takes a few thousand writes
+a second, so a dump lasting a minute or two leaves the side buffer holding tens of megabytes — against
+42.7GB for a second array.
+
+**Its size follows the dump's duration, and the duration is a declaration rather than a device.** The write
+is throttled — a bounded number of buckets per round, like every other background path here — so how long
+a dump takes is chosen rather than discovered, and the side buffer it needs follows from that choice by
+arithmetic. That makes the buffer one more size derived from `PendingCapacity` and refusable at startup,
+which is what rule 20 asks for: the ceiling lives on the declaration and not on whichever disk the
+deployment happens to have.
+
+Throttling is needed whether or not the snapshot shares a disk with the Raft log. Even alone it competes
+with the engine's own reads, and those are on the critical path against a 5ms contract.
 
 ### What is carried, and what is derived
 
@@ -1621,11 +1630,17 @@ Three rules, and they hold:
 
 Two of the design's rules were absent from the reasoning above and belong in it.
 
-**The snapshot shares a disk with the Raft log.** Disk 1 carries both (§2.2), and log commits are on the
-critical path while a snapshot is background work. So the write needs a rate limit and low-priority IO —
-the design says so, and §15's interval table quietly assumed the bandwidth was free. It is not free, it is
-*subordinate*: at a long interval the snapshot's share is a fraction of the log's own write rate, which is
-another argument for the long interval, and at ten minutes it is twice the log's and would be felt.
+**The write has to be throttled, and the interval table quietly assumed its bandwidth was free.** It is
+not free, and it is not the disk layout that makes it so. Whether Disk 1 carries both the log and the
+snapshot, as §2.2 has it, decides only *what* the snapshot competes with — the log's commits, which are on
+the critical path, or the engine's own reads, which are on it too against a 5ms contract. Either way the
+answer is the same and the design says it: a rate limit and low-priority IO, which here takes the shape
+every other background path takes — a declared number of buckets per round.
+
+The layout does change the arithmetic, so it is worth keeping the numbers apart from the rule. Sharing a
+disk, a long interval puts the snapshot at a fraction of the log's own write rate and ten minutes puts it
+at twice — another argument for the long interval. On its own disk that comparison disappears and the
+competition is with reads instead. The throttle is required in both.
 
 **`apply_index` is a cross-component invariant, not just a resume point.** The account component
 checkpoints too, and the design records the index in both so the two views can be compared. That check

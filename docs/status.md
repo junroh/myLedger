@@ -334,6 +334,15 @@ unanswered, and **when that default stops being safe**. The source design's own 
   *Stops being safe:* the first time two components are snapshotted independently, which is the first
   checkpoint of either.
 
+- **Does the snapshot share a disk with the Raft log?**
+  *Default:* the design puts both on Disk 1 (§2.2) and nothing here has chosen. It changes only what the
+  snapshot's throttled write competes with — log commits or the engine's own reads — and both are on a
+  critical path, so the throttle is required either way (§15). What it does change is the arithmetic: on a
+  shared disk the snapshot's share is measured against the log's own write rate, which is one more argument
+  for a long interval.
+  *Stops being safe:* at provisioning, since it is a volume decision. It is here so the throttle is not
+  mistaken for something the layout could make unnecessary.
+
 - **Where is a snapshot written, and is cold start local or from a peer?**
   *Default:* nowhere, so the question is open in both halves. §15 argues the serialisation is the whole
   mechanism and the disk cadence is a policy on top of it: a node that always fetches from a peer needs a
