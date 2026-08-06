@@ -211,8 +211,10 @@ The sentence that used to be here was wrong in a way worth keeping: it said the 
 because unflushed records have to fit in a checkpoint, so the number could not be justified without one.
 They do not have to fit in it. What is unflushed is in the log, so a snapshot leaves it out and recovery
 replays it — and the hour's justification becomes *an hour is what recovery replays*, which is arithmetic
-on the log's size rather than a claim needing a device. What is still unverified is the replay **rate**,
-and that is the one number the snapshot's interval waits on.
+on the log's size rather than a claim needing a device. The replay **rate** is measured now, and it says the
+hour is nowhere near the binding term: a whole day of log replays in 12–18 seconds of engine time against 67
+seconds to read it, so what bounds recovery is the log's bandwidth. An hour of window is a rounding error
+inside that.
 
 ### Smaller, and each with a reason
 
