@@ -141,8 +141,8 @@ the split exists and that residency keeps IO off resolutions inside it.
 
 - **The load-factor alarm is reporting only.** The index reports its load against the target and
   its worst cascade, but nothing warns or refuses before an insert fails. The channel it would warn
-  over now exists; what is missing is the threshold and what a warning should make the node do,
-  which is a question about operations rather than about the code.
+  over now exists; what is missing is the threshold and what a warning should make the node do —
+  a question about operations rather than about the code, listed under *Decisions waiting on someone*.
 - **Consensus is an echo**, the dedup map has no expiry, and the log has no compaction. All three
   grow with a run, which the tools say out loud.
 - **A long run's worst tail belongs to the dedup stand-in, not to the ledger.** A ten-second
@@ -166,7 +166,8 @@ the split exists and that residency keeps IO off resolutions inside it.
   for `lifetime` days of survivors and seals a few days behind, long before sixty; `validate` refuses a
   lifetime that needs more segments than exist, but nothing refuses a sweep this far behind. So the
   bound is real and undeclared, which is rule 20's shape — recorded rather than fixed, because the fix
-  is a question about what a node should do when expiry has stopped working at all.
+  is a question about what a node should do when expiry has stopped working at all, which is the first
+  entry under *Decisions waiting on someone*.
 
 ### Where the documents and the code have diverged
 
@@ -202,6 +203,73 @@ workload (half its chains create a hold and resolve it inside the chain), the st
 metrics struct is `FakeOrderWait` so `OrderWait` names one thing, unordered replies skip lane
 ordering in the dedup stub and both fakes, and the simulator now creates holds on the unconstrained
 account so `check` exercises the order exemption itself — the sweep test asserts it did.
+
+## Decisions waiting on someone
+
+Not gaps in the code — questions the code cannot answer for itself, each of which it is currently
+answering by default. They were scattered through the prose above until they were collected here, which
+is why this section exists: a decision written into a paragraph about something else is one nobody
+revisits, and a default nobody chose reads exactly like a decision that was made.
+
+Every entry says the same three things: **the question**, the **default** the code takes while it goes
+unanswered, and **when that default stops being safe**. The source design's own open questions are tagged
+`SE-OQ-n` where one matches, because until now those numbers appeared nowhere in this repository.
+
+- **What should a node do once expiry has stopped working altogether?**
+  *Default:* nothing — it falls further behind for ever, silently, and the store stops shrinking. The
+  segment-reuse entry above has the mechanism.
+  *Stops being safe:* when a deployment can reach that state without the index sealing first. Today two
+  independently chosen sizes make the seal come first, which is rule 20's shape rather than a guarantee.
+
+- **What threshold should the load-factor alarm fire at, and what should the node do when it fires?**
+  *Default:* it reports and nothing acts. Inserts succeed until one cannot be placed, and that seals.
+  *Stops being safe:* as soon as an operator is expected to react before the seal rather than after it.
+  Half the input exists: `cargo bench -p ledger-pending --bench index` measures what cannot be placed at
+  each load factor and cascade cap — at the 0.90 target and a cap of 128 it is zero in 7.5 million, and it
+  is 149 per million if the cap drops to 32. That is `SE-OQ-2`, answered. What is missing is the operational
+  half.
+
+- **Where does `expiry_blocks_per_round` come from in a deployment?**
+  *Default:* a constant, two. It has three orders of headroom against a design day, so nothing is wrong
+  today.
+  *Stops being safe:* if a day's blocks ever grow faster than the rounds available to read them —
+  a much larger `daily_arrivals`, or a store whose reads are slow enough that a round no longer fits
+  beside the lookups.
+
+- **When does the dedup engine get its rotating generations?**
+  *Default:* a map that only grows, which owns the worst tail of any long run (see above).
+  *Stops being safe:* it already is not, for measurement — no latency gate on a run longer than a few
+  seconds is measuring this ledger rather than the stand-in. It becomes a correctness-adjacent question
+  when a node has to run for a day.
+
+- **How is the flush window's hour justified without a checkpoint?**
+  *Default:* an hour, chosen because unflushed records are memory-only and have to fit in a checkpoint
+  that does not exist.
+  *Stops being safe:* the number cannot be wrong yet, because nothing depends on it. It has to be
+  re-derived the moment recovery is real. Related: `SE-OQ-1`, the split between the two windows and what
+  the hit rate buys.
+
+- **Does the client get told when a hold is voided for outliving its retention?**
+  *Default:* no. The negative answer the design asked for is refused for a stated reason (above), and
+  nothing replaces it.
+  *Stops being safe:* whenever a client's correctness depends on distinguishing "expired" from "never
+  existed". It needs a push channel the ledger does not have, so this is a protocol decision, not an
+  engine one.
+
+- **Which of the design's storage questions are still untouched, and is that acceptable?**
+  *Default:* untouched. `SE-OQ-3` (a group spilling across blocks and what it costs in IO),
+  `SE-OQ-4` (io_uring against a thread pool), `SE-OQ-5` (compression), `SE-OQ-6` (the ≤5ms worst case
+  verified against a real device) and `SE-OQ-8` (provisioning down on the cache hit rate) all need a disk
+  under the block store, and there is none — `StoreModel` prices a device's latency and IOPS but is not
+  one.
+  *Stops being safe:* at the point a real device goes in, when all five become live at once. That is worth
+  knowing in advance rather than discovering as five surprises.
+
+**Closed, and kept here so a reader can tell a settled question from an open one.** The expiry throttle's
+slice no longer needs a policy — the requirement is met three orders over and the binding constraint is a
+single round, which is bounded by declaration. `min_live_seg_id` needs no epoch here, and a test says why.
+`SE-OQ-2` has its measurement. `SE-OQ-7` is answered by the budget group index existing and dying with the
+group it tracks.
 
 ## Where the numbers live
 
