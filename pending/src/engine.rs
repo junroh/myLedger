@@ -1,7 +1,7 @@
 use ledger_base::ports::{ApplyIndex, HoldData, PendingEffect};
 use ledger_base::{Amount, BudgetGroup, FxHashMap, MapGauge, Transfer, TransferFlags, TxId};
 
-use crate::block::{BlockAddr, BlockStore, LogTraffic, MemBlockStore, RecordLog, SEGMENTS};
+use crate::block::{BlockStore, LogTraffic, MemBlockStore, RecordAddr, RecordLog, SEGMENTS};
 use crate::index::{Candidates, HoldTable};
 use crate::snapshot::SnapshotWriter;
 
@@ -17,7 +17,7 @@ pub struct PendingEngine {
     records: RecordLog,
     budgets: FxHashMap<BudgetGroup, BudgetState>,
     /// Reused by every compaction, so flushing a block allocates nothing.
-    survivors: Vec<(TxId, HoldData, BlockAddr)>,
+    survivors: Vec<(TxId, HoldData, RecordAddr)>,
     /// Lookups waiting on the store, with the rest of their candidate walk.
     fetches: FxHashMap<u64, Fetch>,
     /// The day whose records are being written. Not stored anywhere durable: a segment's number *is* its
@@ -48,7 +48,7 @@ pub struct PendingEngine {
     /// top of the walk at the largest size the bench covers (19ns a void to 27ns). The alternative was to
     /// match a removal against this list as it is applied, and that puts the cost on the path that applies
     /// committed decisions in order. Background work is the right place to pay, so it pays there.
-    outstanding: Vec<(BlockAddr, Transfer)>,
+    outstanding: Vec<(RecordAddr, Transfer)>,
     overflowed: u64,
     /// The log position of the last batch whose effects reached this engine. Not the same thing as the
     /// count below: that says how many, this says *where*, and only the second is a position a snapshot can
@@ -274,7 +274,7 @@ impl PendingEngine {
         index.addr_of(key, &mut verify).is_some()
     }
 
-    fn verifier(records: &mut RecordLog, key: TxId) -> impl FnMut(BlockAddr) -> bool + '_ {
+    fn verifier(records: &mut RecordLog, key: TxId) -> impl FnMut(RecordAddr) -> bool + '_ {
         move |addr| records.read(addr).is_some_and(|(found, _)| found == key)
     }
 
@@ -685,7 +685,7 @@ impl PendingEngine {
         }
         let index = &self.index;
         let outstanding = &mut self.outstanding;
-        let mut visit = |key: TxId, hold: HoldData, addr: BlockAddr| {
+        let mut visit = |key: TxId, hold: HoldData, addr: RecordAddr| {
             if !index.points_at(key, addr) {
                 return;
             }

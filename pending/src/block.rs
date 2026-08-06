@@ -81,9 +81,9 @@ const BLOCK_MASK: u64 = (1 << BLOCK_BITS) - 1;
 /// index slot has left beside its fingerprint and its ambiguity bit — the source design packs the same
 /// three into forty and spends the difference on a narrower block field.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct BlockAddr(u64);
+pub struct RecordAddr(u64);
 
-impl BlockAddr {
+impl RecordAddr {
     pub const fn new(segment: u8, block: u64, index: u8) -> Self {
         Self(
             ((segment as u64) << (BLOCK_BITS + INDEX_BITS))
@@ -134,7 +134,7 @@ pub fn encode(key: TxId, hold: &HoldData, into: &mut [u8]) {
     debug_assert_eq!(at, RECORD_BYTES);
 }
 
-pub fn decode(bytes: &[u8], _from: BlockAddr) -> (TxId, HoldData) {
+pub fn decode(bytes: &[u8], _from: RecordAddr) -> (TxId, HoldData) {
     debug_assert_eq!(bytes.len(), RECORD_BYTES);
     let mut at = 0;
     let mut take = |width: usize| {
@@ -170,12 +170,12 @@ pub fn decode(bytes: &[u8], _from: BlockAddr) -> (TxId, HoldData) {
 /// the caller, which prices the IO while leaving the latency of that path unmodelled. That is the gap a
 /// read cache is meant to close, and it is why apply-path reads are counted separately.
 pub trait BlockStore {
-    fn write(&mut self, addr: BlockAddr, bytes: &[u8]);
+    fn write(&mut self, addr: RecordAddr, bytes: &[u8]);
     /// False when the block is not there, which is a bug rather than a miss: the index only points at
     /// blocks that were written.
-    fn read(&self, addr: BlockAddr, into: &mut [u8]) -> bool;
+    fn read(&self, addr: RecordAddr, into: &mut [u8]) -> bool;
     /// False when the store will not take another read yet, which is backpressure rather than failure.
-    fn submit(&mut self, handle: u64, addr: BlockAddr, now: u64) -> bool;
+    fn submit(&mut self, handle: u64, addr: RecordAddr, now: u64) -> bool;
     /// The next read finished by `now`, copied out. `None` while nothing is due.
     fn poll(&mut self, now: u64, into: &mut [u8]) -> Option<u64>;
     fn blocks(&self) -> usize;
@@ -195,21 +195,21 @@ pub struct MemBlockStore {
     /// Submitted reads, answered in the order they were asked for and with no delay. A store that
     /// modelled a device would answer out of order; this one is the baseline that says what the
     /// structure does when the device is not the variable.
-    submitted: VecDeque<(u64, BlockAddr)>,
+    submitted: VecDeque<(u64, RecordAddr)>,
 }
 
 impl MemBlockStore {
-    fn key(addr: BlockAddr) -> u64 {
-        BlockAddr::new(addr.segment(), addr.block(), 0).raw()
+    fn key(addr: RecordAddr) -> u64 {
+        RecordAddr::new(addr.segment(), addr.block(), 0).raw()
     }
 }
 
 impl BlockStore for MemBlockStore {
-    fn write(&mut self, addr: BlockAddr, bytes: &[u8]) {
+    fn write(&mut self, addr: RecordAddr, bytes: &[u8]) {
         self.blocks.insert(Self::key(addr), bytes.to_vec());
     }
 
-    fn read(&self, addr: BlockAddr, into: &mut [u8]) -> bool {
+    fn read(&self, addr: RecordAddr, into: &mut [u8]) -> bool {
         match self.blocks.get(&Self::key(addr)) {
             Some(block) => {
                 into.copy_from_slice(block);
@@ -219,7 +219,7 @@ impl BlockStore for MemBlockStore {
         }
     }
 
-    fn submit(&mut self, handle: u64, addr: BlockAddr, _now: u64) -> bool {
+    fn submit(&mut self, handle: u64, addr: RecordAddr, _now: u64) -> bool {
         self.submitted.push_back((handle, addr));
         true
     }
@@ -243,7 +243,7 @@ impl BlockStore for MemBlockStore {
         // map, which a day's worth of freeing can afford: it happens once per day and off any request's
         // path. A real device would have an extent per segment and free it in one call.
         self.blocks
-            .retain(|key, _| BlockAddr::from_raw(*key).segment() != segment);
+            .retain(|key, _| RecordAddr::from_raw(*key).segment() != segment);
         before - self.blocks.len()
     }
 }
@@ -260,7 +260,7 @@ pub const BUFFER_SEGMENT: u8 = (SEGMENT_VALUES - 1) as u8;
 /// records. `MemoryPendingConfig::validate` refuses a lifetime that reaches it.
 pub const SEGMENTS: u64 = BUFFER_SEGMENT as u64;
 
-impl BlockAddr {
+impl RecordAddr {
     pub const fn buffered(ordinal: u64, index: u8) -> Self {
         Self::new(BUFFER_SEGMENT, ordinal, index)
     }
@@ -333,7 +333,7 @@ impl Filling {
         self.filled - 1
     }
 
-    fn get(&self, index: usize, addr: BlockAddr) -> Option<(TxId, HoldData)> {
+    fn get(&self, index: usize, addr: RecordAddr) -> Option<(TxId, HoldData)> {
         if index >= self.filled {
             return None;
         }
@@ -357,7 +357,7 @@ pub struct LatencyBlockStore {
     prng: Prng,
     /// Submitted reads and when the device says each is done, oldest first by admission. Completions are
     /// released by due time, which is not the order they were asked in.
-    inflight: Vec<(u64, BlockAddr, u64)>,
+    inflight: Vec<(u64, RecordAddr, u64)>,
     queue_depth: usize,
 }
 
@@ -381,15 +381,15 @@ impl LatencyBlockStore {
 }
 
 impl BlockStore for LatencyBlockStore {
-    fn write(&mut self, addr: BlockAddr, bytes: &[u8]) {
+    fn write(&mut self, addr: RecordAddr, bytes: &[u8]) {
         self.inner.write(addr, bytes);
     }
 
-    fn read(&self, addr: BlockAddr, into: &mut [u8]) -> bool {
+    fn read(&self, addr: RecordAddr, into: &mut [u8]) -> bool {
         self.inner.read(addr, into)
     }
 
-    fn submit(&mut self, handle: u64, addr: BlockAddr, now: u64) -> bool {
+    fn submit(&mut self, handle: u64, addr: RecordAddr, now: u64) -> bool {
         if self.inflight.len() >= self.queue_depth {
             return false;
         }
@@ -468,7 +468,7 @@ pub struct RecordLog {
     scratch: Box<Block>,
     /// Reads asked of the store and not yet answered, by handle, because a block carries several
     /// records and only the address says which one was wanted.
-    fetching: FxHashMap<u64, BlockAddr>,
+    fetching: FxHashMap<u64, RecordAddr>,
     appended: u64,
     died_in_buffer: u64,
     flushed: u64,
@@ -533,7 +533,7 @@ impl RecordLog {
 
     /// Writes the record into the buffer and answers where it went. The address is provisional until
     /// the block is compacted.
-    pub fn append(&mut self, key: TxId, hold: &HoldData, at: ApplyIndex) -> BlockAddr {
+    pub fn append(&mut self, key: TxId, hold: &HoldData, at: ApplyIndex) -> RecordAddr {
         if self.buffer.back().is_some_and(Filling::full) {
             self.buffer.push_back(Filling::new());
         }
@@ -544,7 +544,7 @@ impl RecordLog {
             .expect("a block to fill")
             .put_at(key, hold, at);
         self.appended += 1;
-        BlockAddr::buffered(ordinal, index as u8)
+        RecordAddr::buffered(ordinal, index as u8)
     }
 
     /// Whether the buffer is over its flush window and its oldest block is due to be compacted.
@@ -608,7 +608,7 @@ impl RecordLog {
     ///
     /// A snapshot asks it about every slot it keeps. An index entry naming a block nobody has is worse than a
     /// hold the log can create again, so a slot pointing anywhere but a sealed block is written out empty.
-    pub fn is_sealed(&self, addr: BlockAddr) -> bool {
+    pub fn is_sealed(&self, addr: RecordAddr) -> bool {
         !addr.is_buffered() && addr.block() < self.next_block
     }
 
@@ -634,14 +634,14 @@ impl RecordLog {
         &mut self,
         segment: u8,
         at: u64,
-        visit: &mut dyn FnMut(TxId, HoldData, BlockAddr),
+        visit: &mut dyn FnMut(TxId, HoldData, RecordAddr),
     ) -> bool {
         let Some(block) = self.days[segment as usize].block_at(at) else {
             return false;
         };
         if !self
             .store
-            .read(BlockAddr::new(segment, block, 0), &mut self.scratch)
+            .read(RecordAddr::new(segment, block, 0), &mut self.scratch)
         {
             // The range says this block was written, so the store not having it is this node's own
             // bookkeeping disagreeing with itself. Nothing here can repair it; the walk goes on and the
@@ -650,7 +650,7 @@ impl RecordLog {
         }
         self.store_reads += 1;
         for index in 0..RECORDS_PER_BLOCK {
-            let addr = BlockAddr::new(segment, block, index as u8);
+            let addr = RecordAddr::new(segment, block, index as u8);
             let from = index * RECORD_BYTES;
             let (key, hold) = decode(&self.scratch[from..from + RECORD_BYTES], addr);
             if key != TxId::ABSENT {
@@ -680,11 +680,11 @@ impl RecordLog {
 
     /// The records of the oldest buffered block, for the caller to sort into survivors and casualties.
     /// Borrowed rather than taken, so the index still resolves them while that is decided.
-    pub fn oldest_block(&self) -> impl Iterator<Item = (TxId, HoldData, BlockAddr)> + '_ {
+    pub fn oldest_block(&self) -> impl Iterator<Item = (TxId, HoldData, RecordAddr)> + '_ {
         let ordinal = self.oldest;
         let block = self.buffer.front();
         (0..RECORDS_PER_BLOCK).filter_map(move |index| {
-            let addr = BlockAddr::buffered(ordinal, index as u8);
+            let addr = RecordAddr::buffered(ordinal, index as u8);
             block?.get(index, addr).map(|(key, hold)| (key, hold, addr))
         })
     }
@@ -692,13 +692,13 @@ impl RecordLog {
     /// Writes a survivor on towards the store and answers its lasting address. The block it lands in
     /// is written out once full, so survivors of several buffered blocks share one — a block per flush
     /// would multiply the space a tenth of the records occupy.
-    pub fn keep(&mut self, key: TxId, hold: &HoldData, from: ApplyIndex) -> BlockAddr {
+    pub fn keep(&mut self, key: TxId, hold: &HoldData, from: ApplyIndex) -> RecordAddr {
         if self.store_open.full() {
             self.seal_store_block();
         }
         let index = self.store_open.put_at(key, hold, from);
         self.flushed += 1;
-        BlockAddr::new(self.segment, self.next_block, index as u8)
+        RecordAddr::new(self.segment, self.next_block, index as u8)
     }
 
     /// The position the oldest buffered block began at, for compaction to carry on to the block it drains
@@ -726,7 +726,7 @@ impl RecordLog {
     /// Three places rather than one because they are three different claims — not yet written, being
     /// written, written and kept — and a report that could not tell the second window from the first
     /// could not say which one to widen.
-    pub fn try_read(&mut self, addr: BlockAddr) -> Option<(TxId, HoldData)> {
+    pub fn try_read(&mut self, addr: RecordAddr) -> Option<(TxId, HoldData)> {
         let index = addr.index() as usize;
         if addr.is_buffered() {
             self.buffer_reads += 1;
@@ -749,7 +749,7 @@ impl RecordLog {
 
     /// The record at an address, wherever it lives, waiting for the store if it has to. Only the apply
     /// path uses this: it applies in order and cannot park a decision half way.
-    pub fn read(&mut self, addr: BlockAddr) -> Option<(TxId, HoldData)> {
+    pub fn read(&mut self, addr: RecordAddr) -> Option<(TxId, HoldData)> {
         if let Some(found) = self.try_read(addr) {
             return Some(found);
         }
@@ -757,7 +757,7 @@ impl RecordLog {
         self.read_from_store(addr)
     }
 
-    fn read_from_store(&mut self, addr: BlockAddr) -> Option<(TxId, HoldData)> {
+    fn read_from_store(&mut self, addr: RecordAddr) -> Option<(TxId, HoldData)> {
         self.store_reads += 1;
         if !self.store.read(addr, &mut self.scratch) {
             return None;
@@ -768,7 +768,7 @@ impl RecordLog {
 
     /// Asks the store for the block this address is on. False is backpressure: the store will not take
     /// another read yet.
-    pub fn fetch(&mut self, handle: u64, addr: BlockAddr, now: u64) -> bool {
+    pub fn fetch(&mut self, handle: u64, addr: RecordAddr, now: u64) -> bool {
         if !self.store.submit(handle, addr, now) {
             return false;
         }
@@ -779,7 +779,7 @@ impl RecordLog {
 
     /// The next fetch finished by `now`. Completions may arrive in an order the reads were not asked
     /// in, which is what the orderer exists for.
-    pub fn harvest(&mut self, now: u64) -> Option<(u64, BlockAddr, TxId, HoldData)> {
+    pub fn harvest(&mut self, now: u64) -> Option<(u64, RecordAddr, TxId, HoldData)> {
         let handle = self.store.poll(now, &mut self.scratch)?;
         let addr = self.fetching.remove(&handle)?;
         self.store_reads += 1;
@@ -832,7 +832,7 @@ impl RecordLog {
     /// is the one place that says so. Residency is trimmed here rather than on a schedule because this is
     /// the only event that adds to it.
     fn seal_store_block(&mut self) {
-        let addr = BlockAddr::new(self.segment, self.next_block, 0);
+        let addr = RecordAddr::new(self.segment, self.next_block, 0);
         self.store.write(addr, &self.store_open.bytes);
         self.days[self.segment as usize].note(self.next_block);
         let fresh = self.spare.pop().unwrap_or_else(Filling::new);
@@ -922,7 +922,7 @@ mod tests {
     fn a_record_survives_the_round_trip_field_for_field() {
         let mut bytes = vec![0u8; RECORD_BYTES];
         encode(TxId(1 << 100), &hold(500), &mut bytes);
-        let (key, back) = decode(&bytes, BlockAddr::new(1, 2, 3));
+        let (key, back) = decode(&bytes, RecordAddr::new(1, 2, 3));
         assert_eq!(key, TxId(1 << 100));
         assert_eq!(back.debit_account, AccountId(11));
         assert_eq!(back.credit_account, AccountId(22));
@@ -934,17 +934,17 @@ mod tests {
 
     #[test]
     fn an_address_carries_its_three_parts() {
-        let addr = BlockAddr::new(63, (1 << BLOCK_BITS) - 1, 63);
+        let addr = RecordAddr::new(63, (1 << BLOCK_BITS) - 1, 63);
         assert_eq!(
             (addr.segment(), addr.block(), addr.index()),
             (63, (1 << BLOCK_BITS) - 1, 63)
         );
-        let modest = BlockAddr::new(2, 1_000_000, 7);
+        let modest = RecordAddr::new(2, 1_000_000, 7);
         assert_eq!(
             (modest.segment(), modest.block(), modest.index()),
             (2, 1_000_000, 7)
         );
-        assert_eq!(BlockAddr::from_raw(modest.raw()), modest);
+        assert_eq!(RecordAddr::from_raw(modest.raw()), modest);
     }
 
     /// A record comes back from the block it landed in, whether that block is still being filled or
@@ -954,7 +954,7 @@ mod tests {
     fn records_come_back_from_open_and_sealed_blocks_alike() {
         let mut log = RecordLog::default();
         let count = RECORDS_PER_BLOCK * 3 + 2;
-        let addrs: Vec<BlockAddr> = (0..count)
+        let addrs: Vec<RecordAddr> = (0..count)
             .map(|index| {
                 log.append(
                     TxId(index as u128 + 1),

@@ -16,7 +16,7 @@ use ledger_base::{
 use ledger_stubkit::{IdleBackoff, LatencyRange, WorkerThread};
 
 use crate::block::{
-    BlockAddr, BlockStore, LatencyBlockStore, LogTraffic, MemBlockStore, BLOCK_BYTES,
+    BlockStore, LatencyBlockStore, LogTraffic, MemBlockStore, RecordAddr, BLOCK_BYTES,
     RECORDS_PER_BLOCK, SEGMENTS,
 };
 use crate::engine::{BudgetState, PendingEngine, Started};
@@ -572,7 +572,7 @@ impl MemoryPending {
         // The index is what a hold costs in memory; the record itself lives on a block, and the blocks
         // are where the store's own size is. Both are memory today — the disk tier is not built — so
         // neither figure is a disk figure.
-        footprint.gauged_table::<TxId, BlockAddr>("engine index", &self.occupancy.holds);
+        footprint.gauged_table::<TxId, RecordAddr>("engine index", &self.occupancy.holds);
         footprint.gauged_table::<BudgetGroup, BudgetState>(
             "engine budget groups",
             &self.occupancy.budgets,

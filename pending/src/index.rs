@@ -2,7 +2,7 @@ use std::hash::BuildHasher;
 
 use ledger_base::{FxBuildHasher, FxHashMap, LineFit, Prng, TxId};
 
-use crate::block::{BlockAddr, SEGMENT_VALUES};
+use crate::block::{RecordAddr, SEGMENT_VALUES};
 
 /// Slots per bucket. Four ways over two candidate buckets is what makes a load factor near one
 /// reachable while a probe stays inside two buckets — a generic hash table reaches the same average
@@ -66,14 +66,14 @@ enum Found {
 /// declared maximum and that maximum has been passed.
 #[derive(Debug, Clone, Copy)]
 pub struct Homeless {
-    pub address: BlockAddr,
+    pub address: RecordAddr,
 }
 
 /// The addresses a probe turned up, without allocating: two buckets of four ways is the ceiling, and a
 /// second entry means two keys share a fingerprint.
 #[derive(Debug, Clone, Copy)]
 pub struct Candidates {
-    addrs: [BlockAddr; 2 * WAYS],
+    addrs: [RecordAddr; 2 * WAYS],
     /// Bucket and way. The bucket is a `u32` because a table sized for the design has hundreds of
     /// millions of them, and a narrower field truncates silently — which it did.
     slots: [(u32, u8); 2 * WAYS],
@@ -83,7 +83,7 @@ pub struct Candidates {
 impl Default for Candidates {
     fn default() -> Self {
         Self {
-            addrs: [BlockAddr::from_raw(0); 2 * WAYS],
+            addrs: [RecordAddr::from_raw(0); 2 * WAYS],
             slots: [(0u32, 0u8); 2 * WAYS],
             len: 0,
         }
@@ -99,7 +99,7 @@ impl Candidates {
         self.len == 0
     }
 
-    pub fn address(&self, at: usize) -> BlockAddr {
+    pub fn address(&self, at: usize) -> RecordAddr {
         self.addrs[at]
     }
 
@@ -108,7 +108,7 @@ impl Candidates {
         (bucket as usize, way as usize)
     }
 
-    fn push(&mut self, addr: BlockAddr, bucket: usize, way: usize) {
+    fn push(&mut self, addr: RecordAddr, bucket: usize, way: usize) {
         self.addrs[self.len] = addr;
         self.slots[self.len] = (bucket as u32, way as u8);
         self.len += 1;
@@ -204,8 +204,8 @@ impl HoldTable {
     pub fn addr_of(
         &self,
         key: TxId,
-        verify: &mut dyn FnMut(BlockAddr) -> bool,
-    ) -> Option<BlockAddr> {
+        verify: &mut dyn FnMut(RecordAddr) -> bool,
+    ) -> Option<RecordAddr> {
         let slot = self.resolve(key, verify)?;
         Some(address_of(self.slot_word(slot)))
     }
@@ -213,7 +213,7 @@ impl HoldTable {
     /// Whether this key's entry points at exactly this address. Read-free and exact — an address
     /// belongs to one record, so no fingerprint collision can make this true by accident. It is how
     /// compaction tells a record the index still needs from one that has been resolved or superseded.
-    pub fn points_at(&self, key: TxId, addr: BlockAddr) -> bool {
+    pub fn points_at(&self, key: TxId, addr: RecordAddr) -> bool {
         self.slot_at(key, addr).is_some()
     }
 
@@ -221,7 +221,7 @@ impl HoldTable {
     /// Read-free for the same reason. False means the index did not point at `old`, which is a caller
     /// that decided a record was alive and then lost the race — nothing here can repair that, so it is
     /// counted rather than guessed at.
-    pub fn replace(&mut self, key: TxId, old: BlockAddr, new: BlockAddr) -> bool {
+    pub fn replace(&mut self, key: TxId, old: RecordAddr, new: RecordAddr) -> bool {
         let Some(at) = self.slot_at(key, old) else {
             return false;
         };
@@ -316,7 +316,7 @@ impl HoldTable {
             == self.live
     }
 
-    fn slot_at(&self, key: TxId, addr: BlockAddr) -> Option<(usize, usize)> {
+    fn slot_at(&self, key: TxId, addr: RecordAddr) -> Option<(usize, usize)> {
         let (_, home, alternate) = self.locate(key);
         for bucket in [home, alternate] {
             for way in 0..WAYS {
@@ -332,7 +332,7 @@ impl HoldTable {
     /// Takes in a key the store has never held. This is the one moment uniqueness can be checked for
     /// free: anything already in these buckets with this fingerprint is a different key, so both slots
     /// are marked and every later operation on either reads a record to tell them apart.
-    pub fn insert_new(&mut self, key: TxId, addr: BlockAddr) -> Result<(), Homeless> {
+    pub fn insert_new(&mut self, key: TxId, addr: RecordAddr) -> Result<(), Homeless> {
         let (fingerprint, home, alternate) = self.locate(key);
         let clashes = self.candidates(key);
         let mut slot = pack(fingerprint, addr);
@@ -361,8 +361,8 @@ impl HoldTable {
     pub fn repoint(
         &mut self,
         key: TxId,
-        addr: BlockAddr,
-        verify: &mut dyn FnMut(BlockAddr) -> bool,
+        addr: RecordAddr,
+        verify: &mut dyn FnMut(RecordAddr) -> bool,
     ) -> bool {
         let Some(at) = self.resolve(key, verify) else {
             return false;
@@ -376,7 +376,7 @@ impl HoldTable {
     fn resolve(
         &self,
         key: TxId,
-        verify: &mut dyn FnMut(BlockAddr) -> bool,
+        verify: &mut dyn FnMut(RecordAddr) -> bool,
     ) -> Option<(usize, usize)> {
         match self.find(key) {
             Found::Absent => None,
@@ -399,8 +399,8 @@ impl HoldTable {
     pub fn remove(
         &mut self,
         key: TxId,
-        verify: &mut dyn FnMut(BlockAddr) -> bool,
-    ) -> Option<BlockAddr> {
+        verify: &mut dyn FnMut(RecordAddr) -> bool,
+    ) -> Option<RecordAddr> {
         let at = self.resolve(key, verify)?;
         let cleared = self.set_slot(at, EMPTY);
         Some(address_of(cleared))
@@ -556,7 +556,7 @@ impl HoldTable {
     }
 }
 
-const fn pack(fingerprint: u64, addr: BlockAddr) -> Slot {
+const fn pack(fingerprint: u64, addr: RecordAddr) -> Slot {
     (fingerprint << FINGERPRINT_SHIFT) | (addr.raw() & ADDRESS_MASK)
 }
 
@@ -567,12 +567,12 @@ const fn fingerprint_of(slot: Slot) -> u64 {
 /// The address inside a raw slot word. Exported for the snapshot, which is the one caller outside this
 /// module that has to read a word: it decides what to keep by looking at where a slot points, and the layout
 /// of a word is this module's to know (rule 1).
-pub const fn address_in(slot: u64) -> BlockAddr {
+pub const fn address_in(slot: u64) -> RecordAddr {
     address_of(slot)
 }
 
-const fn address_of(slot: Slot) -> BlockAddr {
-    BlockAddr::from_raw(slot & ADDRESS_MASK)
+const fn address_of(slot: Slot) -> RecordAddr {
+    RecordAddr::from_raw(slot & ADDRESS_MASK)
 }
 
 const fn is_ambiguous(slot: Slot) -> bool {
@@ -593,20 +593,20 @@ mod tests {
 
     /// Nothing in these tests shares a fingerprint, so the index answers on its own and this is never
     /// called. A test that needed it would be testing the ambiguous path, which has its own.
-    fn never(_: BlockAddr) -> bool {
+    fn never(_: RecordAddr) -> bool {
         panic!("the index read a record for an unambiguous key");
     }
 
     #[test]
     fn a_hold_comes_back_by_its_own_key_and_a_repoint_moves_it() {
         let mut table = HoldTable::default();
-        let first = BlockAddr::new(0, 1, 2);
+        let first = RecordAddr::new(0, 1, 2);
         table.insert_new(TxId(7), first).expect("room");
         assert_eq!(table.addr_of(TxId(7), &mut never), Some(first));
         assert_eq!(table.addr_of(TxId(8), &mut never), None);
 
         // What a partial resolution does: the record is appended again and the index follows it.
-        let second = BlockAddr::new(0, 9, 3);
+        let second = RecordAddr::new(0, 9, 3);
         assert!(table.repoint(TxId(7), second, &mut never));
         assert_eq!(table.live(), 1, "a repoint is not a second entry");
         assert_eq!(table.addr_of(TxId(7), &mut never), Some(second));
@@ -628,7 +628,7 @@ mod tests {
         let mut refused = 0;
         for key in 1..=holds {
             if table
-                .insert_new(TxId(u128::from(key)), BlockAddr::from_raw(key))
+                .insert_new(TxId(u128::from(key)), RecordAddr::from_raw(key))
                 .is_err()
             {
                 refused += 1;
@@ -642,7 +642,7 @@ mod tests {
         for key in 1..=holds {
             assert_eq!(
                 table.addr_of(TxId(u128::from(key)), &mut never),
-                Some(BlockAddr::from_raw(key)),
+                Some(RecordAddr::from_raw(key)),
                 "key {key} points at someone else's record"
             );
         }
@@ -670,7 +670,7 @@ mod tests {
                 break;
             }
             table
-                .insert_new(key, BlockAddr::from_raw(step as u64))
+                .insert_new(key, RecordAddr::from_raw(step as u64))
                 .expect("room");
         }
         let (first, second) = pair.expect("no shared fingerprint found");
@@ -680,20 +680,20 @@ mod tests {
         );
 
         table
-            .insert_new(second, BlockAddr::from_raw(second.raw() as u64))
+            .insert_new(second, RecordAddr::from_raw(second.raw() as u64))
             .expect("room for the second of the pair");
         assert_eq!(table.ambiguous(), 1, "the clash was not noticed");
 
         // Each is found by reading a record, and each finds its own.
-        let mut verify_first = |addr: BlockAddr| addr.raw() == first.raw() as u64;
-        let mut verify_second = |addr: BlockAddr| addr.raw() == second.raw() as u64;
+        let mut verify_first = |addr: RecordAddr| addr.raw() == first.raw() as u64;
+        let mut verify_second = |addr: RecordAddr| addr.raw() == second.raw() as u64;
         assert_eq!(
             table.addr_of(first, &mut verify_first),
-            Some(BlockAddr::from_raw(first.raw() as u64))
+            Some(RecordAddr::from_raw(first.raw() as u64))
         );
         assert_eq!(
             table.addr_of(second, &mut verify_second),
-            Some(BlockAddr::from_raw(second.raw() as u64))
+            Some(RecordAddr::from_raw(second.raw() as u64))
         );
 
         // And removing one leaves the other where it was — the failure this whole mechanism prevents.
@@ -702,7 +702,7 @@ mod tests {
             .expect("the first of the pair");
         assert_eq!(
             table.addr_of(second, &mut verify_second),
-            Some(BlockAddr::from_raw(second.raw() as u64)),
+            Some(RecordAddr::from_raw(second.raw() as u64)),
             "removing one of a colliding pair took the other's slot"
         );
     }

@@ -9,7 +9,7 @@ mod snapshot;
 /// The seam under the engine. Blocks are bytes so that what answers for them can be memory today and
 /// a file or a network volume later without the engine above changing.
 pub use block::{
-    BlockAddr, BlockStore, LatencyBlockStore, LogTraffic, MemBlockStore, BLOCK_BYTES,
+    BlockStore, LatencyBlockStore, LogTraffic, MemBlockStore, RecordAddr, BLOCK_BYTES,
     DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS, RECORDS_PER_BLOCK, RECORD_BYTES, SEGMENTS,
 };
 /// Exported for the same reason as the overlay: a simulation that drives the engine itself needs the

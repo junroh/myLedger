@@ -321,7 +321,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::block::{BlockAddr, BlockStore, MemBlockStore, RECORDS_PER_BLOCK};
+    use crate::block::{BlockStore, MemBlockStore, RecordAddr, RECORDS_PER_BLOCK};
     use crate::engine::PendingEngine;
 
     /// A chunk small enough that every test here crosses several, because a format that is only ever read in
@@ -335,15 +335,15 @@ mod tests {
     struct SharedStore(Rc<RefCell<MemBlockStore>>);
 
     impl BlockStore for SharedStore {
-        fn write(&mut self, addr: BlockAddr, bytes: &[u8]) {
+        fn write(&mut self, addr: RecordAddr, bytes: &[u8]) {
             self.0.borrow_mut().write(addr, bytes);
         }
 
-        fn read(&self, addr: BlockAddr, into: &mut [u8]) -> bool {
+        fn read(&self, addr: RecordAddr, into: &mut [u8]) -> bool {
             self.0.borrow().read(addr, into)
         }
 
-        fn submit(&mut self, handle: u64, addr: BlockAddr, now: u64) -> bool {
+        fn submit(&mut self, handle: u64, addr: RecordAddr, now: u64) -> bool {
             self.0.borrow_mut().submit(handle, addr, now)
         }
 

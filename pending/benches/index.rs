@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use ledger_base::{FxHashMap, TxId};
 use ledger_benchkit::{BenchOptions, Samples, STRIDE};
-use ledger_pending::{BlockAddr, HoldTable};
+use ledger_pending::{HoldTable, RecordAddr};
 
 const OPS: u64 = 5_000_000;
 
@@ -24,7 +24,7 @@ fn filled(slots: usize, load_factor: f64) -> (HoldTable, usize) {
     let holds = (slots as f64 * load_factor) as usize;
     let mut table = HoldTable::with_slots(slots);
     for index in 0..holds {
-        let _ = table.insert_new(key(index), BlockAddr::from_raw(index as u64));
+        let _ = table.insert_new(key(index), RecordAddr::from_raw(index as u64));
     }
     (table, holds)
 }
@@ -57,7 +57,7 @@ fn lookup_miss(table: &HoldTable) -> Duration {
     started.elapsed()
 }
 
-fn map_lookup_hit(map: &FxHashMap<TxId, BlockAddr>, holds: usize) -> Duration {
+fn map_lookup_hit(map: &FxHashMap<TxId, RecordAddr>, holds: usize) -> Duration {
     let started = Instant::now();
     let mut found = 0u64;
     for step in 0..OPS {
@@ -92,7 +92,7 @@ fn stash_demand(options: &BenchOptions) {
                 for index in 0..holds {
                     let key = TxId(u128::from(salt ^ (index as u64).wrapping_mul(STRIDE)) + 1);
                     if table
-                        .insert_new(key, BlockAddr::from_raw(index as u64))
+                        .insert_new(key, RecordAddr::from_raw(index as u64))
                         .is_err()
                     {
                         homeless += 1;
@@ -144,9 +144,9 @@ fn main() {
     // than remembered.
     for slots in [1usize << 17, 1 << 20] {
         let holds = (slots as f64 * 0.90) as usize;
-        let mut map: FxHashMap<TxId, BlockAddr> = FxHashMap::default();
+        let mut map: FxHashMap<TxId, RecordAddr> = FxHashMap::default();
         for index in 0..holds {
-            map.insert(key(index), BlockAddr::from_raw(index as u64));
+            map.insert(key(index), RecordAddr::from_raw(index as u64));
         }
         let mut samples = Samples::new(format!("lookup hit  FxHashMap ({holds} holds)"), OPS);
         for _ in 0..options.repeat {
