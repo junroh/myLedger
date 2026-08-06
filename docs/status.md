@@ -207,9 +207,13 @@ account so `check` exercises the order exemption itself — the sweep test asser
 ## Decisions waiting on someone
 
 Not gaps in the code — questions the code cannot answer for itself, each of which it is currently
-answering by default. They were scattered through the prose above until they were collected here, which
-is why this section exists: a decision written into a paragraph about something else is one nobody
-revisits, and a default nobody chose reads exactly like a decision that was made.
+answering by default. They were scattered through the prose above until they were collected here, which is
+why this section exists: a decision written into a paragraph about something else is one nobody revisits,
+and a default nobody chose reads exactly like a decision that was made.
+
+Closed decisions are not here. Those live in `design-notes.md`, whose sections each open with what was
+tried, what broke, what was weighed and what was chosen — the same shape as an entry below, with the
+question already answered.
 
 Every entry says the same three things: **the question**, the **default** the code takes while it goes
 unanswered, and **when that default stops being safe**. The source design's own open questions are tagged
@@ -255,6 +259,14 @@ unanswered, and **when that default stops being safe**. The source design's own 
   *Stops being safe:* whenever a client's correctness depends on distinguishing "expired" from "never
   existed". It needs a push channel the ledger does not have, so this is a protocol decision, not an
   engine one.
+
+- **What was weighed and rejected in §3 and §7, and does either deserve revisiting?**
+  *Default:* unknown. `design-notes.md` now opens every section with what was tried, what broke, what was
+  weighed and what was chosen, and two sections answer the third with **not recorded** — the chain scratch
+  with lane gates, and separating a chain from a budget group. Both look right and both are load-bearing;
+  what is missing is the evidence that anything else was considered.
+  *Stops being safe:* the moment either is questioned. A decision whose alternatives were never written
+  down can only be defended by whoever made it, and that is the position this file exists to avoid.
 
 - **Which of the design's storage questions are still untouched, and is that acceptable?**
   *Default:* untouched. `SE-OQ-3` (a group spilling across blocks and what it costs in IO),

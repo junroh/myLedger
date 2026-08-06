@@ -3,7 +3,34 @@
 Decisions the code cannot explain on its own: what the source design left open, where the code
 departs from it, and the measurements behind each choice.
 
+Every section opens with the same four lines, so a decision can be re-read without re-reading its
+reasoning: what was **tried** first, what **broke**, what was **weighed** against it, and what was
+**chosen** and why. The prose below each is the evidence; the four lines are the claim.
+
+The format is not decoration — it was added after three findings in one week ended in a question rather
+than a fix, and it immediately showed which decisions never recorded what they rejected. Where it says
+**Weighed — not recorded**, that is a fact about this repository rather than a section that needs
+rewriting: nobody wrote down what the alternatives were, and only whoever made the call still knows.
+`status.md` carries that as an open item.
+
+Two other places hold decisions of their own, and neither is folded in here. `CLAUDE.md`'s rule 15 is the
+library ledger — hand-rolled on purpose, replaced by a crate, weighed and refused — because those choices
+are about dependencies rather than about this design. `status.md` holds what is *not* decided, under
+*Decisions waiting on someone*.
+
 ## 1. Lane ordering when requests traverse different stages
+
+> **Tried** — the design's three rules at once: contract 1 on every component, the fast kinds skipping the
+> pending round trip, and no reordering in the sequencer.
+> **Broke** — a request is judgeable when *all* its results are in, and two ordered streams joined by AND
+> are only ordered if everything traverses both. A later hold overtakes an earlier settle on the same lane
+> as soon as the pending path is slower. Every component kept its contract; the join broke it.
+> **Weighed** — route every request through pending (loses the fast path for all traffic); park
+> out-of-order arrivals inside the sequencer (cheapest, but it turns an always-on gap detector into a
+> metric and moves ordering back into the core).
+> **Chose** — a *conditional* lane fence: a token that reads nothing, on the same channel and lane, so the
+> engine's own ordering orders it too. Ordering stays outside the sequencer and a gap keeps its meaning.
+> `ledgersim check`; `ledgerfio run --workload hold-settle --external-ratio 30` for the exemption.
 
 The design gives each external component contract 1: return a lane's results in seq order.
 It also lets single-phase transfers and holds skip the pending round trip entirely, and it
@@ -198,6 +225,18 @@ them would count the same time twice.
 
 ## 2. Hold overlay, commit, and pending apply
 
+> **Tried** — an overlay on the reactor's thread holding the whole record, so a resolution could be judged
+> with no round trip at all. It was built that way because the engine was a stub with no memory of its own.
+> **Broke** — once the engine had a memory tier, the copy was a second owner of the record with nothing to
+> say which was true (rule 18), and the rule's one escape — a paired write plus an invariant check — is
+> unavailable here, because checking agreement means reading the record the copy exists to avoid reading.
+> **Weighed** — keep the copy and rename it, on the grounds that a neutral measurement does not buy a
+> refactor. Refused: the measurement's job was to say the round trip was affordable, not whether a second
+> owner was allowed.
+> **Chose** — the overlay holds decisions only; the record rides the reply to the slot of the request that
+> asked and dies with it. Measured free at the target rate — the correction below records three ways the
+> experiment was misread first.
+
 The plan marked the pending contract provisional because the overlay and the store's view
 of a hold could disagree between propose and commit.
 
@@ -362,6 +401,16 @@ expiry that is not built.
 
 ## 3. Linked groups need two mechanisms the design did not spell out
 
+> **Tried** — the design's chain semantics as written.
+> **Broke** — two mechanisms were missing and a chain cannot work without either: its own legs could not
+> see the availability an earlier leg brings in, and the group barrier completes groups in the order their
+> results arrive rather than in lane seq order.
+> **Weighed** — not recorded. What the alternatives were when this was decided is not written down
+> anywhere, and this header is where that shows.
+> **Chose** — a chain scratch holding its own legs' gains, thrown away when the chain is judged, plus lane
+> gates for the barrier the sequencer itself created. Cost accepted and visible: chains sharing a lane
+> serialise, so `linked` runs at about an eighth of the single-phase rate.
+
 A chain is judged as one unit, and that unit needs both of these to work at all:
 
 **The chain scratch.** The overlay deliberately holds back availability a transfer would add, so a
@@ -394,6 +443,16 @@ chain's first leg debits the same external account.
 
 ## 4. The account component is external, so the state had to be split
 
+> **Tried** — treating the account view as a field of the sequencer, which is tempting because the judge
+> calls it inline and cannot continue without it.
+> **Broke** — it is a component: it holds every account in DRAM and persists and recovers itself. Only the
+> sequencer's own volatile per-request state is the sequencer's.
+> **Weighed** — fusing the lane and the record into one cache line, measured at 15.0 ns/op against 24.0
+> for the split.
+> **Chose** — split ownership and pay the second line: 41M ops/s is more than a hundred times the target.
+> If the inline ceiling ever matters, the fix is an opaque per-account sidecar the sequencer owns, not a
+> merge. `cargo bench -p ledger-account --bench columns`.
+
 The account view is called inline — the judge cannot continue without a balance — which
 made it tempting to treat it as a field of the sequencer. It is not: it is a component that
 holds every account in DRAM for speed and persists and recovers on its own, exactly like the
@@ -424,6 +483,17 @@ opaque per-account sidecar the sequencer owns, keeping both halves in one line w
 side reading the other's fields.
 
 ## 5. Line-aligned or packed: measure, per structure
+
+> **Tried** — "align hot state to a cache line" as a blanket rule.
+> **Broke** — padding everything pays memory for nothing, and footprint beats straddling: while a packed
+> array still partly fits a cache the padded one does not, and once neither fits the two are equal.
+> **Weighed** — 128 bytes everywhere (x86 fetches adjacent lines in pairs; a real effect nobody here can
+> measure, so not bought); padding `AccountRecord` to 64 (grows the array by half again); a whole line per
+> lane (four times the memory, slower wherever the array still fits a cache).
+> **Chose** — per structure, and the rule that survived is not the one we started with: make hot
+> random-access state a size that *divides* the line, pad to whole lines only when it cannot fit in one,
+> and spend a whole line only to keep threads off each other. Every claim is build-checked, so weakening
+> one fails the build rather than a benchmark.
 
 Padding follows the machine's own line size — 128 on Apple Silicon, 64 on x86 and generic ARM64 — because aligning to anything else
 pays memory for nothing. Going to 128 everywhere would buy exactly one thing: x86 pulls adjacent lines
@@ -514,6 +584,15 @@ scattered accounts; the earlier random walk reported apply at 45 ns/op where it 
 
 ## 6. Batch boundaries, backpressure, and logging
 
+> **Tried** — batching for throughput.
+> **Broke** — it was never the bottleneck: 4.4 M/s batched against 4.0 M/s pushed item by item, and the
+> larger batch is slightly *worse* because it makes the load bursty.
+> **Weighed** — a timeout to close an abandoned linked chain, which would leave lanes gated for the length
+> of the timeout.
+> **Chose** — keep batching for the *boundary* rather than the throughput. `Request::end_of_batch` marks a
+> submission's last request and a chain still open there is rejected, which removes the hang structurally
+> instead of waiting it out.
+
 **A batch boundary is what terminates a linked chain.** A chain is a run of consecutive
 requests, so without a boundary an abandoned chain stays open forever and gates its lanes:
 those accounts stop. `Request::end_of_batch` marks the last request of a submission, and a
@@ -542,6 +621,15 @@ decisions with a `ManualClock`. The default is a monotonic system clock.
 
 ## 7. A linked chain and a shared budget group are not the same thing
 
+> **Tried** — one mechanism for both. This implementation conflated them, because a chain's holds are in
+> practice the group.
+> **Broke** — their lifetimes differ: a chain lives for exactly one judge and one propose, and a budget
+> group outlives the request that created it and has to be tracked until every member is resolved.
+> **Weighed** — not recorded. As with §3, what else was on the table is not written down.
+> **Chose** — separate types (`ChainId`, `BudgetGroup`) and a stated rather than implied policy: the holds
+> a chain creates share one group named after the chain. The general case — a group spanning submissions —
+> needs a client-supplied durable id, so today only the weaker rule is enforced.
+
 The design describes two mechanisms that are easy to conflate, and this implementation did
 conflate them at first.
 
@@ -567,6 +655,16 @@ boundary and be aborted. Allowing a chain to span submissions would mean a timer
 gated for the length of that timer, which is the hang the boundary removes.
 
 ## 8. Who runs the loop
+
+> **Tried** — nothing failed here; the section records where a decision had to be made rather than a
+> reversal. A `tick()` state machine with no threads, transport or clock needs something to run it.
+> **Broke** — n/a. What it must *not* be is a client, and what a library must not do is decide which
+> signal means stop.
+> **Weighed** — signal handling inside the library, refused: which signal means "stop" belongs to whoever
+> owns the process.
+> **Chose** — `ledger-service` assembles the node and hands out an endpoint; anyone asks for a stop through
+> a `StopToken`; the drain runs until the node owes nobody anything, because a committed batch still owes
+> an apply and dropping it would lose a decision the log already holds.
 
 The sequencer is a state machine with a `tick()`: no threads, no transport, no clock of its
 own. That is what lets a test drive it step by step and a simulation replay it. But something
@@ -598,6 +696,15 @@ final state away.
 
 ## 9. Two ways the ledger can be wrong about itself
 
+> **Tried** — detect and carry on, which is what a report-and-continue path amounts to.
+> **Broke** — applying a commit that answers the wrong batch would ack the wrong requests and release
+> slots other requests still hold. That is the classic mistake of continuing after detecting corruption.
+> **Weighed** — skipping a committed effect that cannot be applied. Refused: `replay` returns the same
+> error, so a follower would skip it too and the two would diverge in silence.
+> **Chose** — seal the apply path, with deliberately no operator action: the drain that never completes is
+> the signal to replace the leader. A half-written effect is prevented differently, by asking the far side
+> whether it fits before the near side is touched. All of it exercised by fault injection.
+
 Contract-1 detection says an external component misbehaved. Two failures say something worse — that
 the sequencer's own bookkeeping is off — and they are handled differently from each other.
 
@@ -623,6 +730,17 @@ All three are exercised by fault injection rather than argued: the consensus stu
 in the wrong order, and the store can be filled until the next effect cannot land.
 
 ## 10. Measurement conditions
+
+> **Tried** — a hardware profile for the simulator, `ns = cycles/freq + misses x dram_latency`, the shape
+> the source Python model uses.
+> **Broke** — measuring its own inputs refuted the form: the stages' misses overlap, and the formula
+> prices every one of them at full latency.
+> **Weighed** — writing measured numbers into these documents. Refused, because the code changes and a
+> number here goes stale without saying so.
+> **Chose** — keep the *direction* a measurement showed and the command that reproduces it; the numbers
+> live in each report beside the conditions they were taken under. For a machine nobody here can run, a
+> measured curve of cost against working set plus `--cost-*` and `--cost-scale` as a bracket, not a
+> formula.
 
 Measurements are not recorded in these documents. The code changes, so a number written here would be
 stale without saying so; what is kept is the direction a measurement showed and the command that
@@ -701,6 +819,20 @@ the end-to-end stamp, and the reactor times propose-to-commit once per batch. Th
 per-request phase breakdown, because that would need clock reads per request on the hot path.
 
 ## 11. The hold index: a bounded probe, and what identifies a slot
+
+> **Tried** — a fast average, which is what a generic hash table gives.
+> **Broke** — its probe has no bound, and the tail is exactly what the engine owes the sequencer. Cuckoo
+> hashing does not remove the unbounded part either; it moves it from the lookup to the insert.
+> **Weighed** — a stash for entries that cannot be placed (at a 32-hop cap the design's scale needs
+> hundreds of thousands, so the miss bound collapses; at 128 hops there is nothing for it to hold); a
+> 64-bit fingerprint in a 16-byte slot (buys a rehash that needs no keys, which only matters if growth is
+> a path the engine takes — it is not, and it costs twice the index); linear probing (unbounded under load
+> or tombstones).
+> **Chose** — (2,4) cuckoo, an 8-byte slot, a cascade cap of 128 as a latency budget, a 0.90 target, and
+> ambiguity **detected** at insert rather than assumed away. The slot width moved twice and both
+> reversals are recorded, along with one arithmetic error: the wider fingerprint was defended with a
+> per-lookup collision probability where the question is a birthday problem over the live set.
+> `cargo bench -p ledger-pending --bench index`.
 
 The store finds a hold by transaction id, and the structure that does it was chosen for a bounded probe
 rather than a fast average: two candidate buckets of four ways each, so a lookup compares at most eight
@@ -784,6 +916,19 @@ flip rather than a vanishing chance. The mechanism that replaced the argument �
 only where marked — is exact, and needs no probability at all.
 
 ## 12. Records live on blocks, and blocks are written once
+
+> **Tried** — changing a record where it lies, which is what a resolution wants to do.
+> **Broke** — it costs a read before every write on a path that has none, and it gives up the property
+> everything else rests on: that an address never moves, which is what lets an index entry and a group's
+> offset chain be trusted.
+> **Weighed** — writing each buffered block out whole instead of compacting it (the store then grows with
+> holds *created* rather than holds alive, which is the figure the capacity estimate rests on); one store
+> block per flush (multiplies the space a surviving tenth occupies by ten); a window measured as a
+> duration (the engine has no clock and should not grow one for this).
+> **Chose** — append-only with a new version at a new address, a writeback buffer that compacts on the way
+> out, and **two** windows rather than one — an hour before flush bounding recovery, a day of residency
+> bounding latency. Every length and share is configuration, and the declared share is checkable: `died in
+> buffer` measures the same quantity the declaration claims.
 
 An address is `(segment, block, index)` packed into the forty-eight bits a slot has spare: six bits of
 segment, thirty-six of block, six of index. The source design packs the same three into forty because
@@ -931,6 +1076,18 @@ survivor fraction implies half of it lives for the full retention. A run now say
 
 ## 13. The engine speaks first, and what it is allowed to say
 
+> **Tried** — answering a hold the index could not take on the reply channel, like everything else.
+> **Broke** — a reply names a work slot and there is no slot behind it. A sentinel correlation would make
+> one field mean two things, which is the shape rule 18 forbids; and a notice is not on a request's
+> latency path, so sharing the queue lets a slow reader of one delay the other (rule 10).
+> **Weighed** — a flag instead of a queue. It would do for the one notice built here — a seal is the same
+> news however often it is said — and was refused because expiry is the other user of this direction and
+> carries a hold id a flag cannot hold. Building the flag now means building the queue later, and then the
+> mechanism exists twice (rule 3).
+> **Chose** — a third direction on the port with a channel of its own, drained before every other stage so
+> a seal decided this tick is in effect before this tick applies anything, and no stage in `--cpu` for
+> something that happens once in a node's life.
+
 Every method on the pending port was call-and-reply: the sequencer sends, the engine answers, and the
 answer carries the `Correlation` of the request that asked. Two things need the engine to start the
 conversation instead — sealing when a committed hold cannot be stored, and expiry — and neither could
@@ -992,6 +1149,21 @@ entered. Reproduce the whole thing in one run with
 and exits 1.
 
 ## 14. Retention is a promise, so expiry rounds late
+
+> **Tried** — a stored per-record expiry timestamp, and a wall-clock sweep to act on it.
+> **Broke** — a retention window is *configuration*, and a configuration changed and restarted has to
+> apply to records already written; a stored deadline was computed under the old policy and could only be
+> reached by rewriting every record. A local wall clock deciding expiry also diverges between nodes.
+> **Weighed** — a per-segment lifetime (makes a deadline depend on which block a hold landed in); a
+> separate durable structure keyed by deadline (a second owner of what a hold is, with its own liveness,
+> compaction and recovery); the design's four-level timing wheel (38GB at the design's scale if it holds
+> the holds, against the 2GB it budgets — so it was never meant to hold them); searching the index for an
+> expiring segment's addresses (exact, but bounds the voids collected and not the slots walked: 2.2s a
+> pass at the design's size, on the thread that answers lookups).
+> **Chose** — a deadline computed from the segment's own day, one wall-clock reading per day through an
+> injectable `DaySource`, the wheel reduced to one live count per day, and the survivors read out of that
+> day's own blocks a declared number at a time. One number — `grace_days` — buys away every source of
+> *early* deletion at once, and its price is linear and only ever space.
 
 The thirty-two days is not an internal window. It is told to the customer — *your pending data is kept
 for at most thirty-two days, then deleted* — and a promise like that has two edges, only one of which is

@@ -27,6 +27,13 @@ for: `docs/glossary.md` for terminology, `docs/request-flow.md` for pipeline cha
 behaviour, and `docs/tools.md` before choosing a measurement or simulation. `docs/status.md` is the
 source of truth for current work and outstanding gaps.
 
+**A decision is written in one of two places, in the same shape.** Settled ones open a `design-notes.md`
+section with four lines — what was **tried**, what **broke**, what was **weighed**, what was **chosen** —
+and the prose below is the evidence. Unsettled ones are an entry under *Decisions waiting on someone* in
+`docs/status.md`, with the question, the **default** the code takes meanwhile, and **when that default
+stops being safe**. Write the four lines when a decision closes and move the entry out; a decision left in
+prose is one nobody revisits, and a default nobody chose reads exactly like a choice.
+
 ## Coding rules
 
 1. **DRY.** A rule lives in exactly one place. Exception: the four transfer kinds (single-phase / hold / settle / void) stay explicit branches in the S3-judge and S5-apply hot paths. Share the *delta rule*, not the branching.
