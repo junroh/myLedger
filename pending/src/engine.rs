@@ -1,7 +1,7 @@
 use ledger_base::ports::{ApplyIndex, HoldData, PendingEffect};
 use ledger_base::{Amount, BudgetGroup, FxHashMap, MapGauge, Transfer, TransferFlags, TxId};
 
-use crate::block::{BlockStore, LogTraffic, MemBlockStore, RecordAddr, RecordLog, SEGMENTS};
+use crate::block::{DurableStore, LogTraffic, MemoryStore, RecordAddr, RecordLog, SEGMENTS};
 use crate::index::{Candidates, HoldTable};
 use crate::snapshot::SnapshotWriter;
 
@@ -155,7 +155,7 @@ impl PendingEngine {
         slots: usize,
         flush_blocks: usize,
         resident_blocks: usize,
-        store: Box<dyn BlockStore>,
+        store: Box<dyn DurableStore>,
     ) -> Self {
         Self {
             index: HoldTable::with_slots(slots),
@@ -169,7 +169,7 @@ impl PendingEngine {
     pub fn with_windows(flush_blocks: usize, resident_blocks: usize) -> Self {
         Self {
             records: RecordLog::new(
-                Box::new(MemBlockStore::default()),
+                Box::new(MemoryStore::default()),
                 flush_blocks,
                 resident_blocks,
             ),
@@ -745,8 +745,8 @@ impl PendingEngine {
             if segment == open || self.index.live_in_segment(segment) > 0 {
                 continue;
             }
-            // Asked before freeing because a store frees a segment by looking for its blocks, which costs
-            // something even when there are none.
+            // Asked so a day nothing was written to is not counted as freed. Freeing itself is one call now
+            // — a segment stops existing — so this is about the answer rather than about the cost.
             if self.records.blocks_in_day(segment) > 0 {
                 freed += self.records.free_segment(segment);
             }
@@ -1032,7 +1032,7 @@ mod tests {
     /// have is not a number to report — it is news the sequencer has to stop on.
     #[test]
     fn a_hold_the_index_cannot_take_is_named_back_to_the_caller() {
-        let mut engine = PendingEngine::sized(8, 64, 64, Box::new(MemBlockStore::default()));
+        let mut engine = PendingEngine::sized(8, 64, 64, Box::new(MemoryStore::default()));
         let mut refused = None;
         for index in 0..256u128 {
             if let Err(not_stored) = engine.write(

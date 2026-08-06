@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use ledger_base::ports::{ApplyIndex, PendingEffect};
 use ledger_base::{AccountId, BudgetGroup, TxId};
 use ledger_benchkit::{BenchOptions, Samples, STRIDE};
-use ledger_pending::{MemBlockStore, PendingEngine, SnapshotReader, LOAD_TARGET, SNAPSHOT_RECORD};
+use ledger_pending::{MemoryStore, PendingEngine, SnapshotReader, LOAD_TARGET, SNAPSHOT_RECORD};
 
 /// Slots the design's index has: 4.8 billion holds at the 0.90 load target, eight bytes each.
 const DESIGN_SLOTS: u64 = 5_333_333_333;
@@ -52,7 +52,7 @@ fn create(ordinal: u64) -> PendingEffect {
 /// The slot count is the caller's because a snapshot only restores into a table of the same size: a recovery
 /// row has to give the source room for the tail it will replay, or the restore it measures is a refusal.
 fn filled(holds: u64, slots: usize) -> PendingEngine {
-    let mut engine = PendingEngine::sized(slots, 8, 1 << 20, Box::new(MemBlockStore::default()));
+    let mut engine = PendingEngine::sized(slots, 8, 1 << 20, Box::new(MemoryStore::default()));
     for at in 1..=holds {
         let _ = engine.write(create(at), ApplyIndex(at));
     }
@@ -143,7 +143,7 @@ fn recovery_rate(options: &BenchOptions) {
         let mut chunk = vec![0u8; CHUNK];
         for _ in 0..options.repeat {
             let mut into =
-                PendingEngine::sized(slots, 8, 1 << 20, Box::new(MemBlockStore::default()));
+                PendingEngine::sized(slots, 8, 1 << 20, Box::new(MemoryStore::default()));
             let mut writer = engine.begin_snapshot();
             let mut reader = SnapshotReader::new();
             let started = Instant::now();

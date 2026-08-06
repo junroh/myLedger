@@ -1460,8 +1460,8 @@ offered, admitted and refused, and whose sweep test fails if no seed outlived it
 > metadata and the per-segment counts, written every N minutes.
 > **Broke** — three of those four have no business being in it, and the fourth is the only one that does.
 > Blocks are already on disk and immutable. The buffer is records not yet on disk, which the log has, so
-> replay rebuilds it. Ranges and counts are functions of the slots. What is left is the index, and it is
-> the only thing that says which of the records on disk are alive.
+> replay rebuilds it. Counts are functions of the slots, and so is every range the *expiry walk* needs.
+> What is left is the index, and it is the only thing that says which of the records on disk are alive.
 > **Weighed** — carrying the buffer as well, so coverage is *now* and no replay is needed (more bytes,
 > and a moving set to snapshot); a block-number cutoff to keep the dump coherent while it is written,
 > which was a self-inflicted problem and lost a hold repointed across it; two full copies of the array
@@ -1567,7 +1567,7 @@ with the engine's own reads, and those are on the critical path against a 5ms co
 | blocks | ❌ | already on disk; a follower gets them by bulk transfer (§6.3) |
 | writeback buffer | ❌ | not on disk, so the log has it — replay rebuilds it |
 | residency | ❌ | memory copies of blocks that are on disk |
-| per-segment block ranges | ❌ | the span of block numbers the slots reference, per segment |
+| per-segment block ranges | ❌ | what the expiry walk needs of them is the span the slots reference; where a block *sits* needs no range at all (§16) |
 | per-segment live counts | ❌ | count the slots |
 | overlay, sweep cursor, offered slice | ❌ | leader-local and volatile by design |
 
@@ -1688,3 +1688,117 @@ surviving a restart: if the two components' snapshots are taken at different poi
 replay from the earlier of them and the later component has to tolerate seeing effects it has already
 applied. That is the same idempotency argument as above, now needed on the account side as well, and
 nothing here has established it there.
+
+## 16. The store's interface is a filesystem's, and the offset is a function of the address
+
+> **Tried** — adding a file and an offset to the block store as it was: a trait addressed by
+> `RecordAddr`, with each backend working out for itself where a block sits.
+> **Broke** — two ways. The one rule that has to be identical in every backend would have lived once per
+> backend. And the offset that shape implies is *relative* to a segment's own first block, which is not a
+> function of anything that survives: a leading block whose records all died leaves no live slot to find
+> it by. The snapshot test that shares one store between two engines could not read a single record —
+> `the index names a block that no day says it wrote` — which is the same defect shape as the group
+> totals in §15, a value documented as derived that is not derivable.
+> **Weighed** — carrying the sixty-four ranges and the next block number in the snapshot (about a
+> kilobyte, and it makes an exception of §15's argument that the snapshot is the index and the rest is
+> derived); a struct of its own above the seam to own the layout (the record log already owns the ranges,
+> so it would have been a second owner of them, rule 18); a raw block device instead of a filesystem (the
+> directory is the metadata you would otherwise have to write and `fsync` yourself); naming the trait for
+> its unit rather than its purpose (`BlockStore` — but memory is the stand-in and durable space is the
+> point, and this repo already names a port for the role and the stand-in for its backing:
+> `PendingPort`/`MemoryPending`).
+> **Chose** — a filesystem's vocabulary at the seam. A segment is a file: brought into being by its first
+> block, appended to at an offset, read at an offset, removed whole, and able to fail. The offset is
+> **absolute** — the block number times the block size — so it is a function of the address and nothing
+> has to be restored. `MemoryStore` backs it today, `LatencyStore` prices a device in front of any
+> backend, and `FileStore` is seven methods whenever a disk arrives.
+
+**The seam is where it is because of what has to be identical.** Above it the engine speaks in
+`RecordAddr` — segment, block, record — and knows about holds, days and retention. Below it there is a
+segment, an offset and bytes, and nothing that understands any of the above. `RecordLog` is the
+translation, and it is where it already was: it keeps the per-day block ranges for the expiry walk, so
+asking it for an offset adds no state and creates no second owner of one.
+
+### Absolute offsets, and what a filesystem is being asked to remember
+
+Block numbers count on across day boundaries and a day's blocks are consecutive, so a segment's file
+holds one contiguous extent that begins at `first_block × 4096`. Everything before that offset is a hole.
+
+That is the whole trick, and what it buys is that **the filesystem's own extent map is the layout**. A
+restart derives every offset from the address it already has in the index and asks nobody: no range in
+the snapshot, no directory scan, no superblock. A raw block device would have to write and `fsync` that
+mapping itself, and that — rather than throughput — is the argument for a filesystem here.
+
+What it costs is an apparent file size and not space: allocation is the day's blocks and nothing else, so
+`du` tells the truth and `ls -l` does not. Two consequences worth knowing before a deployment rather than
+after one:
+
+- **`ext4` caps a file at 16TB**, so a block number above 2³² could not be written to one. At the design's
+  2.9M blocks a day that is 1481 years. XFS and APFS cap at 8EB and the question does not arise.
+- **A copy that is not sparse-aware would expand the hole.** Nothing in the recovery path copies these
+  files — the log and the snapshot are what recovery reads — but a backup script written in ignorance of
+  this would try to write 137TB.
+
+### The buffer's alignment arrives before the buffer's reader
+
+`Block` is 4096 bytes aligned to 4096, and that is not a cache-line matter: the residency window is
+already this engine's cache, so a real store reads and writes past the page cache rather than through a
+second copy of it, and direct IO wants the *buffer address* aligned as well as the offset and the length.
+The last two are whole blocks by construction. A `Vec<u8>` is aligned to one byte, so an unaligned buffer
+would have bought a bounce copy per IO on a path that has none.
+
+It is written as a literal `repr(align(4096))` rather than through `cache_aligned!` because that macro
+exists to funnel the *target's* line size, which varies per build. This alignment is `BLOCK_BYTES` and
+cannot vary with the target, so what keeps the literal honest is a const assertion that it equals the
+constant. `ledgerfio layout` prints the claim beside everyone else's.
+
+### What a real backend is, method by method
+
+| seam | a file per segment |
+|---|---|
+| `open_with(segment, offset, block)` | `openat(dir, "seg-NN.blk", O_CREAT\|O_EXCL\|O_RDWR\|O_DIRECT)` then `pwrite` at `offset` |
+| `append(segment, offset, block)` | `pwrite` |
+| `read_at(segment, offset, into)` | `pread`. A short read is `Missing`; `EIO` is the fault variant that arrives with the device |
+| `submit` / `poll` | the one pair POSIX has no answer for — `pread` on a thread pool, or io_uring. `SE-OQ-4` is a choice between two implementations of these two methods, and this is where it lives |
+| `remove(segment)` | `unlinkat`, then close |
+
+**`open_with` is one call and not a create followed by a write**, because a segment's first block *is* its
+creation and two statements that always happen together are two that can come apart (rule 16). Which of
+the two a write is, is the caller's to say rather than the backend's to discover: `RecordLog` knows from
+the day's own block count, so a real backend never pays a syscall to learn what its caller already knew.
+
+**Durability on a filesystem has two layers, and that is why a sync is one call with no argument.**
+`fsync(fd)` makes a file's bytes durable; a file that has just been created also needs `fsync(dir)`, or a
+crash can leave durable bytes in a file that does not exist. So durability is a property of the store as a
+whole at a moment in time, not a per-segment watermark — an optimisation someone would otherwise reach
+for. Removing a segment needs no such care in the other direction: `reclaim` uses no clock and no cursor,
+so a leftover file is found and freed again on the next pass.
+
+**`ENOSPC` is real on a filesystem and impossible on a preallocated device**, and its reaction is `EIO`'s:
+the hold cannot be stored, which is rule 19's condition. Same reaction, so it is not a variant of its own.
+
+**`O_DIRECT` cannot be verified on this machine.** macOS has no equivalent — `F_NOCACHE` is advisory — so
+numbers from a local file backend would not be a device's. `SE-OQ-6` needs a Linux host, which is worth
+knowing in advance of it rather than as a surprise.
+
+### What this makes askable, and one answer it already narrows
+
+`SE-OQ-5` is compression, and the layout above answers half of it before anyone measures: a block's offset
+is derived from its number, so **compressing whole blocks would break the one rule this seam rests on** —
+a shorter block leaves the next one's offset no longer derivable, and an offset map is exactly the state
+absolute offsets exist to avoid. Compression therefore belongs *inside* a block, at the record, with the
+block staying 4096 bytes. That also matches what compression is for here: the design's sixty-four records
+a block needs its 128-byte record halved, and the gain is records per read rather than bytes per write.
+
+### Still unbuilt, and named so it is not read as done
+
+- **A fault a device can produce.** `StoreFault` has one variant, `Missing`, and it means this node's own
+  record of where blocks are has stopped agreeing with the store. A device variant, and the rule 19 seal
+  that both deserve, arrive with a backend that can fail — today a write that a store would not take is
+  counted by nobody, because no store refuses one.
+- **Nothing reconciles at startup.** `reclaim` only frees a segment it has a block count for, and a
+  restart begins with none — so a file left by the previous life would never be removed, and sixty-three
+  days later the segment's reuse would write over the front of it. That is one call at the seam
+  (`existing()`, a bitmap of segments present) and it is not built, because nothing restarts yet.
+- **Written is not yet distinguished from durable.** `sync` is not on the seam, so a snapshot's coverage
+  still stops at the last *sealed* block rather than the last durable one. That is the next piece.

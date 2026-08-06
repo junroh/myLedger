@@ -321,7 +321,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::block::{BlockStore, MemBlockStore, RecordAddr, RECORDS_PER_BLOCK};
+    use crate::block::{Block, DurableStore, MemoryStore, StoreFault, RECORDS_PER_BLOCK};
     use crate::engine::PendingEngine;
 
     /// A chunk small enough that every test here crosses several, because a format that is only ever read in
@@ -332,35 +332,40 @@ mod tests {
     /// index and the blocks are already on the disk that survived. An engine restored over an empty store
     /// would find every slot and be able to read none of them, which is a test about nothing.
     #[derive(Clone, Default)]
-    struct SharedStore(Rc<RefCell<MemBlockStore>>);
+    struct SharedStore(Rc<RefCell<MemoryStore>>);
 
-    impl BlockStore for SharedStore {
-        fn write(&mut self, addr: RecordAddr, bytes: &[u8]) {
-            self.0.borrow_mut().write(addr, bytes);
+    impl DurableStore for SharedStore {
+        fn open_with(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
+            self.0.borrow_mut().open_with(segment, offset, block)
         }
 
-        fn read(&self, addr: RecordAddr, into: &mut [u8]) -> bool {
-            self.0.borrow().read(addr, into)
+        fn append(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
+            self.0.borrow_mut().append(segment, offset, block)
         }
 
-        fn submit(&mut self, handle: u64, addr: RecordAddr, now: u64) -> bool {
-            self.0.borrow_mut().submit(handle, addr, now)
+        fn read_at(
+            &mut self,
+            segment: u8,
+            offset: u64,
+            into: &mut Block,
+        ) -> Result<(), StoreFault> {
+            self.0.borrow_mut().read_at(segment, offset, into)
         }
 
-        fn poll(&mut self, now: u64, into: &mut [u8]) -> Option<u64> {
+        fn submit(&mut self, handle: u64, segment: u8, offset: u64, now: u64) -> bool {
+            self.0.borrow_mut().submit(handle, segment, offset, now)
+        }
+
+        fn poll(&mut self, now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
             self.0.borrow_mut().poll(now, into)
-        }
-
-        fn blocks(&self) -> usize {
-            self.0.borrow().blocks()
         }
 
         fn inflight(&self) -> usize {
             self.0.borrow().inflight()
         }
 
-        fn free_segment(&mut self, segment: u8) -> usize {
-            self.0.borrow_mut().free_segment(segment)
+        fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
+            self.0.borrow_mut().remove(segment)
         }
     }
 
@@ -529,8 +534,7 @@ mod tests {
         );
 
         // And the claim itself: every hold at or below coverage is carried, every one above it is not.
-        let mut restored =
-            PendingEngine::sized(1 << 12, 4, 1024, Box::new(MemBlockStore::default()));
+        let mut restored = PendingEngine::sized(1 << 12, 4, 1024, Box::new(MemoryStore::default()));
         let mut writer = engine.begin_snapshot();
         let mut reader = SnapshotReader::new();
         let mut chunk = vec![0u8; CHUNK];
@@ -783,12 +787,12 @@ mod tests {
     /// the bytes mean.
     #[test]
     fn a_table_of_a_different_size_refuses_the_stream() {
-        let mut engine = PendingEngine::sized(64, 1, 64, Box::new(MemBlockStore::default()));
+        let mut engine = PendingEngine::sized(64, 1, 64, Box::new(MemoryStore::default()));
         engine
             .write(create(1, BudgetGroup::ABSENT), ApplyIndex(1))
             .expect("the index took the hold");
 
-        let mut wrong = PendingEngine::sized(1 << 14, 1, 64, Box::new(MemBlockStore::default()));
+        let mut wrong = PendingEngine::sized(1 << 14, 1, 64, Box::new(MemoryStore::default()));
         let refused = round_trip(&mut engine, &mut wrong).expect_err("a table of another size");
         assert!(
             matches!(refused, NotASnapshot::Buckets { .. }),

@@ -16,7 +16,7 @@ use ledger_base::{
 use ledger_stubkit::{IdleBackoff, LatencyRange, WorkerThread};
 
 use crate::block::{
-    BlockStore, LatencyBlockStore, LogTraffic, MemBlockStore, RecordAddr, BLOCK_BYTES,
+    DurableStore, LatencyStore, LogTraffic, MemoryStore, RecordAddr, BLOCK_BYTES,
     RECORDS_PER_BLOCK, SEGMENTS,
 };
 use crate::engine::{BudgetState, PendingEngine, Started};
@@ -116,12 +116,12 @@ pub struct StoreModel {
 }
 
 impl StoreModel {
-    fn build(&self, seed: u64) -> Box<dyn BlockStore> {
-        let exact = Box::new(MemBlockStore::default());
+    fn build(&self, seed: u64) -> Box<dyn DurableStore> {
+        let exact = Box::new(MemoryStore::default());
         if self.read_base_nanos == 0 && self.read_tail_nanos == 0 && self.iops == 0 {
             return exact;
         }
-        Box::new(LatencyBlockStore::new(
+        Box::new(LatencyStore::new(
             exact,
             self.read_base_nanos,
             self.read_tail_nanos,

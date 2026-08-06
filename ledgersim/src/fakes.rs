@@ -13,7 +13,7 @@ use ledger_base::ports::{
 };
 use ledger_base::{Amount, FxHashMap, Prng, Transfer, TxId, UNORDERED};
 use ledger_pending::{
-    HoldOverlay, MemBlockStore, PendingEngine, DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS,
+    HoldOverlay, MemoryStore, PendingEngine, DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS,
     DEFAULT_SLOTS,
 };
 use ledger_stubkit::{LaneOrderer, Server, ServerStats};
@@ -257,7 +257,7 @@ impl PendingFake {
                 },
                 timings.flush_blocks,
                 timings.resident_blocks,
-                Box::new(MemBlockStore::default()),
+                Box::new(MemoryStore::default()),
             ),
             inbox: VecDeque::new(),
             orderer: LaneOrderer::new(faults.violate_order_every),

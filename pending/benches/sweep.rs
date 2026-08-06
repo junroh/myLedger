@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use ledger_base::ports::{ApplyIndex, PendingEffect};
 use ledger_base::{AccountId, BudgetGroup, Transfer, TxId};
 use ledger_benchkit::{BenchOptions, Samples, STRIDE};
-use ledger_pending::{MemBlockStore, PendingEngine, RECORDS_PER_BLOCK};
+use ledger_pending::{MemoryStore, PendingEngine, RECORDS_PER_BLOCK};
 
 /// Holds alive at once in the design: 4.8 billion over its retention. The per-record cost measured here is
 /// multiplied by one day's share of it, which is what a day's sweep has to get through.
@@ -66,7 +66,7 @@ fn remove(pending_ref: TxId) -> PendingEffect {
 /// which is a real property of the engine and would be a silent zero here.
 fn expiring_day(holds: u64) -> PendingEngine {
     let slots = (holds as f64 / ledger_pending::LOAD_TARGET) as usize;
-    let mut engine = PendingEngine::sized(slots, 1, 1, Box::new(MemBlockStore::default()));
+    let mut engine = PendingEngine::sized(slots, 1, 1, Box::new(MemoryStore::default()));
     engine.open_day(0, LIFETIME_DAYS);
     for at in 0..holds {
         engine
@@ -183,9 +183,9 @@ fn survivor_density(options: &BenchOptions) {
 /// engine is answering, and it is bounded by declaration now — so this row is the bound being linear, which
 /// is the property the index scan did not have at any setting.
 ///
-/// The round that hands the day's blocks back is excluded, and deliberately: `MemBlockStore::free_segment`
-/// scans its map, which is a stand-in's cost — a real device frees an extent — and it would otherwise be
-/// the worst round at every size and hide the one being measured.
+/// A round is both halves of the worker's own sweep and nothing is kept out of the timer. It used to be:
+/// handing a day's blocks back meant a scan of the store's map, a stand-in's cost that would have been the
+/// worst round at every size and hidden the one being measured. A segment now stops existing in one call.
 fn round_size(options: &BenchOptions) {
     println!();
     println!("the same day, against the blocks a round reads");
@@ -210,7 +210,7 @@ fn round_size(options: &BenchOptions) {
 }
 
 /// Emptying a day and the worst round that read blocks. Rounds that offered nothing are left out of the
-/// worst: they are the wait for the day to empty and the one that frees its blocks, and neither is the walk.
+/// worst: they are the wait for the day to empty, which is not the walk.
 fn empty_one_day_timed(
     engine: &mut PendingEngine,
     blocks: usize,
@@ -226,11 +226,13 @@ fn empty_one_day_timed(
     };
     while day.rounds < 1_000_000 {
         voids.clear();
-        // Both halves, the way the worker runs them: reclaiming a dead day's blocks is every node's own
-        // housekeeping and proposing its voids is the leader's, so a loop that drove only the second would
-        // be timing a node that never gets its space back.
-        engine.reclaim();
+        // Both halves, the way the worker runs them, and both inside the timer: reclaiming a dead day's
+        // blocks is every node's own housekeeping and proposing its voids is the leader's, so a round that
+        // timed only the second would be timing a node that never gets its space back. Reclaim used to sit
+        // outside it because handing a day back meant a scan of the store's map; a segment now stops
+        // existing in one call, so there is nothing left to keep out of the measurement.
         let started = Instant::now();
+        engine.reclaim();
         engine.propose_expiry(black_box(blocks), voids);
         let elapsed = started.elapsed();
         day.rounds += 1;

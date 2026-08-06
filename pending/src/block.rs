@@ -48,6 +48,12 @@ impl Block {
     pub fn zeroed() -> Box<Self> {
         Box::new(Self([0; BLOCK_BYTES]))
     }
+
+    pub fn copy_of(other: &Self) -> Box<Self> {
+        let mut fresh = Self::zeroed();
+        fresh.copy_from_slice(other);
+        fresh
+    }
 }
 
 impl Deref for Block {
@@ -111,6 +117,24 @@ impl RecordAddr {
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
     }
+
+    /// Where this record's block sits in its segment. **This is the whole of the layout rule and it lives
+    /// here alone**: the block number times the block size, absolute rather than relative to whatever the
+    /// segment's first block happened to be.
+    ///
+    /// Absolute is what leaves nothing to restore. Block numbers count on across day boundaries, so a
+    /// segment's file begins with a hole and its own blocks are one extent inside it — and the extent map
+    /// a filesystem already keeps *is* the layout, so a restart derives every offset from the address and
+    /// asks nobody. The relative form needed the segment's first block, which is not a function of the
+    /// live slots — a leading block whose records all died leaves no slot to find it by — so it would have
+    /// had to travel in the snapshot, and §15's whole argument is that the snapshot is the index and the
+    /// rest is derived. A restore proved it rather than argued it: the test that shares a store between
+    /// two engines could not read a single record.
+    ///
+    /// What it costs is an apparent file size, not space: allocation is the day's blocks and nothing else.
+    pub const fn block_offset(self) -> u64 {
+        self.block() * BLOCK_BYTES as u64
+    }
 }
 
 /// Little-endian, stated rather than inherited: these bytes are a format the moment the blocks leave
@@ -159,9 +183,26 @@ pub fn decode(bytes: &[u8], _from: RecordAddr) -> (TxId, HoldData) {
     (key, hold)
 }
 
-/// Whole blocks, written once. Below this is memory today; a file or a network volume goes here
-/// without the engine above it changing, which is the point of the seam being bytes rather than
-/// records — a store that had to understand a hold could not be either of those.
+/// What a store can fail at.
+///
+/// One variant, because without a device only one thing can go wrong: the store is asked for a block it
+/// does not have. That is not a miss — the index only ever names blocks that were written — so it is this
+/// node's own record of where blocks are having stopped agreeing with the store. A device that refuses a
+/// read for reasons of its own is a second variant, and it arrives with the device that can produce it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreFault {
+    Missing,
+}
+
+/// Whole blocks at a segment and an offset, written once and freed a segment at a time. Memory backs it
+/// today; a file or a network volume goes underneath without the engine above changing.
+///
+/// **The vocabulary here is a filesystem's, and that is what this seam is for.** A segment is a file: it
+/// is brought into being by its first block, appended to after that, and removed whole. Offsets and
+/// lengths are whole blocks, which is what direct IO asks of them alongside the buffer's alignment. And
+/// the *caller* turns an address into an offset — `RecordAddr::block_offset`, which needs no state to do
+/// it — so nothing below here needs to know what a block number is, let alone what a hold is. A backend is
+/// then seven methods: a file per segment, an extent per segment on a raw device, or memory.
 ///
 /// Two ways to read, because the engine has two callers with different constraints. A **lookup** submits
 /// and harvests, so a store with a latency does not stop the loop. **Applying** a committed decision
@@ -169,82 +210,152 @@ pub fn decode(bytes: &[u8], _from: RecordAddr) -> (TxId, HoldData) {
 /// ends — so it reads synchronously; a store that models a device charges its rate gate without holding
 /// the caller, which prices the IO while leaving the latency of that path unmodelled. That is the gap a
 /// read cache is meant to close, and it is why apply-path reads are counted separately.
-pub trait BlockStore {
-    fn write(&mut self, addr: RecordAddr, bytes: &[u8]);
-    /// False when the block is not there, which is a bug rather than a miss: the index only points at
-    /// blocks that were written.
-    fn read(&self, addr: RecordAddr, into: &mut [u8]) -> bool;
+pub trait DurableStore {
+    /// A segment's first block, which is what brings the segment into being. One call rather than a
+    /// create followed by a write: a segment's first block *is* its creation, and two statements that
+    /// always happen together are two that can come apart (rule 16). The caller knows which of this and
+    /// `append` a write is, from the blocks it has already put there, so a backend never pays a syscall
+    /// to find out what its caller already knew.
+    fn open_with(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault>;
+    /// The next block of a segment that already exists. Same shape as `open_with` on purpose: the two
+    /// differ in whether the segment is there yet and in nothing else, and which it is is the caller's to
+    /// say.
+    fn append(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault>;
+    /// `&mut` although reading changes nothing a caller can see: a store that models a device charges
+    /// the read, and one that can fail counts it.
+    fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault>;
     /// False when the store will not take another read yet, which is backpressure rather than failure.
-    fn submit(&mut self, handle: u64, addr: RecordAddr, now: u64) -> bool;
+    fn submit(&mut self, handle: u64, segment: u8, offset: u64, now: u64) -> bool;
     /// The next read finished by `now`, copied out. `None` while nothing is due.
-    fn poll(&mut self, now: u64, into: &mut [u8]) -> Option<u64>;
-    fn blocks(&self) -> usize;
+    fn poll(&mut self, now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>>;
     fn inflight(&self) -> usize;
-    /// Drops every block of a segment and answers how many there were. The one way the store shrinks:
-    /// blocks are written once and never rewritten, so space comes back a whole day at a time, and only
-    /// once nothing in the index points into that day. The segment is in the address, so what belongs to a
-    /// day is the store's own to find — no caller has to remember which blocks it handed over.
-    fn free_segment(&mut self, segment: u8) -> usize;
+    /// Stops a segment existing. The one way the store shrinks: blocks are written once and never
+    /// rewritten, so space comes back a whole day at a time, and only once nothing in the index points
+    /// into that day.
+    ///
+    /// It answers nothing about how many blocks there were. The caller wrote them and so already knows,
+    /// and a real store could not answer anyway — `unlink` does not count what it removes.
+    fn remove(&mut self, segment: u8) -> Result<(), StoreFault>;
 }
 
 /// The exact store: it keeps what it was given and adds no latency. Every other store is measured
 /// against this one, and a simulation that wants a device's tail wraps it rather than replacing it.
-#[derive(Default)]
-pub struct MemBlockStore {
-    blocks: FxHashMap<u64, Vec<u8>>,
+///
+/// A segment's blocks are one growing sequence rather than a map keyed by address, and that is a property
+/// being proved rather than a detail of the stand-in: **where a block sits follows from its offset
+/// alone**, which is what a file requires and what a map let this code get away without. Boxed per block
+/// so growing the sequence moves pointers rather than four kilobytes at a time — physical contiguity is
+/// what a file has and what nothing here rests on; the offsets are.
+pub struct MemoryStore {
+    segments: [Option<SegmentFile>; SEGMENT_VALUES],
     /// Submitted reads, answered in the order they were asked for and with no delay. A store that
     /// modelled a device would answer out of order; this one is the baseline that says what the
     /// structure does when the device is not the variable.
-    submitted: VecDeque<(u64, RecordAddr)>,
+    submitted: VecDeque<(u64, u8, u64)>,
 }
 
-impl MemBlockStore {
-    fn key(addr: RecordAddr) -> u64 {
-        RecordAddr::new(addr.segment(), addr.block(), 0).raw()
+/// One segment's blocks, and the offset the first of them landed at.
+///
+/// The hole in front of that offset is what a sparse file has and this does not have to: `base` is the
+/// whole of it. A real backend keeps no equivalent — the filesystem's extent map is already this — which is
+/// why nothing has to restore it and why memory is allowed to forget it.
+struct SegmentFile {
+    base: u64,
+    blocks: Vec<Box<Block>>,
+}
+
+impl SegmentFile {
+    fn at(&self, offset: u64) -> Option<&Block> {
+        let within = offset.checked_sub(self.base)?;
+        self.blocks
+            .get((within / BLOCK_BYTES as u64) as usize)
+            .map(|block| &**block)
+    }
+
+    fn end(&self) -> u64 {
+        self.base + self.blocks.len() as u64 * BLOCK_BYTES as u64
     }
 }
 
-impl BlockStore for MemBlockStore {
-    fn write(&mut self, addr: RecordAddr, bytes: &[u8]) {
-        self.blocks.insert(Self::key(addr), bytes.to_vec());
-    }
-
-    fn read(&self, addr: RecordAddr, into: &mut [u8]) -> bool {
-        match self.blocks.get(&Self::key(addr)) {
-            Some(block) => {
-                into.copy_from_slice(block);
-                true
-            }
-            None => false,
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self {
+            segments: std::array::from_fn(|_| None),
+            submitted: VecDeque::new(),
         }
     }
+}
 
-    fn submit(&mut self, handle: u64, addr: RecordAddr, _now: u64) -> bool {
-        self.submitted.push_back((handle, addr));
+impl MemoryStore {
+    fn block_at(&self, segment: u8, offset: u64) -> Result<&Block, StoreFault> {
+        debug_assert!(
+            offset.is_multiple_of(BLOCK_BYTES as u64),
+            "an offset is a whole number of blocks, which is what direct IO requires of it"
+        );
+        self.segments[segment as usize]
+            .as_ref()
+            .and_then(|file| file.at(offset))
+            .ok_or(StoreFault::Missing)
+    }
+}
+
+impl DurableStore for MemoryStore {
+    fn open_with(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
+        // What `O_EXCL` is for, and a self-invariant rather than a fault: both sides of it are ours. A
+        // segment brought into being twice would hold two days' blocks under one day's count.
+        debug_assert!(
+            self.segments[segment as usize].is_none(),
+            "a segment is brought into being once, by its first block"
+        );
+        self.segments[segment as usize] = Some(SegmentFile {
+            base: offset,
+            blocks: vec![Block::copy_of(block)],
+        });
+        Ok(())
+    }
+
+    fn append(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
+        let file = self.segments[segment as usize]
+            .as_mut()
+            .ok_or(StoreFault::Missing)?;
+        // Blocks are written once and a segment's own are consecutive, so its end is the only offset a
+        // write can have. A self-invariant, not a fault: the caller's block numbers and this sequence are
+        // both ours, and disagreeing means one of them is wrong rather than the store being broken.
+        debug_assert_eq!(
+            offset,
+            file.end(),
+            "a block goes at the end of its segment or nowhere"
+        );
+        file.blocks.push(Block::copy_of(block));
+        Ok(())
+    }
+
+    fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault> {
+        into.copy_from_slice(self.block_at(segment, offset)?);
+        Ok(())
+    }
+
+    fn submit(&mut self, handle: u64, segment: u8, offset: u64, _now: u64) -> bool {
+        self.submitted.push_back((handle, segment, offset));
         true
     }
 
-    fn poll(&mut self, _now: u64, into: &mut [u8]) -> Option<u64> {
-        let (handle, addr) = self.submitted.pop_front()?;
-        self.read(addr, into).then_some(handle)
-    }
-
-    fn blocks(&self) -> usize {
-        self.blocks.len()
+    fn poll(&mut self, _now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
+        let (handle, segment, offset) = self.submitted.pop_front()?;
+        Some(self.read_at(segment, offset, into).map(|()| handle))
     }
 
     fn inflight(&self) -> usize {
         self.submitted.len()
     }
 
-    fn free_segment(&mut self, segment: u8) -> usize {
-        let before = self.blocks.len();
-        // The segment is in the key, so what belongs to a day is the store's own to find. A scan of the
-        // map, which a day's worth of freeing can afford: it happens once per day and off any request's
-        // path. A real device would have an extent per segment and free it in one call.
-        self.blocks
-            .retain(|key, _| RecordAddr::from_raw(*key).segment() != segment);
-        before - self.blocks.len()
+    fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
+        // One drop, which is what `unlink` costs. What this replaced went looking through a map for the
+        // blocks of a day, and that was a stand-in's cost rather than a store's: the sweep bench had to
+        // leave the round that frees a day out of its numbers because it was the worst round at every
+        // size and hid the one being measured.
+        self.segments[segment as usize] = None;
+        Ok(())
     }
 }
 
@@ -351,19 +462,26 @@ impl Filling {
 /// The synchronous read charges the device without waiting: the path that applies committed decisions is
 /// in order, and on a virtual clock a wait only time can end never ends. So this prices that path's IO
 /// and leaves its latency unmodelled — stated, because it is the one number this cannot answer.
-pub struct LatencyBlockStore {
-    inner: Box<dyn BlockStore>,
+///
+/// **It wraps any store, including one with a real device under it, and the composition is a floor rather
+/// than a sum.** A completion is an absolute time taken from when the read was admitted, so when the inner
+/// store is memory the drawn time is the whole of it, and when the inner store is real its own time has
+/// already passed by the time the deadline is compared — whichever is slower wins, with nothing measuring
+/// the difference. That is what makes "model a device slower than the one I have" mean something, and
+/// modelling a faster one impossible.
+pub struct LatencyStore {
+    inner: Box<dyn DurableStore>,
     device: Server,
     prng: Prng,
     /// Submitted reads and when the device says each is done, oldest first by admission. Completions are
     /// released by due time, which is not the order they were asked in.
-    inflight: Vec<(u64, RecordAddr, u64)>,
+    inflight: Vec<(u64, u8, u64, u64)>,
     queue_depth: usize,
 }
 
-impl LatencyBlockStore {
+impl LatencyStore {
     pub fn new(
-        inner: Box<dyn BlockStore>,
+        inner: Box<dyn DurableStore>,
         base_nanos: u64,
         tail_nanos: u64,
         per_second: u64,
@@ -380,32 +498,32 @@ impl LatencyBlockStore {
     }
 }
 
-impl BlockStore for LatencyBlockStore {
-    fn write(&mut self, addr: RecordAddr, bytes: &[u8]) {
-        self.inner.write(addr, bytes);
+impl DurableStore for LatencyStore {
+    fn open_with(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
+        self.inner.open_with(segment, offset, block)
     }
 
-    fn read(&self, addr: RecordAddr, into: &mut [u8]) -> bool {
-        self.inner.read(addr, into)
+    fn append(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
+        self.inner.append(segment, offset, block)
     }
 
-    fn submit(&mut self, handle: u64, addr: RecordAddr, now: u64) -> bool {
+    fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault> {
+        self.inner.read_at(segment, offset, into)
+    }
+
+    fn submit(&mut self, handle: u64, segment: u8, offset: u64, now: u64) -> bool {
         if self.inflight.len() >= self.queue_depth {
             return false;
         }
         let due = self.device.serve(now, &mut self.prng);
-        self.inflight.push((handle, addr, due));
+        self.inflight.push((handle, segment, offset, due));
         true
     }
 
-    fn poll(&mut self, now: u64, into: &mut [u8]) -> Option<u64> {
+    fn poll(&mut self, now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
         let at = self.inflight.iter().position(|(.., due)| *due <= now)?;
-        let (handle, addr, _) = self.inflight.swap_remove(at);
-        self.inner.read(addr, into).then_some(handle)
-    }
-
-    fn blocks(&self) -> usize {
-        self.inner.blocks()
+        let (handle, segment, offset, _) = self.inflight.swap_remove(at);
+        Some(self.inner.read_at(segment, offset, into).map(|()| handle))
     }
 
     fn inflight(&self) -> usize {
@@ -414,8 +532,8 @@ impl BlockStore for LatencyBlockStore {
 
     /// Freeing costs the device nothing this model charges for: it is off any request's path, and a device
     /// that made it expensive would be one whose extents this store does not model.
-    fn free_segment(&mut self, segment: u8) -> usize {
-        self.inner.free_segment(segment)
+    fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
+        self.inner.remove(segment)
     }
 }
 
@@ -438,7 +556,7 @@ impl BlockStore for LatencyBlockStore {
 /// them apart is what lets the first window be an hour while the second is a day. Residency costs far
 /// less than a day of arrivals, because what is resident has already been compacted: the survivors.
 pub struct RecordLog {
-    store: Box<dyn BlockStore>,
+    store: Box<dyn DurableStore>,
     /// Recent blocks, oldest first; the last is the one being filled. Not on the store yet.
     buffer: VecDeque<Filling>,
     /// Ordinal of `buffer.front()`, so an address stays unique after blocks are flushed away.
@@ -485,7 +603,7 @@ pub struct RecordLog {
 impl Default for RecordLog {
     fn default() -> Self {
         Self::new(
-            Box::new(MemBlockStore::default()),
+            Box::new(MemoryStore::default()),
             DEFAULT_FLUSH_BLOCKS,
             DEFAULT_RESIDENT_BLOCKS,
         )
@@ -500,7 +618,7 @@ pub const DEFAULT_FLUSH_BLOCKS: usize = 1024;
 pub const DEFAULT_RESIDENT_BLOCKS: usize = 4096;
 
 impl RecordLog {
-    pub fn new(store: Box<dyn BlockStore>, flush_blocks: usize, resident_blocks: usize) -> Self {
+    pub fn new(store: Box<dyn DurableStore>, flush_blocks: usize, resident_blocks: usize) -> Self {
         let mut buffer = VecDeque::new();
         buffer.push_back(Filling::new());
         Self {
@@ -562,11 +680,18 @@ impl RecordLog {
     /// Hands a day's blocks back, and answers how many. The caller decides *when*: only once nothing in
     /// the index points into that day, which is the one moment they are known to be dead.
     ///
+    /// The count comes from this day's range rather than from the store, because the store no longer has
+    /// one to give: it stops a segment existing, and a real one's `unlink` cannot say what it removed. The
+    /// blocks were noted here as they were written, so this side already knows.
+    ///
     /// Residency is not touched, and it does not have to be: it holds the most recently written blocks,
     /// and a day old enough to be freed left it long before. A configuration that kept records in memory
     /// longer than they are allowed to exist is refused at startup rather than handled here.
     pub fn free_segment(&mut self, segment: u8) -> usize {
-        let freed = self.store.free_segment(segment);
+        let freed = self.days[segment as usize].blocks as usize;
+        // Nothing to react to: the reaction to a store that cannot do as it is told is rule 19's, and it
+        // arrives with a store that can fail at it.
+        let _ = self.store.remove(segment);
         self.freed += freed as u64;
         self.days[segment as usize] = BlockRange::default();
         freed
@@ -612,8 +737,8 @@ impl RecordLog {
         !addr.is_buffered() && addr.block() < self.next_block
     }
 
-    /// Blocks this day wrote. Asked before freeing a day, because a store frees a segment by going looking
-    /// for its blocks and that costs something even when there are none.
+    /// Blocks this day wrote, which is also how many freeing it hands back — the store cannot say, so this
+    /// side is where the number is.
     pub fn blocks_in_day(&self, segment: u8) -> u64 {
         self.days[segment as usize].blocks
     }
@@ -639,9 +764,13 @@ impl RecordLog {
         let Some(block) = self.days[segment as usize].block_at(at) else {
             return false;
         };
-        if !self
+        // Where an address with its record field zeroed used to be built, which was the distinction between
+        // a block and a record being made by convention rather than by the seam.
+        let offset = block * BLOCK_BYTES as u64;
+        if self
             .store
-            .read(RecordAddr::new(segment, block, 0), &mut self.scratch)
+            .read_at(segment, offset, &mut self.scratch)
+            .is_err()
         {
             // The range says this block was written, so the store not having it is this node's own
             // bookkeeping disagreeing with itself. Nothing here can repair it; the walk goes on and the
@@ -759,7 +888,11 @@ impl RecordLog {
 
     fn read_from_store(&mut self, addr: RecordAddr) -> Option<(TxId, HoldData)> {
         self.store_reads += 1;
-        if !self.store.read(addr, &mut self.scratch) {
+        if self
+            .store
+            .read_at(addr.segment(), addr.block_offset(), &mut self.scratch)
+            .is_err()
+        {
             return None;
         }
         let at = addr.index() as usize * RECORD_BYTES;
@@ -769,7 +902,10 @@ impl RecordLog {
     /// Asks the store for the block this address is on. False is backpressure: the store will not take
     /// another read yet.
     pub fn fetch(&mut self, handle: u64, addr: RecordAddr, now: u64) -> bool {
-        if !self.store.submit(handle, addr, now) {
+        if !self
+            .store
+            .submit(handle, addr.segment(), addr.block_offset(), now)
+        {
             return false;
         }
         self.fetching.insert(handle, addr);
@@ -780,7 +916,7 @@ impl RecordLog {
     /// The next fetch finished by `now`. Completions may arrive in an order the reads were not asked
     /// in, which is what the orderer exists for.
     pub fn harvest(&mut self, now: u64) -> Option<(u64, RecordAddr, TxId, HoldData)> {
-        let handle = self.store.poll(now, &mut self.scratch)?;
+        let handle = self.store.poll(now, &mut self.scratch)?.ok()?;
         let addr = self.fetching.remove(&handle)?;
         self.store_reads += 1;
         let at = addr.index() as usize * RECORD_BYTES;
@@ -824,7 +960,10 @@ impl RecordLog {
         (
             self.buffer.len(),
             self.resident.len() + usize::from(self.store_open.filled > 0),
-            self.store.blocks(),
+            // Summed from the ranges rather than asked of the store, which no longer counts what it holds:
+            // it is told a segment and an offset, and a real one's answer to "how many blocks have you"
+            // would be a `stat` per file for a number this side already has.
+            self.days.iter().map(|day| day.blocks as usize).sum(),
         )
     }
 
@@ -833,7 +972,21 @@ impl RecordLog {
     /// the only event that adds to it.
     fn seal_store_block(&mut self) {
         let addr = RecordAddr::new(self.segment, self.next_block, 0);
-        self.store.write(addr, &self.store_open.bytes);
+        // A segment's first block is what brings it into being, and a later one lands in a segment that
+        // exists. This side knows which from the day's own count, so the store is told rather than asked —
+        // a real one would otherwise pay a syscall to find out what its caller already knew.
+        let opening = self.days[self.segment as usize].blocks == 0;
+        let written = if opening {
+            self.store
+                .open_with(self.segment, addr.block_offset(), &self.store_open.bytes)
+        } else {
+            self.store
+                .append(self.segment, addr.block_offset(), &self.store_open.bytes)
+        };
+        // Nothing here can repair a store that would not take a block, and nothing here decides what to do
+        // about it either: the index already points at these records, so the reaction is rule 19's seal and
+        // it arrives with a store that can actually fail.
+        let _ = written;
         self.days[self.segment as usize].note(self.next_block);
         let fresh = self.spare.pop().unwrap_or_else(Filling::new);
         let sealed = std::mem::replace(&mut self.store_open, fresh);
