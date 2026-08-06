@@ -436,14 +436,6 @@ unanswered, and **when that default stops being safe**. The source design's own 
   existed". It needs a push channel the ledger does not have, so this is a protocol decision, not an
   engine one.
 
-- **What was weighed and rejected in §3 and §7, and does either deserve revisiting?**
-  *Default:* unknown. `design-notes.md` now opens every section with what was tried, what broke, what was
-  weighed and what was chosen, and two sections answer the third with **not recorded** — the chain scratch
-  with lane gates, and separating a chain from a budget group. Both look right and both are load-bearing;
-  what is missing is the evidence that anything else was considered.
-  *Stops being safe:* the moment either is questioned. A decision whose alternatives were never written
-  down can only be defended by whoever made it, and that is the position this file exists to avoid.
-
 - **Which of the design's storage questions are still untouched, and is that acceptable?**
   *Default:* untouched. `SE-OQ-3` (a group spilling across blocks and what it costs in IO),
   `SE-OQ-4` (io_uring against a thread pool), `SE-OQ-5` (compression), `SE-OQ-6` (the ≤5ms worst case
@@ -475,6 +467,11 @@ An entry that vanishes reads as a question nobody ever asked.
   `cargo bench -p ledger-pending --bench snapshot`, and design notes §15 has the table.
 - **What sizes the expiry throttle's slice?** The day does. The requirement is met three orders over and the
   binding constraint is a single round, which is bounded by declaration rather than by density.
+- **What was weighed and rejected in §3 and §7?** Asked, and neither turns out to be a decision with
+  alternatives. §7 was never a choice: the design has a linked chain and a budget group apart and always did,
+  and the implementation merged them by misreading rather than by weighing — found afterwards by the person
+  who had separated them. §3's alternatives were never written down and are not remembered, so that line now
+  says unrecoverable rather than unrecorded: the first reads like a gap somebody could fill.
 - **Does the index need a `min_live_seg_id` epoch?** No, and a test says why: a day's blocks go back only
   once the index has no entry in it, so the dead slots are gone before the blocks are.
 - **`SE-OQ-2`** — the index bench measures what cannot be placed at each load factor and cascade cap.

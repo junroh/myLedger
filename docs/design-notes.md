@@ -406,8 +406,9 @@ gap: keeping "expired" needs per-hold state past retention, which is the data th
 > **Broke** — two mechanisms were missing and a chain cannot work without either: its own legs could not
 > see the availability an earlier leg brings in, and the group barrier completes groups in the order their
 > results arrive rather than in lane seq order.
-> **Weighed** — not recorded. What the alternatives were when this was decided is not written down
-> anywhere, and this header is where that shows.
+> **Weighed** — asked and unrecoverable. Nothing was written down at the time and the person who decided it
+> does not remember, so this line will stay as it is. Recorded that way on purpose: "not recorded" reads like
+> a gap somebody could still fill, and this one cannot be.
 > **Chose** — a chain scratch holding its own legs' gains, thrown away when the chain is judged, plus lane
 > gates for the barrier the sequencer itself created. Cost accepted and visible: chains sharing a lane
 > serialise, so `linked` runs at about an eighth of the single-phase rate.
@@ -622,17 +623,23 @@ decisions with a `ManualClock`. The default is a monotonic system clock.
 
 ## 7. A linked chain and a shared budget group are not the same thing
 
-> **Tried** — one mechanism for both. This implementation conflated them, because a chain's holds are in
-> practice the group.
-> **Broke** — their lifetimes differ: a chain lives for exactly one judge and one propose, and a budget
-> group outlives the request that created it and has to be tracked until every member is resolved.
-> **Weighed** — not recorded. As with §3, what else was on the table is not written down.
-> **Chose** — separate types (`ChainId`, `BudgetGroup`) and a stated rather than implied policy: the holds
-> a chain creates share one group named after the chain. The general case — a group spanning submissions —
-> needs a client-supplied durable id, so today only the weaker rule is enforced.
+> **Not a decision — a misreading corrected.** The design has these two apart and always did. This
+> implementation merged them because a chain's holds are in practice the group, and the merge was found
+> afterwards by the person who had written them separately in the first place. So there is no set of
+> alternatives here, and the header says that rather than pretending to one: what was weighed was nothing,
+> because the answer was already written down somewhere the implementation had not read closely enough.
+>
+> **What the merge cost**, which is the part worth keeping: their lifetimes differ, and a single type takes the
+> shorter of the two. A chain lives for exactly one judge and one propose; a budget group outlives the request
+> that created it and has to be tracked until every member is resolved. Merged, the second silently became the
+> first, and a group could be resolved a member at a time.
+>
+> **What it is now:** separate types (`LinkedChainId`, `BudgetGroup`), separate modules, and a policy stated
+> rather than implied — the holds a chain creates share one group named after the chain. The general case, a
+> group spanning submissions, needs a client-supplied durable id, so only the weaker rule is enforced today.
 
-The design describes two mechanisms that are easy to conflate, and this implementation did
-conflate them at first.
+The design describes two mechanisms that are easy to conflate, and this implementation did conflate them at
+first — not as a choice between them, but by reading one where there were two.
 
 - A **linked chain** is *atomicity at submission time*: these legs commit or roll back
   together. It lives for exactly one judge and one propose, and it is a property of a
