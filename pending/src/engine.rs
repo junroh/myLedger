@@ -286,7 +286,6 @@ impl PendingEngine {
                 credit_account,
                 amount,
                 remaining,
-                consumed,
                 ledger,
                 budget,
             } => {
@@ -312,9 +311,21 @@ impl PendingEngine {
                 };
                 // A repoint, not an insert: the slot is already there, so this cannot overflow.
                 self.put(pending_ref, hold, false);
-                if let Some(state) = self.budgets.get_mut(&budget) {
-                    state.remaining -= consumed;
-                }
+                // A group's total is deliberately not adjusted here, because a `Reduce` cannot belong to a
+                // group: `BudgetRules::allow_resolution` refuses a partial resolution of any hold that has
+                // one, whatever its size, so a group member always resolves in full and becomes a `Remove`.
+                //
+                // Asserted rather than assumed, and here rather than only where the rule lives, because
+                // something else now depends on it. Every other write is safe to apply twice — a `Remove`
+                // of a hold that is gone returns early, a repoint sets the same address again — so replay
+                // over already-applied state is idempotent, which is what lets a checkpoint carry the index
+                // as it is now and let the log's tail rebuild the rest. A subtraction that ran twice would
+                // be the one exception, and it would be silent: it took a hand-built effect the judge
+                // would have refused to produce a group remaining of minus twenty.
+                debug_assert!(
+                    budget.is_absent(),
+                    "a partial resolution reached the store with a budget group"
+                );
             }
             // Nothing is read: the slot is found by address and the group's arithmetic came with the
             // decision. This is every full settle and every void, which is most of the traffic.
@@ -763,7 +774,6 @@ mod tests {
             credit_account: AccountId(2),
             amount: 100,
             remaining: 40,
-            consumed: 60,
             ledger: 1,
             budget: BudgetGroup::ABSENT,
         });
@@ -780,7 +790,6 @@ mod tests {
             credit_account: AccountId(2),
             amount: 100,
             remaining: 10,
-            consumed: 30,
             ledger: 1,
             budget: BudgetGroup::ABSENT,
         });
@@ -803,9 +812,15 @@ mod tests {
         );
     }
 
-    /// A group's remainder follows the writes the engine is told about, across the block boundary a
-    /// partial resolution pushes it over. Holds are found by index, so nothing depends on a record
-    /// staying in the block it was first written to.
+    /// A group's totals follow the writes the engine is told about, across the block boundary its members
+    /// spill over. Holds are found by index, so nothing depends on a record staying in the block it was
+    /// first written to — and a group of more members than fit on one block is the case that says so.
+    ///
+    /// Resolved in full, because a group member cannot be resolved any other way:
+    /// `BudgetRules::allow_resolution` refuses a partial resolution of a hold that has a group, whatever
+    /// its size. This test used to use one anyway and assert what the engine did with it, which was
+    /// asserting behaviour for a shape the rules make unreachable — the `debug_assert` in the `Reduce`
+    /// arm found it.
     #[test]
     fn a_group_survives_its_records_spilling_into_later_blocks() {
         let group = BudgetGroup(77);
@@ -818,21 +833,16 @@ mod tests {
         assert_eq!(hold.budget_members, members as u32);
         assert_eq!(hold.budget_remaining, members as Amount * 10);
 
-        engine.stored(PendingEffect::Reduce {
+        engine.stored(PendingEffect::Remove {
             pending_ref: TxId(1),
-            debit_account: AccountId(1),
-            credit_account: AccountId(2),
-            amount: 10,
-            remaining: 4,
-            consumed: 6,
-            ledger: 1,
             budget: group,
+            released: 10,
         });
         let last = engine
             .lookup(TxId(members as u128))
             .expect("the last member");
-        assert_eq!(last.budget_remaining, members as Amount * 10 - 6);
-        assert_eq!(last.budget_members, members as u32);
+        assert_eq!(last.budget_remaining, members as Amount * 10 - 10);
+        assert_eq!(last.budget_members, members as u32 - 1);
     }
 
     /// The index does not grow, so an insert past its declared maximum has nowhere to go. It is named
@@ -898,7 +908,6 @@ mod apply_tests {
             credit_account: AccountId(2),
             amount: hold_amount,
             remaining: 300,
-            consumed: 200,
             ledger: 1,
             budget: BudgetGroup::ABSENT,
         });
@@ -935,7 +944,6 @@ mod apply_tests {
             credit_account: AccountId(2),
             amount: 0,
             remaining: 100,
-            consumed: 400,
             ledger: 1,
             budget: BudgetGroup::ABSENT,
         });
@@ -1102,7 +1110,6 @@ mod buffer_tests {
             credit_account: AccountId(2),
             amount: hold_amount,
             remaining: 60,
-            consumed: 40,
             ledger: 1,
             budget: BudgetGroup::ABSENT,
         });

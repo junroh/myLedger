@@ -113,7 +113,6 @@ impl Effect {
                 credit_account: self.credit_account,
                 amount: hold_amount,
                 remaining: self.remaining_after,
-                consumed: self.amount,
                 ledger: self.ledger,
                 budget: self.budget,
             }),

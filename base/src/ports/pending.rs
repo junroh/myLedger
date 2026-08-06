@@ -40,9 +40,6 @@ pub enum PendingEffect {
         /// The hold's original size, or zero when the sequencer could not supply it.
         amount: Amount,
         remaining: Amount,
-        /// What this resolution took, for the group's total. Carried because the engine would otherwise
-        /// have to read the old remainder back to subtract it.
-        consumed: Amount,
         ledger: u32,
         budget: BudgetGroup,
     },
