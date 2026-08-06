@@ -122,6 +122,18 @@ impl Runner {
                         .max
                         .saturating_sub(options.store_read.min))
                     .as_nanos() as u64,
+                    write_base_nanos: options.store_write.min.as_nanos() as u64,
+                    write_tail_nanos: (options
+                        .store_write
+                        .max
+                        .saturating_sub(options.store_write.min))
+                    .as_nanos() as u64,
+                    sync_base_nanos: options.store_sync.min.as_nanos() as u64,
+                    sync_tail_nanos: (options
+                        .store_sync
+                        .max
+                        .saturating_sub(options.store_sync.min))
+                    .as_nanos() as u64,
                     iops: options.store_iops,
                     queue_depth: 128,
                 },

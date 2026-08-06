@@ -205,11 +205,10 @@ pub enum StoreFault {
 /// then seven methods: a file per segment, an extent per segment on a raw device, or memory.
 ///
 /// Two ways to read, because the engine has two callers with different constraints. A **lookup** submits
-/// and harvests, so a store with a latency does not stop the loop. **Applying** a committed decision
-/// cannot wait for anything — it is in order, and on a virtual clock a wait that only time can end never
-/// ends — so it reads synchronously; a store that models a device charges its rate gate without holding
-/// the caller, which prices the IO while leaving the latency of that path unmodelled. That is the gap a
-/// read cache is meant to close, and it is why apply-path reads are counted separately.
+/// and harvests, so a store with a latency does not stop the loop. **Applying** a committed decision cannot
+/// wait for anything — it is in order — so it reads synchronously, and a store that models a device charges
+/// that read to the thread rather than to its queue (`take_charge`). Both are priced now; they are counted
+/// separately because only the second is what a read cache would remove.
 pub trait DurableStore {
     /// A segment's first block, which is what brings the segment into being. One call rather than a
     /// create followed by a write: a segment's first block *is* its creation, and two statements that
@@ -229,6 +228,15 @@ pub trait DurableStore {
     /// The next read finished by `now`, copied out. `None` while nothing is due.
     fn poll(&mut self, now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>>;
     fn inflight(&self) -> usize;
+    /// Device time this store's *synchronous* calls have cost since it was last asked, taken as it is read.
+    /// A write, a sync and an apply-path read hold the thread the way a real `pwrite`, `fsync` and `pread`
+    /// do, and on the pending engine's thread that time is every lookup's latency as well.
+    ///
+    /// A charge rather than a wait, because whoever runs the loop is the only thing that has a clock, and on
+    /// a virtual one a wait that only time can end never ends. Zero from a store that models no device.
+    fn take_charge(&mut self) -> u64 {
+        0
+    }
     /// Everything written before this returns is durable when it does.
     ///
     /// **One call with no argument, and that is a property of a filesystem rather than a simplification.**
@@ -469,61 +477,153 @@ impl Filling {
     }
 }
 
+/// How the store behaves, as a stand-in charges it. Every nanos field zero is the exact store — memory, no
+/// delay — which is what every other answer is measured against. Anything else wraps it in a device's timing,
+/// because there is no disk under this yet and pretending otherwise in silence would be worse than saying so.
+///
+/// It lives beside the store rather than beside the engine's configuration, because it describes the store.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StoreModel {
+    pub read_base_nanos: u64,
+    /// The mean of the tail. A fixed latency completes every read in the order it was asked for and hides
+    /// what putting a lane back in order costs.
+    pub read_tail_nanos: u64,
+    /// What sealing one block costs. A write is synchronous and on the engine's own thread, so this is time
+    /// no lookup gets — see `busy_until`.
+    pub write_base_nanos: u64,
+    pub write_tail_nanos: u64,
+    /// What making the written blocks durable costs. The one the sync cadence turns on: an `fsync` is the
+    /// longest thing a real store does synchronously, and this thread is the one every lookup passes through.
+    pub sync_base_nanos: u64,
+    pub sync_tail_nanos: u64,
+    /// Reads a second the device can serve, zero for no ceiling. Reads only: writes and syncs are serialised
+    /// by holding the thread, which is a rate of its own and needs no second gate.
+    pub iops: u64,
+    /// Reads it will hold at once. Past this the engine keeps the command and asks again.
+    pub queue_depth: usize,
+}
+
+impl StoreModel {
+    pub fn build(&self, seed: u64) -> Box<dyn DurableStore> {
+        let exact = Box::new(MemoryStore::default());
+        if self.is_exact() {
+            return exact;
+        }
+        Box::new(LatencyStore::new(exact, *self, seed))
+    }
+
+    fn is_exact(&self) -> bool {
+        self.read_base_nanos == 0
+            && self.read_tail_nanos == 0
+            && self.write_base_nanos == 0
+            && self.write_tail_nanos == 0
+            && self.sync_base_nanos == 0
+            && self.sync_tail_nanos == 0
+            && self.iops == 0
+    }
+}
+
+/// What one synchronous call to the device costs: a floor and an exponential tail, the same shape the read
+/// queue draws from. Zero for both is a call that costs nothing, which is how a model with only reads set
+/// stays exactly what it was.
+#[derive(Debug, Clone, Copy, Default)]
+struct Cost {
+    base_nanos: u64,
+    tail_nanos: u64,
+}
+
+impl Cost {
+    fn draw(&self, prng: &mut Prng) -> u64 {
+        if self.base_nanos == 0 && self.tail_nanos == 0 {
+            return 0;
+        }
+        self.base_nanos + prng.exponential_nanos(self.tail_nanos)
+    }
+}
+
 /// A store with a device's timing in front of another store. What makes it a stand-in is
 /// `stubkit::Server` — a rate gate with an exponential tail, so reads are admitted no faster than the
 /// ceiling and each draws its own latency, which is what makes them complete **out of the order they
 /// were asked for**. It lives here rather than in `stubkit` only because the trait does and the
 /// dependency runs this way.
 ///
-/// The synchronous read charges the device without waiting: the path that applies committed decisions is
-/// in order, and on a virtual clock a wait only time can end never ends. So this prices that path's IO
-/// and leaves its latency unmodelled — stated, because it is the one number this cannot answer.
+/// **Two kinds of cost, because two different things are being occupied.** A lookup's read occupies the
+/// *device*: it is submitted, the queue serves it, and the engine keeps working — a deadline per read, and
+/// completions come back out of order. A write, a sync and the apply path's read occupy the *thread*: a real
+/// `pwrite` or `fsync` blocks, and on this thread that is every lookup's latency as well. So those three are
+/// charged to `busy_until` and the round that ran them does nothing more until the clock passes it.
+///
+/// A charge rather than a wait, and that is what makes it work where a wait would not: on a virtual clock a
+/// wait only time can end never ends. It also removes the one thing this used to be unable to answer — the
+/// apply path's read latency was priced as IO and left unmodelled, because there was nowhere to put it.
 ///
 /// **It wraps any store, including one with a real device under it, and the composition is a floor rather
-/// than a sum.** A completion is an absolute time taken from when the read was admitted, so when the inner
-/// store is memory the drawn time is the whole of it, and when the inner store is real its own time has
+/// than a sum.** Every cost is turned into an absolute time from when the call was admitted, so when the
+/// inner store is memory the drawn time is the whole of it, and when the inner store is real its own time has
 /// already passed by the time the deadline is compared — whichever is slower wins, with nothing measuring
 /// the difference. That is what makes "model a device slower than the one I have" mean something, and
 /// modelling a faster one impossible.
 pub struct LatencyStore {
     inner: Box<dyn DurableStore>,
     device: Server,
+    read: Cost,
+    write: Cost,
+    sync: Cost,
     prng: Prng,
     /// Submitted reads and when the device says each is done, oldest first by admission. Completions are
     /// released by due time, which is not the order they were asked in.
     inflight: Vec<(u64, u8, u64, u64)>,
     queue_depth: usize,
+    /// Device time charged by synchronous calls and not yet handed to whoever has a clock.
+    charged_nanos: u64,
 }
 
 impl LatencyStore {
-    pub fn new(
-        inner: Box<dyn DurableStore>,
-        base_nanos: u64,
-        tail_nanos: u64,
-        per_second: u64,
-        queue_depth: usize,
-        seed: u64,
-    ) -> Self {
+    pub fn new(inner: Box<dyn DurableStore>, model: StoreModel, seed: u64) -> Self {
+        let queue_depth = model.queue_depth.max(1);
         Self {
             inner,
-            device: Server::new(base_nanos, tail_nanos, per_second),
+            device: Server::new(model.read_base_nanos, model.read_tail_nanos, model.iops),
+            read: Cost {
+                base_nanos: model.read_base_nanos,
+                tail_nanos: model.read_tail_nanos,
+            },
+            write: Cost {
+                base_nanos: model.write_base_nanos,
+                tail_nanos: model.write_tail_nanos,
+            },
+            sync: Cost {
+                base_nanos: model.sync_base_nanos,
+                tail_nanos: model.sync_tail_nanos,
+            },
             prng: Prng::new(seed),
             inflight: Vec::with_capacity(queue_depth),
-            queue_depth: queue_depth.max(1),
+            queue_depth,
+            charged_nanos: 0,
         }
+    }
+
+    fn charge(&mut self, cost: Cost) {
+        self.charged_nanos += cost.draw(&mut self.prng);
     }
 }
 
 impl DurableStore for LatencyStore {
     fn open_with(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
+        self.charge(self.write);
         self.inner.open_with(segment, offset, block)
     }
 
     fn append(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
+        self.charge(self.write);
         self.inner.append(segment, offset, block)
     }
 
+    /// The read that cannot be submitted and harvested: the apply path is in order and cannot park a
+    /// decision half way, and the expiry walk reads a whole block at a time. Both hold the thread, so both
+    /// are charged to it rather than to the device's queue.
     fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault> {
+        self.charge(self.read);
         self.inner.read_at(segment, offset, into)
     }
 
@@ -547,7 +647,12 @@ impl DurableStore for LatencyStore {
     }
 
     fn sync(&mut self) -> Result<(), StoreFault> {
+        self.charge(self.sync);
         self.inner.sync()
+    }
+
+    fn take_charge(&mut self) -> u64 {
+        std::mem::take(&mut self.charged_nanos)
     }
 
     /// Freeing costs the device nothing this model charges for: it is off any request's path, and a device
@@ -724,6 +829,12 @@ impl RecordLog {
         self.freed += freed as u64;
         self.days[segment as usize] = BlockRange::default();
         freed
+    }
+
+    /// Device time the store's synchronous calls have cost since this was last asked. Whoever has a clock
+    /// turns it into a deadline of its own: the charge has one owner and each driver has its own time.
+    pub fn take_store_charge(&mut self) -> u64 {
+        self.store.take_charge()
     }
 
     /// Makes durable everything sealed since this was last asked, and answers whether there was anything to

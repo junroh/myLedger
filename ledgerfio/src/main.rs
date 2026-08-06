@@ -162,6 +162,12 @@ fn print_help() {
     println!("  --raft-rtt <us>             (900:1400) consensus round trip: the latency floor");
     println!("  --store-read <us>           (0) what a block read costs the engine: the disk it has not got");
     println!(
+        "  --store-write <us>          (0) what sealing a block costs; synchronous, so it holds the engine's thread"
+    );
+    println!(
+        "  --store-sync <us>           (0) what making the sealed blocks durable costs; holds the thread too"
+    );
+    println!(
         "  --store-iops <n>            (0) reads a second that store can serve, 0 for no ceiling"
     );
     println!("  --overlay-limit <n>         (1M) ceiling on the sequencer's own hold decisions; in flight bounds it");

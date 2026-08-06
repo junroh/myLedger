@@ -231,6 +231,10 @@ struct PendingState {
     /// run takes a step every few hundred nanoseconds and a component answers every few
     /// microseconds: without it, every step would walk every lane.
     earliest: Option<u64>,
+    /// When a modelled device's last synchronous call lets this component go. A write, a sync and an
+    /// apply-path read hold the thread rather than a queue, so nothing else here happens until the clock
+    /// passes it — and `earliest` has to carry it, or an idle virtual clock would have nothing to jump to.
+    busy_until: u64,
 }
 
 /// What putting a lane back in order cost. Separate from the device's own numbers, because a read
@@ -279,6 +283,7 @@ impl PendingFake {
             order_wait: FakeOrderWait::default(),
             depth: faults.inbox_depth,
             earliest: None,
+            busy_until: 0,
         })))
     }
 
@@ -347,6 +352,9 @@ impl PendingFake {
             state.store.counts_agree(),
             "the index's per-segment counts no longer add up to its entries"
         );
+        if state.busy_until > state.now {
+            return;
+        }
         // Every node reclaims for itself, leader or not: a segment the index has no entry in holds only
         // dead records. Driven here as well as in the real worker, so the seeds see the same split.
         state.store.reclaim();
@@ -363,6 +371,9 @@ impl PendingFake {
                 .push_back(PendingNotice::HoldExpired { void: *void });
         }
         state.expiring = found;
+        // The walk read blocks, and on a modelled device that held the thread. Charged here as well as in
+        // `drive`, because the simulation drives the two separately and the device does not care which.
+        state.charge_device();
     }
 
     pub fn engine(&self) -> ServerStats {
@@ -385,6 +396,11 @@ impl PendingFake {
     pub fn drive(&self, now: u64) {
         let mut state = self.0.borrow_mut();
         state.now = now;
+        // A modelled device's synchronous call holds this component whole: a reply already finished does not
+        // leave either, because the thread that would hand it over is inside a syscall.
+        if state.busy_until > now {
+            return;
+        }
         if state.earliest.is_none_or(|due| due > now) {
             return;
         }
@@ -447,17 +463,34 @@ impl PendingFake {
         }
         let deepest = state.orderer.behind_heads();
         state.order_wait.deepest = state.order_wait.deepest.max(deepest);
-        state.earliest = match (
+        // Last in the round, so one sync covers everything it sealed — the cadence `PendingWorker` uses, and
+        // the seeds should see the same one.
+        state.store.sync();
+        state.charge_device();
+        let work = match (
             state.inbox.front().map(|(due, _)| *due),
             state.orderer.next_due(),
         ) {
             (Some(inbox), Some(held)) => Some(inbox.min(held)),
             (only, None) | (None, only) => only,
         };
+        // Not before the device lets go, or an idle clock would jump to work this cannot do yet and spin
+        // there. With no device modelled `busy_until` is zero and this is the work's own due time.
+        state.earliest = work.map(|due| due.max(state.busy_until));
     }
 }
 
 impl PendingState {
+    /// Time a modelled device's synchronous calls just cost, turned into a deadline on this component's own
+    /// clock. The charge has one owner — the store — and each driver holds its own time, which is why this is
+    /// here rather than behind the seam.
+    fn charge_device(&mut self) {
+        let owed = self.store.take_store_charge();
+        if owed > 0 {
+            self.busy_until = self.now + owed;
+        }
+    }
+
     /// A reply is finished at `at` — when it *leaves* is the orderer's business, which is the whole
     /// point: the lane's order is the component's work, and breaking it on purpose is a fault. An
     /// order-exempt reply keeps no place, so it leaves as soon as its own work is done.

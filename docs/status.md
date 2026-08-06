@@ -209,7 +209,7 @@ handed to the store is written; a `sync` is what makes it durable, and only what
 be carried. So coverage stops at the oldest block no sync has covered — ahead of the block being filled and
 the buffer behind it — and a second test says so: a restore taken before the sync answers none of the holds,
 one taken after answers them. The worker syncs at the end of its round, which covers every block that round
-sealed; whether that is the right cadence is a decision below, because pricing it needs a device.
+sealed, and that cadence is now measured rather than assumed — see the closed decision below.
 
 **Replay is built, and the whole chain is asserted**: a snapshot covering an earlier position, plus every
 effect after it, lands on the same answers as never having stopped. `PendingEngine::replay` is a mode of its
@@ -395,15 +395,15 @@ unanswered, and **when that default stops being safe**. The source design's own 
   seconds is measuring this ledger rather than the stand-in. It becomes a correctness-adjacent question
   when a node has to run for a day.
 
-- **How often should the engine make its blocks durable?**
-  *Default:* once at the end of every worker round, so one `sync` covers every block that round sealed. It
-  is the cadence that keeps coverage as far forward as it can be, and erring the other way is safe — what is
-  not durable is still in the log, so a lagging sync costs replay and never a hold.
-  *Stops being safe:* it does not stop being safe, it stops being free. On a real device an `fsync` blocks
-  the thread that also answers lookups, and this is the thread every lookup passes through. What a deferred
-  sync buys is that block of time; what it costs is coverage. Nobody has priced either, because
-  `MemoryStore::sync` does nothing — design notes §16's device model is what will, and until it exists a
-  number chosen here would be a guess of the kind that has been a digit out before.
+- **Can `ledgerfio` price a store read at all?**
+  *Default:* it cannot, and it does not say so. `--store-read` and `--store-iops` exist and are wired, but
+  `engine reads store=0` in every configuration tried — `--resolve-after 900000`, `--overlay-limit 10000`,
+  `--residency 1` included. Nothing falls out of a 24-hour residency window in a five-second run, so there is
+  nothing for a store read to fetch. `ledgersim check` does reach the path (87,494 store reads over
+  sixty-four seeds), so this is about the tool that can put a latency on it, not about the path.
+  *Stops being safe:* it already is not, for anyone reading a report. A run that sets `--store-read` and shows
+  a tail is showing something else, and `SE-OQ-6` cannot be approached from a tool that never issues the read
+  being priced. What is missing is either a residency window a short run can empty or a way to make one.
 
 - **What throttle paces the snapshot's write?**
   *Default:* none — nothing writes one anywhere, so nothing paces it. The unit is settled (a declared number
@@ -484,6 +484,15 @@ An entry that vanishes reads as a question nobody ever asked.
   `cargo bench -p ledger-pending --bench snapshot`, and design notes §15 has the table.
 - **What sizes the expiry throttle's slice?** The day does. The requirement is met three orders over and the
   binding constraint is a single round, which is bounded by declaration rather than by density.
+- **How often should the engine make its blocks durable?** Every worker round, and there is nothing to trade.
+  Measured: at 1M tx/s a 500µs `sync` costs 2–9% of throughput and the knee is around 2ms; at the design's own
+  rate — 1,736 arrivals a second, so about thirty-four blocks sealed — a 500µs `fsync` is 1.7% of one thread,
+  against a real NVMe's 50–500µs. Group commit is why it is cheap: one sync covers every block the round
+  sealed, so a slower device is covered by fewer syncs and the curve bends instead of falling.
+  **What the same measurement found instead is a requirement on the *write*.** A block write is per block and
+  nothing amortises it: at 1M tx/s this workload seals eighteen thousand blocks a second, so 100µs of write is
+  1.8s of thread per second and throughput halves. A 4KB `O_DIRECT` write is 10–20µs, so it fits with less
+  headroom than the read path has. Design notes §16 has both curves and the command.
 - **What was weighed and rejected in §3 and §7?** Nothing, in both. Neither was a decision: what is in the
   code is what was intended, and the implementation reached something else and was corrected. §7 merged a
   linked chain with a budget group, which the design has apart and always did. §3 kept arriving at other

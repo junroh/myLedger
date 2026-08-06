@@ -11,7 +11,7 @@ mod snapshot;
 /// what answers for them can be memory today and a file or a network volume later without the engine above
 /// changing, and without anything having to be restored to know where a block sits. Design notes §16.
 pub use block::{
-    DurableStore, LatencyStore, LogTraffic, MemoryStore, RecordAddr, BLOCK_BYTES,
+    DurableStore, LatencyStore, LogTraffic, MemoryStore, RecordAddr, StoreModel, BLOCK_BYTES,
     DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS, RECORDS_PER_BLOCK, RECORD_BYTES, SEGMENTS,
 };
 /// Exported for the same reason as the overlay: a simulation that drives the engine itself needs the
@@ -20,7 +20,7 @@ pub use engine::{NotStored, PendingEngine, Started};
 /// Exported for this crate's own bench: what the index costs as it fills is the number an analytic
 /// estimate of it was guessing, and it can only be measured from outside.
 pub use index::{Candidates, HoldTable, Homeless, DEFAULT_SLOTS, LOAD_TARGET, SLOT_BYTES};
-pub use memory::{DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity, StoreModel};
+pub use memory::{DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity};
 /// Contract 1 is the engine's own work, so the structure that keeps it lives here. Exported for a
 /// simulation that drives the engine and wants to see what ordering cost it.
 pub use orderer::{OrderWait, Orderer};

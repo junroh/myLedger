@@ -1042,9 +1042,10 @@ the walk continues to the next candidate rather than answering "not there". Answ
 reject a hold that exists, a few times in every ten thousand cold resolutions.
 
 Applying a committed decision reads synchronously instead. It has to: apply is in order, and on a virtual
-clock a wait that only time can end never ends. So a store that models a device charges its rate gate
-without holding the caller — which prices the IO and leaves that path's latency unmodelled, and is the
-reason apply-path reads are counted on their own.
+clock a wait that only time can end never ends. A store that models a device therefore charges that read to
+the **thread** rather than to its read queue, which is what a synchronous `pread` costs and what the queue
+cannot express — §16's `take_charge`. That is priced now; it used to be the one number this could not answer.
+Apply-path reads are still counted on their own, because only they are what a read cache would remove.
 
 **A committed write should carry what the engine would otherwise read back.** A partial resolution has
 to write the record again — append-only — so it needs the whole record, and the engine used to read the
@@ -1819,6 +1820,51 @@ bytes into. What it implements is the *barrier* — the caller learns what is co
 that is the half a test can exercise without a device.
 `a_sealed_block_is_carried_only_once_a_sync_has_covered_it` is that test: three engines over one store, and
 a restore taken before the sync answers none of the holds while one taken after answers them.
+
+### What the device model says, now that there is one
+
+`LatencyStore` prices a device where there is none, and until now it priced only reads. It prices writes and
+syncs too, and those are charged differently on purpose: a read occupies the *device* — submitted, served by
+the queue, harvested later, with the engine working meanwhile — while a write, a sync and an apply-path read
+occupy the *thread*, which on this component is the thread every lookup passes through.
+
+Reproduce with `ledgerfio run --workload partial-settle --rate 1m --resolve-after 900000 --sweep
+store-sync=...`. One megabyte-per-second of transfers rather than the usual hundred thousand, and that is not
+for show: at 100k/s the spread between repeats is 20–80ms at p99.9 — the idem stand-in's own tail, which
+`status.md` already records — and it swamps anything either flag does. At 1M/s the engine is the limit and the
+curve is clean.
+
+| `--store-sync` | tx/s | | `--store-write` | tx/s |
+|---|---|---|---|---|
+| 0 | 1.00M | | 0 | 1.00M |
+| 500µs | 0.91–0.98M | | 20µs | 1.00M |
+| 2ms | 0.74M | | 50µs | 0.71M |
+| 4ms | 0.51M | | 100µs | 0.44M |
+
+**A write is about four times as expensive per microsecond as a sync, and the reason is group commit.** One
+sync covers every block the round sealed, so as it gets slower it covers more — self-limiting, and the
+throughput curve bends rather than falling off. A write is per block and nothing amortises it: at 1M tx/s this
+workload seals about eighteen thousand blocks a second, so 100µs of write is 1.8 seconds of thread per second
+and the run is store-bound at 44%.
+
+That settles the sync cadence, and it settles it by there being nothing to trade. At the design's rate — 150M
+arrivals a day is 1,736/s, so about thirty-four blocks sealed a second — a 500µs `fsync` costs 1.7% of one
+thread, and a real NVMe `fsync` is 50–500µs. Syncing every round is affordable by two orders, and a deferred
+sync would buy that back at the price of coverage. The `status.md` entry moves to the closed list.
+
+What the same measurement puts in its place is a **requirement on the write**, which is not the same shape as
+the `≤5ms` read contract and was not visible before: at 1M tx/s a 4KB block write has to be under about 50µs,
+because eighteen thousand of them a second is the rate the buffer compacts at. A 4KB `O_DIRECT` write to NVMe
+is 10–20µs, so it fits — with less headroom than the read path has, and that is worth knowing before the
+device rather than after it. At the design's own rate it is thirty-four writes a second and the question
+does not arise.
+
+**What `ledgerfio` still cannot price is the read.** `engine reads store=0` in every configuration tried,
+including `--resolve-after 900000`, `--overlay-limit 10000` and `--residency 1`: nothing falls out of a
+24-hour residency window in a five-second run, so there is nothing for a store read to fetch. `ledgersim
+check` does reach it — 87,494 store reads across sixty-four seeds — so the path is exercised, just not by the
+tool that could put a latency on it. `--store-read` and `--store-iops` are therefore still priced against
+runs that never use them.
 
 ### Still unbuilt, and named so it is not read as done
 

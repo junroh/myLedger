@@ -77,6 +77,12 @@ pub struct Options {
     /// only where the missing device would be. Zero is the exact store, which every other answer is
     /// measured against.
     pub store_read: LatencyRange,
+    /// What sealing one block costs. Unlike a read, a write is synchronous and on the engine's own thread,
+    /// so this is time no lookup gets — which is why it shows up in the tail rather than only in throughput.
+    pub store_write: LatencyRange,
+    /// What making the written blocks durable costs. The knob the sync cadence turns on: an `fsync` is the
+    /// longest thing a real store does synchronously, and it holds the thread every lookup passes through.
+    pub store_sync: LatencyRange,
     /// Reads a second the store can serve, zero for no ceiling.
     pub store_iops: u64,
     /// Holds the engine's overlay may keep before idle ones are evicted. Small enough and a resolution
@@ -137,6 +143,8 @@ impl Default for Options {
             // Zero: the default run measures the engine as built, and the store it was built on is
             // memory. Asking for a device's timing is what the knob is for.
             store_read: LatencyRange::fixed(Duration::ZERO),
+            store_write: LatencyRange::fixed(Duration::ZERO),
+            store_sync: LatencyRange::fixed(Duration::ZERO),
             store_iops: 0,
             overlay_limit: 1 << 20,
             idem_latency: LatencyRange::new(Duration::from_micros(1), Duration::from_micros(5)),
@@ -270,6 +278,8 @@ impl Cli {
             "raft-in-flight" => options.raft_in_flight = Self::count(value)? as usize,
             "raft-rtt" => options.raft_round_trip = Self::latency(value)?,
             "store-read" => options.store_read = Self::latency(value)?,
+            "store-write" => options.store_write = Self::latency(value)?,
+            "store-sync" => options.store_sync = Self::latency(value)?,
             "store-iops" => options.store_iops = Self::count(value)?,
             "overlay-limit" => options.overlay_limit = Self::count(value)? as usize,
             "idem-latency" => options.idem_latency = Self::latency(value)?,

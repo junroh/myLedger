@@ -787,6 +787,13 @@ impl PendingEngine {
         self.records.sync()
     }
 
+    /// Device time the store's synchronous calls have cost since this was last asked. Whoever runs the loop
+    /// owes it: it is time the thread would have spent inside a `pwrite`, an `fsync` or a `pread`, and no
+    /// lookup gets served during it.
+    pub fn take_store_charge(&mut self) -> u64 {
+        self.records.take_store_charge()
+    }
+
     /// Zero means it covers nothing, which is what an engine that has applied nothing reflects — and a
     /// legitimate snapshot rather than a missing one, since a follower starting from empty receives exactly
     /// that.

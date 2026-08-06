@@ -129,8 +129,15 @@ decides what the prediction is worth:
 - **Every resolution reaches it.** The record a resolution is judged by is the engine's, so what it is
   asked for is one command per resolution, plus fences and writes — the command rate follows the traffic
   and nothing on the sequencer's side reduces it. What the engine's own memory saves is the IO *below*
-  that command, which is `--store-read` and `--store-iops`, reported as `reads: memory=N store=M`. There
-  is one rate, not one per kind: a slow write path shows up as reads queueing behind it.
+  that command, which is `--store-read` and `--store-iops`, reported as `reads: memory=N store=M`.
+- **The device's two kinds of cost are separate flags, because they occupy different things.** A lookup's
+  read occupies the *device*: `--store-read` and `--store-iops` set a deadline per read and the engine keeps
+  working while the queue serves it. A write (`--store-write`) and a sync (`--store-sync`) occupy the
+  *thread*: a real `pwrite` or `fsync` blocks, and on the engine's thread that is every lookup's latency as
+  well, so the round that ran them does nothing more until the clock passes. Zero for all of them is the
+  exact store, which every other answer is measured against. Design notes §16 has the measured curves; the
+  short of it is that a per-block write is roughly four times as expensive per microsecond as a sync, because
+  one sync covers every block a round sealed and a write does not.
 - **The tail is what makes answers finish out of order**, and that is a cost of its own: an answer that
   is ready waits for an earlier one on its lane, so the wait is the queue depth times a latency, which no
   per-command bound covers. The run reports it as `order wait`, separately from the engine, because the

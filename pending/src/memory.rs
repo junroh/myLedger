@@ -15,10 +15,7 @@ use ledger_base::{
 };
 use ledger_stubkit::{IdleBackoff, LatencyRange, WorkerThread};
 
-use crate::block::{
-    DurableStore, LatencyStore, LogTraffic, MemoryStore, RecordAddr, BLOCK_BYTES,
-    RECORDS_PER_BLOCK, SEGMENTS,
-};
+use crate::block::{LogTraffic, RecordAddr, StoreModel, BLOCK_BYTES, RECORDS_PER_BLOCK, SEGMENTS};
 use crate::engine::{BudgetState, PendingEngine, Started};
 use crate::index::{LOAD_TARGET, SLOT_BYTES};
 use crate::orderer::OrderWait;
@@ -97,38 +94,6 @@ impl DaySource {
                 .unwrap_or(0),
             Self::Fixed(day) => day.load(Ordering::Relaxed),
         }
-    }
-}
-
-/// How the block store behaves. Zero base latency is the exact store — memory, no delay — which is what
-/// every other answer is measured against. Anything else wraps it in a device's timing, because there is
-/// no disk under this yet and pretending otherwise in silence would be worse than saying so.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct StoreModel {
-    pub read_base_nanos: u64,
-    /// The mean of the tail. A fixed latency completes every read in the order it was asked for and hides
-    /// what putting a lane back in order costs.
-    pub read_tail_nanos: u64,
-    /// Reads a second the device can serve, zero for no ceiling.
-    pub iops: u64,
-    /// Reads it will hold at once. Past this the engine keeps the command and asks again.
-    pub queue_depth: usize,
-}
-
-impl StoreModel {
-    fn build(&self, seed: u64) -> Box<dyn DurableStore> {
-        let exact = Box::new(MemoryStore::default());
-        if self.read_base_nanos == 0 && self.read_tail_nanos == 0 && self.iops == 0 {
-            return exact;
-        }
-        Box::new(LatencyStore::new(
-            exact,
-            self.read_base_nanos,
-            self.read_tail_nanos,
-            self.iops,
-            self.queue_depth.max(1),
-            seed,
-        ))
     }
 }
 
@@ -536,6 +501,7 @@ impl MemoryPending {
                 jitter: Prng::new(config.seed),
                 latency: config.latency,
                 started: Instant::now(),
+                busy_until: 0,
             }
             .run(shutdown)
         });
@@ -758,12 +724,21 @@ struct PendingWorker {
     /// integer clock, so the origin is the caller's to choose — here it is the thread's own start, and in
     /// a simulation it is the virtual clock.
     started: Instant,
+    /// When a modelled device's last synchronous call lets this thread go. Zero unless a device is modelled.
+    busy_until: u64,
 }
 
 impl PendingWorker {
     fn run(mut self, shutdown: Arc<AtomicBool>) {
         let mut backoff = IdleBackoff::new();
         while !shutdown.load(Ordering::Relaxed) {
+            // A modelled device's synchronous calls hold this thread, and nothing else it does is available
+            // while they do — which is the whole point of charging them here rather than to a queue. With no
+            // device modelled the deadline is never set and this is one comparison.
+            if self.now() < self.busy_until {
+                backoff.record(false);
+                continue;
+            }
             let progress = self.hand_over_notices()
                 | self.sweep_expiry()
                 | self.drain_commands()
@@ -771,10 +746,16 @@ impl PendingWorker {
                 | self.deliver()
                 // Last, so one sync covers every block this round sealed — group commit within a round. The
                 // policy is here because it is a policy: syncing less often costs coverage and nothing else,
-                // and what it buys back is a device's fsync off the thread that answers lookups. Nobody has
-                // measured that trade, because there is no device to measure it against
-                // (`status.md`'s decisions list).
+                // and what it buys back is a device's fsync off the thread that answers lookups.
+                // `status.md`'s decisions list has that trade and what would settle it.
                 | self.engine.sync();
+            // Taken after the round rather than before, because the round is what incurred it: the writes,
+            // syncs and apply-path reads it just did are time this thread would have been inside a syscall
+            // for. Absolute, so a real device under the model has already spent it and the gate is a no-op.
+            let owed = self.engine.take_store_charge();
+            if owed > 0 {
+                self.busy_until = self.now() + owed;
+            }
             if progress {
                 self.publish();
             }
