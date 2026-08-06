@@ -919,8 +919,10 @@ only where marked — is exact, and needs no probability at all.
 
 > **Tried** — changing a record where it lies, which is what a resolution wants to do.
 > **Broke** — it costs a read before every write on a path that has none, and it gives up the property
-> everything else rests on: that an address never moves, which is what lets an index entry and a group's
-> offset chain be trusted.
+> everything else rests on: a block once written is never rewritten, so an address names one version for as
+> long as that version exists. Four things rest on it — an index slot holds an address and nothing else,
+> compaction decides what is alive by comparing addresses, the expiry walk does the same, and the sweep
+> retires an offered void the same way.
 > **Weighed** — writing each buffered block out whole instead of compacting it (the store then grows with
 > holds *created* rather than holds alive, which is the figure the capacity estimate rests on); one store
 > block per flush (multiplies the space a surviving tenth occupies by ten); a window measured as a
@@ -943,8 +945,10 @@ they are a format, and a format that borrows the machine's byte order is not one
 
 **A partial resolution appends a new version and the index is repointed.** Blocks are never rewritten.
 The alternative — changing a record where it lies — costs a read before every write on a path that has
-none today, and it gives up the one property everything else rests on: that an address never moves,
-which is what lets an index entry and a group's offset chain be trusted. What it costs instead is
+none today, and it gives up the one property everything else rests on: a block once written is never
+rewritten, so an address names one version for as long as that version exists. That is what lets an index
+slot hold an address and nothing else, and what makes "alive exactly when the index points at it" an exact
+test rather than a heuristic. What it costs instead is
 space: the old version sits there until its segment expires. Partial resolutions are a minority of
 traffic, and this is what append-only means.
 

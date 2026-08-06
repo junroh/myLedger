@@ -188,7 +188,7 @@ the split exists and that residency keeps IO off resolutions inside it.
   `ledgerfio run --workload void-heavy --duration 10s --rate 100k --resolve-after 900000 --repeat 8`.
 ### Where the documents and the code have diverged
 
-Two places where the design names a mechanism this code does not have. Kept as a section of its own
+Places where the design names a mechanism this code does not have. Kept as a section of its own
 because neither is a gap to fill in passing — each was a deliberate substitution, and a substitution that
 nobody writes down is read as an implementation of the thing it replaced. Both now have their reason and
 neither is outstanding work.
@@ -214,6 +214,20 @@ neither is outstanding work.
   `propose_expiry` runs in the worker loop regardless. On a real cluster a follower would offer voids it
   cannot propose. `reclaim` is the opposite and must keep running everywhere — see the built entry above.
   The split exists in the code; the gate does not, because there is nothing yet to gate on.
+- **There is no group offset chain, and no membership index, and coverage is why.** Design §4.5 writes a
+  group's legs into one flush batch with each head carrying the next leg's offset, so a lookup can walk the
+  chain; §4.8 adds a `group_index` with `is_group_member` and `group_intact` to enumerate a group's members
+  while it is undecided. Neither is built, and neither is needed here for the same shape of reason as the
+  epoch below: a different mechanism removed the need. The sequencer checks a resolution's coverage by
+  **count** — every record carries `budget_members` and `budget_remaining`, and the engine aggregates them —
+  so nothing ever has to enumerate who the members are, and a structure for walking to them answers a
+  question no one asks. What would bring them back is the general case §7 already names: a budget group
+  spanning submissions, which needs a client-supplied durable id and full-coverage checking against a
+  membership rather than against a count.
+
+  This one was worse than unrecorded. Design notes §12 cited "a group's offset chain" as one of the things
+  that rest on an address being stable — a reason resting on a structure that does not exist. It now names
+  the four that do.
 - **There is no `min_live_seg_id`, and it is verified that there needs to be none.** Design §3.1 and
   §4.6 give the index an epoch, and there they need one: `apply_expire` unlinks a segment on a *time*
   condition, so slots addressing it survive the unlink and two jobs have to cope — a lookup answers Dead
