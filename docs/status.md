@@ -265,6 +265,16 @@ unanswered, and **when that default stops being safe**. The source design's own 
   *Stops being safe:* the day consensus is real. A follower offering voids it cannot propose is waste
   rather than corruption, but it is waste that grows with the cluster.
 
+- **Should the sweep stop offering a void whose lane is quarantined?**
+  *Default:* it keeps offering. `set_wants_expiry` covers a full backlog and a sealed apply path, but a
+  quarantined lane refuses each void at `prepare` while the backlog stays roomy, so the slice is re-offered
+  until the quarantine lifts. `ledgersim check --seeds 32` shows 77,000 refusals for it — 1.2 a tick against
+  the 64 a tick expiry may use, and every one of them counted.
+  *Stops being safe:* if a quarantine can last long enough for that to matter, or if the share of a tick's
+  expiry budget it burns ever competes with a day finishing. The fix needs the engine to know about lanes,
+  which is a layer it does not cross today — so this is a question about where the knowledge belongs, not a
+  missing line.
+
 - **What threshold should the load-factor alarm fire at, and what should the node do when it fires?**
   *Default:* it reports and nothing acts. Inserts succeed until one cannot be placed, and that seals.
   *Stops being safe:* as soon as an operator is expected to react before the seal rather than after it.
