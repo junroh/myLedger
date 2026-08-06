@@ -163,9 +163,15 @@ push channel the ledger does not have.
 
 ### Recovery is not real
 
-There is no checkpoint. The flush window is an hour *because* unflushed records are memory-only and
-have to be in one, so the reason for that number cannot be verified yet. What is verified is that
-the split exists and that residency keeps IO off resolutions inside it.
+There is no checkpoint, and **design notes §15 is now the design for one** — reasoning with no code
+behind it, which is why it says so at the top.
+
+The sentence that used to be here was wrong in a way worth keeping: it said the flush window is an hour
+because unflushed records have to fit in a checkpoint, so the number could not be justified without one.
+They do not have to fit in it. What is unflushed is in the log, so a snapshot leaves it out and recovery
+replays it — and the hour's justification becomes *an hour is what recovery replays*, which is arithmetic
+on the log's size rather than a claim needing a device. What is still unverified is the replay **rate**,
+and that is the one number the snapshot's interval waits on.
 
 ### Smaller, and each with a reason
 
@@ -310,12 +316,22 @@ unanswered, and **when that default stops being safe**. The source design's own 
   seconds is measuring this ledger rather than the stand-in. It becomes a correctness-adjacent question
   when a node has to run for a day.
 
-- **How is the flush window's hour justified without a checkpoint?**
-  *Default:* an hour, chosen because unflushed records are memory-only and have to fit in a checkpoint
-  that does not exist.
-  *Stops being safe:* the number cannot be wrong yet, because nothing depends on it. It has to be
-  re-derived the moment recovery is real. Related: `SE-OQ-1`, the split between the two windows and what
-  the hit rate buys.
+- **How fast does the engine replay, and so how often must a snapshot be written?**
+  *Default:* neither exists, so neither has a value. Design notes §15 shows the interval is decided by
+  recovery time and nothing else — a long interval is nearly free in IO and a short one is not — and that
+  the missing input is the replay rate. An estimate of a million effects a second would put a 24-hour
+  replay at minutes, which would mean the design's base-plus-deltas is built for an MTTR this workload
+  does not need. An estimate is not a number.
+  *Stops being safe:* the moment an interval is chosen. Choosing before measuring adds a figure with
+  nothing behind it, which is what this file exists to prevent. Related: `SE-OQ-1`.
+
+- **Where is a snapshot written, and is cold start local or from a peer?**
+  *Default:* nowhere, so the question is open in both halves. §15 argues the serialisation is the whole
+  mechanism and the disk cadence is a policy on top of it: a node that always fetches from a peer needs a
+  healthy peer, and a cluster that loses power together needs either a local copy or a log long enough to
+  replay from nothing.
+  *Stops being safe:* whenever a deployment has to survive losing every node at once — which is a
+  question about the operation rather than about the code.
 
 - **Does the client get told when a hold is voided for outliving its retention?**
   *Default:* no. The negative answer the design asked for is refused for a stated reason (above), and

@@ -1436,3 +1436,160 @@ than "never existed".
 
 Reproduce the whole mechanism with `ledgersim check --seeds 64`, whose coverage line reports expiry
 offered, admitted and refused, and whose sweep test fails if no seed outlived its retention.
+
+## 15. The snapshot is the index, and the log being truncated is the only reason it exists
+
+> **Designed, not built.** Everything below is reasoning, not description: no code implements any of it.
+> It is here rather than in `status.md` because it is a chain of decisions with evidence, which is what
+> this file is for — and `status.md`'s *Recovery is not real* points at it.
+>
+> **Tried** — "a checkpoint of the engine's state", taken to mean the index, the buffer, the block
+> metadata and the per-segment counts, written every N minutes.
+> **Broke** — three of those four have no business being in it, and the fourth is the only one that does.
+> Blocks are already on disk and immutable. The buffer is records not yet on disk, which the log has, so
+> replay rebuilds it. Ranges and counts are functions of the slots. What is left is the index, and it is
+> the only thing that says which of the records on disk are alive.
+> **Weighed** — carrying the buffer as well, so coverage is *now* and no replay is needed (more bytes,
+> and a moving set to snapshot); a block-number cutoff to keep the dump coherent while it is written,
+> which was a self-inflicted problem and lost a hold repointed across it; two full copies of the array
+> for a stable read (42.7GB against the tens of megabytes copy-on-write costs); deriving a group's
+> totals instead of accumulating them, which would need the membership index §4.8 asks for and is
+> unnecessary once a partial resolution of a group member is known to be impossible.
+> **Chose** — the raw slot array minus what points at records not yet on disk, plus the group totals and
+> one coverage scalar; a stable read bought by copying only the buckets touched while it is written; and
+> the log's tail replayed to make up the difference. The same bytes serve a follower's catch-up and a
+> local restart, so the serialisation is the work and the cadence is a policy on top of it.
+
+**Nothing here is needed if the Raft log is never truncated.** That is worth stating first, because every
+other justification is downstream of it. A follower that is behind can be caught up by log replay; a node
+that restarts can rebuild by log replay; a cold start can rebuild by log replay. All three stop working at
+the same moment and for the same reason — the log has to be truncated, because it grows with every
+committed effect and nothing else bounds it. Once entries are gone, the state they described has to come
+from somewhere, and that somewhere is this.
+
+### What the disk already has, and the one thing it does not
+
+The blocks are on disk and immutable, and a block is written once. So "the records in blocks written
+before B" is a fact that never changes, whenever it is read.
+
+What is *not* on disk is which of them are alive. A resolution appends nothing — a `Remove` writes no
+record and a `Reduce` writes a new version — so a resolved hold leaves its old record sitting on its
+block with no marker. Aliveness lives in the index and nowhere else, which is the same sentence
+compaction and the expiry walk both rest on.
+
+That is why scanning the blocks cannot rebuild the index, and the counterexample is one line: a hold
+created thirty days ago and resolved twenty days ago has its record on a block and its `Remove` outside a
+24-hour log. A rebuild from blocks resurrects it, and its pending column is reserved again for a hold that
+was released. Losing the index is not losing data — it is losing the ability to answer any resolution,
+which leaves every hold's money reserved for good.
+
+### The boundary, and why the buffer is not in it
+
+Coverage is the apply index of the **last sealed block**. Not "the last record to leave the buffer": a
+record in the block still being filled has a real address and is not on disk yet.
+
+Everything after that point is rebuilt by replaying the log, which is where the writeback window's hour
+finally gets a justification that can be checked without a device: **an hour is what recovery replays**,
+not what a checkpoint has to carry. The claim is arithmetic on the log's own size, and the log keeps
+whatever the snapshot interval needs (below).
+
+So the dump excludes every slot whose address is in the buffer segment or in the block being filled.
+Their holds were created after coverage, so replay creates them again.
+
+### Replay over already-applied state, which is what a smear needs
+
+The dump is paced — 42.7GB cannot be written in one worker round — so slots written early and late reflect
+different moments. Coverage is the frontier at the *start*, which means replay re-applies effects the dump
+already reflects. That is only safe if applying twice is a no-op, and it is, one case at a time:
+
+| replayed | what happens |
+|---|---|
+| `Remove` of a hold already gone | `index.remove` finds nothing and returns before touching anything |
+| `Reduce` already applied | repoints to the same or a newer address; appends one wasted record version |
+| `Reduce`'s group arithmetic | does not exist — a group member cannot be resolved in part, so a `Reduce` never carries a group (§14's assert) |
+| `Create` already applied | **inserts a second slot for the same key** |
+
+So exactly one change is needed: a `Create` for a key the index already holds becomes a repoint. It is
+unreachable in normal operation — idem refuses a resend, so a hold is created once — and correct in
+replay, where the record is appended again and the index follows the newest.
+
+An earlier attempt avoided this with a block-number cutoff: exclude any slot whose address is beyond the
+coverage frontier, so a `Create` after coverage never appears. That works for `Create` and loses a hold
+that was *repointed* across the cutoff — its slot is excluded, and `repoint` does not insert, so replay
+drops it. The cutoff was solving a problem the one-line change does not have.
+
+### The kick cascade is why the read has to be stable
+
+Effects are replayable. A cuckoo relocation is not: `insert_new` displaces an existing entry into another
+bucket, and that movement is nowhere in the log. So an entry that moves while the dump is in progress
+produces one of two silent wrong answers:
+
+- from an already-dumped bucket to one not yet dumped: it appears **twice**. On restore, one `remove`
+  clears one slot and the other survives, so a resolved hold is alive again and its money is reserved for
+  good.
+- the other way: it appears **nowhere**. Its `Create` is before coverage, so replay does not restore it.
+
+Hence the dump needs a stable view of the array. Not two copies of it: copy the buckets that are about to
+change, and let the dumper read the pre-image. At the design's rates the dump takes about eighty-five
+seconds against a 500MB/s device, and the index takes a few thousand writes a second, so the side buffer
+holds tens of megabytes — against 42.7GB for a second array. Its size follows the *dump's duration*, which
+is set by the device rather than by the interval, so a longer interval does not make it bigger.
+
+### What is carried, and what is derived
+
+| | in the snapshot | why |
+|---|---|---|
+| index slots, raw | ✅ | the only thing that says what is alive |
+| group totals (`budgets`) | ✅ | RAM-only, and not a function of the slots: a slot does not name a group |
+| coverage (one apply index) | ✅ | where replay starts |
+| blocks | ❌ | already on disk; a follower gets them by bulk transfer (§6.3) |
+| writeback buffer | ❌ | not on disk, so the log has it — replay rebuilds it |
+| residency | ❌ | memory copies of blocks that are on disk |
+| per-segment block ranges | ❌ | the span of block numbers the slots reference, per segment |
+| per-segment live counts | ❌ | count the slots |
+| overlay, sweep cursor, offered slice | ❌ | leader-local and volatile by design |
+
+**Raw, in slot order, because there are no keys.** A slot holds a fingerprint, not a key, so a placement
+cannot be recomputed — which means a sparse dump would have to write each entry's bucket and way
+explicitly, and that is larger than letting position be implicit. Raw also makes restore a copy rather
+than a rebuild. The ten percent of slots left empty at the load target are written as zeroes, which is
+also the part that compresses.
+
+**42.7GB, not the design's 37GB.** The design's slot is seven bytes — a two-byte fingerprint and a
+five-byte offset — and ours is eight, because the address is forty-seven bits rather than forty (§12: a
+wider block field, 137TB addressable against 1TB) and there is an ambiguity bit beside it (§11).
+
+### The interval, and the one number nobody has
+
+Recovery replays from coverage, and coverage is the flush frontier at the time of the dump. So:
+
+```
+log retention  >=  flush window + snapshot age
+```
+
+With an hour of window, a 24-hour log allows a snapshot up to 23 hours old. But that reads the dependency
+backwards: the retention is a *consequence* of the interval, not a constraint on it. Both are dials, and
+24h/1h is one consistent pair.
+
+| interval | snapshot writes | replayed on recovery |
+|---|---|---|
+| 10 minutes | 42.7GB × 144/day ≈ 71 MB/s | 1h10m |
+| 1 hour | ≈ 12 MB/s | 2h |
+| 23 hours | ≈ 0.5 MB/s | 24h |
+
+A long interval is nearly free and a short one is not, so the interval is decided by how long recovery may
+take. **That is the number nobody has**: replaying twenty-four hours is a few hundred million effects, and
+how fast the engine applies them is not measured, because there is no replay path to measure. An estimate
+of a million a second puts it at minutes rather than hours, which would say the design's "base every N
+minutes plus deltas every few seconds" is built for an MTTR this workload does not need. An estimate is
+not a number, so the order is: serialise, replay, **measure the replay**, then choose — because choosing
+first would add one more figure with nothing behind it.
+
+### Catch-up first, disk second
+
+A follower too far behind gets the state rather than the entries, which is Raft's `InstallSnapshot`, and
+the leader can serialise its index on demand for that — no stored copy involved. A local restart is the
+same bytes read from disk instead. So the serialisation and its stable read are the whole of the
+mechanism, and whether it is also written down periodically is a policy question about cold start: a node
+that always fetches from a peer needs a healthy peer, and a cluster that loses power together needs a
+local copy or a log long enough to replay from nothing.
