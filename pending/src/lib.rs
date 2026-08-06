@@ -4,6 +4,7 @@ mod index;
 mod memory;
 mod orderer;
 mod overlay;
+mod snapshot;
 
 /// The seam under the engine. Blocks are bytes so that what answers for them can be memory today and
 /// a file or a network volume later without the engine above changing.
@@ -25,6 +26,9 @@ pub use orderer::{OrderWait, Orderer};
 /// uncommitted reservations and the pins live, and a simulation that reimplemented it would be
 /// exercising something else.
 pub use overlay::HoldOverlay;
+/// What the engine writes down so a log can be truncated. The same bytes a follower receives instead of
+/// entries and a restart reads instead of replaying from nothing — see design notes §15.
+pub use snapshot::{NotASnapshot, SnapshotReader, SnapshotWriter, RECORD as SNAPSHOT_RECORD};
 
 /// The layout claims this crate owns, printed by `ledgerfio layout` beside everyone else's.
 pub const HOT_TYPES: &[ledger_base::TypeLayout] = &[index::BUCKET_LAYOUT];

@@ -163,7 +163,19 @@ push channel the ledger does not have.
 
 ### Recovery is not real
 
-There is no checkpoint, and **design notes §15 is now the design for one** — reasoning with no code
+The **snapshot's format and its round trip are built** — `SnapshotWriter` and `SnapshotReader`, chunked
+because 42.7GB cannot be held or written in one piece, refusing a stream whose bucket count is not this
+table's because a bucket's position in it *is* its position in the table. Four tests: the round trip answers
+every carried hold the same, a hold still in the writeback buffer is deliberately not carried, a differently
+sized table refuses the stream, and junk or an unknown version is refused rather than interpreted.
+
+Three things are not, each named where it is missing: the **coverage index**, which waits on replay because a
+position with no replay to use it is a number with nothing behind it; the **stable read**, so nothing may
+apply while a snapshot is in flight — the writer borrows the engine, which says it in the type without making
+it true under a worker; and the **group totals' own boundary**, which needs a frontier to straddle and so
+waits on coverage too.
+
+Nothing writes one anywhere yet, and **design notes §15 is the design for the rest** — reasoning with no code
 behind it, which is why it says so at the top.
 
 The sentence that used to be here was wrong in a way worth keeping: it said the flush window is an hour

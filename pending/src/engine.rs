@@ -3,6 +3,7 @@ use ledger_base::{Amount, BudgetGroup, FxHashMap, MapGauge, Transfer, TransferFl
 
 use crate::block::{BlockAddr, BlockStore, LogTraffic, MemBlockStore, RecordLog, SEGMENTS};
 use crate::index::{Candidates, HoldTable};
+use crate::snapshot::SnapshotWriter;
 
 /// What the pending engine keeps: every hold it was told to create, and the budget groups those
 /// holds belong to. It writes down committed decisions and judges nothing — which is why a write
@@ -109,6 +110,22 @@ pub struct NotStored {
 pub struct BudgetState {
     members: u32,
     remaining: Amount,
+}
+
+impl BudgetState {
+    pub fn members(&self) -> u32 {
+        self.members
+    }
+
+    pub fn remaining(&self) -> Amount {
+        self.remaining
+    }
+
+    /// Rebuilt from a snapshot. Not `new`: this is the only way one is made from outside, and the name says
+    /// that the numbers came from a stream rather than from applies the engine counted.
+    pub fn restored(members: u32, remaining: Amount) -> Self {
+        Self { members, remaining }
+    }
 }
 
 impl PendingEngine {
@@ -671,6 +688,28 @@ impl PendingEngine {
     /// The segment being emptied, if a day has run out.
     fn expiring_segment(&self) -> Option<u8> {
         self.behind().map(|(day, _)| (day % SEGMENTS) as u8)
+    }
+
+    /// A writer over this engine's state. Borrows it, so nothing is copied to be written — and so a caller
+    /// cannot apply anything while a snapshot is in flight, which is the stable read the design asks for and
+    /// the only form of it that exists yet (design notes §15).
+    pub fn snapshot(&self) -> SnapshotWriter<'_> {
+        SnapshotWriter::new(&self.index, &self.records, &self.budgets)
+    }
+
+    /// Puts a snapshot's group totals back, once its stream is complete. The index restores itself as the
+    /// chunks arrive, because holding a second copy of it is what a chunked format exists to avoid.
+    ///
+    /// Nothing checks that the two halves came from the same stream: a reader that had taken a partial one
+    /// answers `is_complete` with false, and it is the caller's business not to ask for the groups then.
+    pub fn restore_groups(&mut self, groups: FxHashMap<BudgetGroup, BudgetState>) {
+        self.budgets = groups;
+    }
+
+    /// The table a snapshot's chunks are written into. Exposed for restore alone — the index is otherwise
+    /// the engine's own, and every other caller reaches it through a method that means something.
+    pub fn index_mut(&mut self) -> &mut HoldTable {
+        &mut self.index
     }
 
     /// That the index's per-segment counts still add up to its entries. Constant time in the number of

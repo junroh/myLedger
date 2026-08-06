@@ -513,6 +513,16 @@ impl RecordLog {
         freed
     }
 
+    /// Whether this address names a record on a block the store has. False for a record in the writeback
+    /// buffer, and false for one in the block still being filled: that block has handed out addresses and
+    /// has not been written.
+    ///
+    /// A snapshot asks it about every slot it keeps. An index entry naming a block nobody has is worse than a
+    /// hold the log can create again, so a slot pointing anywhere but a sealed block is written out empty.
+    pub fn is_sealed(&self, addr: BlockAddr) -> bool {
+        !addr.is_buffered() && addr.block() < self.next_block
+    }
+
     /// Blocks this day wrote. Asked before freeing a day, because a store frees a segment by going looking
     /// for its blocks and that costs something even when there are none.
     pub fn blocks_in_day(&self, segment: u8) -> u64 {

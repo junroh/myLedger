@@ -227,6 +227,31 @@ impl HoldTable {
         self.live_per_segment[segment as usize]
     }
 
+    /// Buckets, for a snapshot to walk. Not slots: a bucket is the unit that is written, because four
+    /// eight-byte slots are thirty-two bytes and every record in the format is that wide.
+    pub fn bucket_count(&self) -> usize {
+        self.buckets.len()
+    }
+
+    /// One bucket's four slot words, in order. Raw, because a snapshot cannot do better: a slot holds a
+    /// fingerprint rather than a key, so a placement cannot be recomputed and position has to be carried
+    /// implicitly by order.
+    pub fn bucket_words(&self, at: usize) -> [u64; WAYS] {
+        self.buckets[at].slots
+    }
+
+    /// Puts one bucket's slots back, through the one write point so both counts follow. `false` means a
+    /// slot's address was not one this table can hold, which is a snapshot that does not belong to it.
+    pub fn restore_bucket(&mut self, at: usize, words: [u64; WAYS]) -> bool {
+        if at >= self.buckets.len() {
+            return false;
+        }
+        for (way, word) in words.iter().enumerate() {
+            self.set_slot((at, way), *word);
+        }
+        true
+    }
+
     /// That the counts add up to the entries. Constant time in the number of segments and independent of
     /// the table's size, so it belongs with the per-tick self-invariants rather than with `audit`: what it
     /// catches is a slot written somewhere other than `set_slot`, and the cost of missing that is a day
@@ -268,10 +293,10 @@ impl HoldTable {
             self.ambiguous += 1;
         }
         match self.place(slot, home, alternate) {
-            Ok(()) => {
-                self.live += 1;
-                Ok(())
-            }
+            // `live` is not touched here: `set_slot` owns both counts, so a cascade's swaps net to zero and
+            // a placement adds one. Keeping it by hand as well was two owners for one number, and it is
+            // what a restore would have had to remember to do (rule 18).
+            Ok(()) => Ok(()),
             Err(displaced) => Err(Homeless {
                 address: address_of(displaced),
             }),
@@ -326,7 +351,6 @@ impl HoldTable {
     ) -> Option<BlockAddr> {
         let at = self.resolve(key, verify)?;
         let cleared = self.set_slot(at, EMPTY);
-        self.live -= 1;
         Some(address_of(cleared))
     }
 
@@ -416,9 +440,11 @@ impl HoldTable {
         let previous = self.buckets[bucket].slots[way];
         if previous != EMPTY {
             self.live_per_segment[address_of(previous).segment() as usize] -= 1;
+            self.live -= 1;
         }
         if slot != EMPTY {
             self.live_per_segment[address_of(slot).segment() as usize] += 1;
+            self.live += 1;
         }
         self.buckets[bucket].slots[way] = slot;
         previous
@@ -477,6 +503,13 @@ const fn pack(fingerprint: u64, addr: BlockAddr) -> Slot {
 
 const fn fingerprint_of(slot: Slot) -> u64 {
     slot >> FINGERPRINT_SHIFT
+}
+
+/// The address inside a raw slot word. Exported for the snapshot, which is the one caller outside this
+/// module that has to read a word: it decides what to keep by looking at where a slot points, and the layout
+/// of a word is this module's to know (rule 1).
+pub const fn address_in(slot: u64) -> BlockAddr {
+    address_of(slot)
 }
 
 const fn address_of(slot: Slot) -> BlockAddr {
