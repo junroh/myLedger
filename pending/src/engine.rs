@@ -33,6 +33,16 @@ pub struct PendingEngine {
     /// run can say what expiry cost it rather than inferring it — the number this replaces was index slots
     /// walked, which nothing bounded.
     swept_blocks: u64,
+    /// Expiry voids handed over and not yet landed, with the address each was built from. One slice at a
+    /// time, because the sweep is not asked for more until the last is handed over — so this is bounded by
+    /// `expiry_blocks_per_round` times `RECORDS_PER_BLOCK`, not by the size of a day.
+    ///
+    /// It is the retry, and it exists because there was none. A void the sequencer declined or the judge
+    /// refused used to be recoverable only by walking the day again, which the sweep would not do until the
+    /// day's live count moved — so a declined void that was the last of its day left the day unfinished for
+    /// ever, and with it every later day: deletion is strictly ordered and one stuck hold stops all of it.
+    /// Four comments claimed "the sweep offers it again" and none of them was true in that case.
+    outstanding: Vec<(BlockAddr, Transfer)>,
     overflowed: u64,
     /// Committed decisions applied, counted so an answer can say which of them it reflects. The
     /// sequencer knows how many it had sent when it asked, and an answer from before one of them is a
@@ -77,12 +87,6 @@ struct Sweep {
     /// what every day did. The index scan this replaces cost 2.2 seconds a pass at the design's table, on
     /// this same thread, ahead of the lookups it would otherwise be answering.
     at_block: u64,
-    /// Entries left in the day when the walk last reached the end of its blocks. While that number has not
-    /// moved, nothing has been released, so walking again would offer the same voids a second time — and
-    /// each of those takes a slot and a lane place for the judge to refuse, which at a small index outruns
-    /// the commits and fills the pool with work that cannot succeed. So the sweep waits for the day to
-    /// empty a little rather than spinning against it.
-    waiting_at: Option<u32>,
 }
 
 /// A hold the index could not take, on its way out of the engine. Named rather than returned as a bare
@@ -367,6 +371,7 @@ impl PendingEngine {
             overflowed: self.overflowed,
             segment: self.records.segment(),
             days_behind: self.days_behind(),
+            days_of_slack: self.days_of_slack(),
             swept_blocks: self.swept_blocks,
             ..self.records.traffic()
         }
@@ -443,15 +448,81 @@ impl PendingEngine {
         // was a real defect: the sweep read "day zero has already run out", walked forward past the day its
         // own records were about to land in, and then never came back to it.
         self.lifetime_days = lifetime_days;
-        self.sweep
-            .day
-            .get_or_insert_with(|| day.saturating_sub(lifetime_days));
+        if self.sweep.day.is_none() {
+            self.sweep.day = Some(self.oldest_unfinished_day(day));
+        }
         if day == self.today {
+            return false;
+        }
+        if !self.day_has_a_segment(day) {
             return false;
         }
         self.today = day;
         self.records.open_day(day);
         true
+    }
+
+    /// Where the cursor starts: the oldest expired day the index still has entries in, or the oldest day
+    /// that has expired if it has none.
+    ///
+    /// **This is what makes a leadership change safe, and it is the only reason the counts are read here.**
+    /// The cursor is leader-local and volatile — deliberately, because which day has run out is a judgment
+    /// from the leader's own clock and never a log entry (design notes §14). So a new leader starts without
+    /// one. Deriving it from its clock alone, as `today - lifetime`, abandons every day the old leader was
+    /// still working on: those holds are never released, their pending columns never come back down, and
+    /// their blocks never go back. It is the same defect `Sweep` records having been found once already —
+    /// a day abandoned because the walk restarted at whatever had just expired — reached the other way.
+    ///
+    /// The counts are the recovery, and they can be because they are a function of the log: a node that has
+    /// applied the same prefix has the same counts, whatever its table size or its clock. A segment with
+    /// entries in it whose day has already expired is a day somebody left unfinished, and the oldest of
+    /// those is where to resume.
+    ///
+    /// Sound only while every live day has a segment of its own, which is what `day_has_a_segment` keeps
+    /// true: past that a segment number no longer names one day and this could resume on the wrong one.
+    fn oldest_unfinished_day(&self, today: u64) -> u64 {
+        let Some(expired_through) = today.checked_sub(self.lifetime_days) else {
+            return today.saturating_sub(self.lifetime_days);
+        };
+        (0..SEGMENTS)
+            .filter(|&segment| self.index.live_in_segment(segment as u8) > 0)
+            // The most recent day at or before the last expired one with this segment number. Unique
+            // because a day's number is its day modulo `SEGMENTS` and no more than that many are live.
+            .map(|segment| expired_through - (expired_through + SEGMENTS - segment) % SEGMENTS)
+            .min()
+            .unwrap_or(expired_through)
+    }
+
+    /// Whether opening this day would still leave every live day a segment number of its own.
+    ///
+    /// A segment's number is its day modulo `SEGMENTS`, so a day being written and a day the sweep has not
+    /// emptied can come to share one — and then one block range covers two days and one count counts both.
+    /// Neither is a wrong answer, because the walk enumerates block numbers that belong to the other day and
+    /// they fail the index's address check: the day simply never finishes, for ever, and no later day does
+    /// either. That is the safe direction and an unbounded amount of it.
+    ///
+    /// Refusing to open the day stops it. New records keep going into the segment already open, which dates
+    /// them later than they are — late deletion, which is the direction that costs only space. And it
+    /// releases itself: the moment the sweep finishes a day the span shrinks and the calendar moves again.
+    ///
+    /// **Rule 20.** `validate` already refuses a lifetime needing more segments than exist, but nothing
+    /// refused a *sweep* far enough behind to need them. The ceiling was the address format's, enforced by
+    /// whichever structure happened to misbehave first — so it was a limit nobody declared. It is declared
+    /// here, from the one number it follows from.
+    fn day_has_a_segment(&self, day: u64) -> bool {
+        let Some(oldest) = self.sweep.day else {
+            return true;
+        };
+        day.saturating_sub(oldest) < SEGMENTS
+    }
+
+    /// Days the sweep may still fall behind before the calendar stops. Zero means it has stopped, which is
+    /// a state a run has to be able to see rather than infer from a formula.
+    pub fn days_of_slack(&self) -> u64 {
+        let Some(oldest) = self.sweep.day else {
+            return SEGMENTS;
+        };
+        SEGMENTS.saturating_sub(self.today.saturating_sub(oldest) + 1)
     }
 
     /// The next holds whose retention has run out, as the resolutions that release them. Bounded per call
@@ -470,28 +541,36 @@ impl PendingEngine {
     /// **The day is done when the index has nothing left in it**, which `live_in_segment` answers in
     /// constant time. That is what the whole-index pass was being used to find out, and it is the reason
     /// the count exists.
-    pub fn expiring(&mut self, blocks: usize, into: &mut Vec<Transfer>) {
+    pub fn propose_expiry(&mut self, blocks: usize, into: &mut Vec<Transfer>) {
         let Some(segment) = self.expiring_segment() else {
             return;
         };
-        let left = self.index.live_in_segment(segment);
-        if left == 0 {
-            // Nothing points into the day, which is the one moment its blocks are known to be dead.
-            // Handing them back is the only place the store shrinks.
-            self.records.free_segment(segment);
+        if self.index.live_in_segment(segment) == 0 {
+            // The day's holds are all released. Its blocks are `reclaim`'s to hand back — that is not a
+            // decision about retention and does not belong to the cursor.
             self.sweep = Sweep {
                 day: self.sweep.day.map(|day| day + 1),
                 at_block: 0,
-                waiting_at: None,
             };
             return;
         }
-        // The last walk left holds behind and nothing has been released since. Offering them again would be
-        // the same voids for the judge to refuse a second time.
-        if self.sweep.waiting_at == Some(left) {
+        // Voids already handed over and not yet landed. Offered again rather than walked past, and the test
+        // for "landed" is the same one the walk makes — a record is alive exactly when the index points at
+        // it — so nothing has to be tracked on the apply path to know which of them are done.
+        //
+        // This is what the day's detail level of a timing wheel is for, at the size the throttle makes it:
+        // one slice, not one day. Without it the only way to retry a lost void was to walk the day again,
+        // which meant choosing between re-offering everything and re-offering nothing — and the gate that
+        // chose "nothing" turned a void the sequencer declined into a day that never finished.
+        let index = &self.index;
+        self.outstanding
+            .retain(|(addr, void)| index.points_at(void.pending_ref, *addr));
+        if !self.outstanding.is_empty() {
+            into.extend(self.outstanding.iter().map(|(_, void)| *void));
             return;
         }
         let index = &self.index;
+        let outstanding = &mut self.outstanding;
         let mut visit = |key: TxId, hold: HoldData, addr: BlockAddr| {
             if !index.points_at(key, addr) {
                 return;
@@ -499,7 +578,7 @@ impl PendingEngine {
             // The one place an expiry void is built. Its id is derived from the hold, which is what makes
             // it a `TransferKind::VoidExpiry` everywhere downstream — the void flags alone would make it a
             // client's.
-            into.push(Transfer {
+            let void = Transfer {
                 id: TxId::expiry_void_of(key),
                 pending_ref: key,
                 debit_account: hold.debit_account,
@@ -509,23 +588,56 @@ impl PendingEngine {
                 amount: 0,
                 ledger: hold.ledger,
                 flags: TransferFlags::VOID_PENDING,
-            });
+            };
+            outstanding.push((addr, void));
+            into.push(void);
         };
         for _ in 0..blocks.max(1) {
             if !self
                 .records
                 .each_record_in_day(segment, self.sweep.at_block, &mut visit)
             {
-                // The end of the day's blocks with holds still in it: those voids are in flight, or the
-                // judge refused them. Wait for the day to empty a little before walking again — it stays
-                // open, which is late rather than wrong.
+                // The end of the day's blocks with holds still in it. Those holds are either behind a void
+                // in flight — which `outstanding` is now holding, so the next round offers it again rather
+                // than walking — or they were never reached because the walk stopped short. Either way the
+                // walk starts over, and the day stays open, which is late rather than wrong.
                 self.sweep.at_block = 0;
-                self.sweep.waiting_at = Some(left);
                 return;
             }
             self.sweep.at_block += 1;
             self.swept_blocks += 1;
         }
+    }
+
+    /// Blocks of any day nothing points into any more, handed back to the store. Answers how many.
+    ///
+    /// **No clock, no cursor, no leadership, and no notion of retention.** A segment the index has no entry
+    /// in holds only dead records — that is what the count means — and it is equally true of a day whose
+    /// retention ran out and of one whose holds all resolved the ordinary way weeks early. So this is pure
+    /// local housekeeping, and it has to be: on a follower nothing proposes voids, so a reclaim tied to the
+    /// expiry cursor would leave its store growing while the leader's shrank. Every node runs it for itself
+    /// and they need not agree on when.
+    ///
+    /// It also reclaims sooner than expiry would. Waiting for the retention window was never the rule —
+    /// it was an artefact of the search: finding a day empty used to cost a pass over the index, so only
+    /// the one day that had to be checked was. Sixty-three counts cost nothing to read.
+    ///
+    /// The segment being written is skipped. Its open block has been promised addresses and is not sealed,
+    /// so its count says nothing about the blocks still to come; the space returns when the day rolls.
+    pub fn reclaim(&mut self) -> usize {
+        let open = self.records.segment();
+        let mut freed = 0;
+        for segment in 0..SEGMENTS as u8 {
+            if segment == open || self.index.live_in_segment(segment) > 0 {
+                continue;
+            }
+            // Asked before freeing because a store frees a segment by looking for its blocks, which costs
+            // something even when there are none.
+            if self.records.blocks_in_day(segment) > 0 {
+                freed += self.records.free_segment(segment);
+            }
+        }
+        freed
     }
 
     /// The oldest day still waiting to be emptied, and how many such days there are. Days are finished
@@ -1117,7 +1229,7 @@ mod expiry_tests {
 
     fn offered(engine: &mut PendingEngine, blocks: usize) -> Vec<Transfer> {
         let mut voids = Vec::new();
-        engine.expiring(blocks, &mut voids);
+        engine.propose_expiry(blocks, &mut voids);
         voids
     }
 
@@ -1136,10 +1248,15 @@ mod expiry_tests {
 
     /// Offers and commits until the day is done, answering how many holds were released and in how many
     /// rounds. Bounded, so a sweep that never converged fails rather than hanging.
+    ///
+    /// Reclaims every round, the way the worker does. The two halves are separate jobs — proposing a void
+    /// needs the leader's clock, handing back a dead day's blocks needs nothing — so a test that drove only
+    /// the proposing half would be driving a node that never reclaims.
     fn empty_the_day(engine: &mut PendingEngine, blocks_per_round: usize) -> (usize, usize) {
         let mut released = 0;
         let mut rounds = 0;
         while engine.sweeping() {
+            engine.reclaim();
             let voids = offered(engine, blocks_per_round);
             // Blocks bound the work and the voids both: a round reads the blocks it was asked for and every
             // void it offers came out of one of them. That is the property the bound being on blocks buys —
@@ -1153,6 +1270,9 @@ mod expiry_tests {
             rounds += 1;
             assert!(rounds < 100_000, "the sweep never finished");
         }
+        // Once more with the cursor past the day: the round that advanced it had already reclaimed, so the
+        // blocks of the day it just left are handed back here.
+        engine.reclaim();
         (released, rounds)
     }
 
@@ -1319,6 +1439,128 @@ mod expiry_tests {
                 "an expired hold was answered from a freed day"
             );
         }
+    }
+
+    /// The calendar stops rather than letting two live days share a segment.
+    ///
+    /// A segment's number is its day modulo `SEGMENTS`, so a sweep far enough behind meets its own target
+    /// again as the day being written. Driving the engine there by hand showed what happens: the walk
+    /// enumerates block numbers belonging to the other day, they fail the index's address check, no void is
+    /// offered, and the day never finishes — for ever, and with it every later day. Refusing to open the day
+    /// is what makes that state unreachable, and it releases itself as soon as the sweep finishes one.
+    #[test]
+    fn the_calendar_stops_before_two_live_days_share_a_segment() {
+        let (mut engine, _) = written_on_day_zero();
+        engine.open_day(LIFETIME, LIFETIME);
+
+        // Nothing is ever committed, so day zero never finishes and the sweep never advances.
+        let mut day = LIFETIME;
+        for _ in 0..(SEGMENTS * 2) {
+            day += 1;
+            engine.open_day(day, LIFETIME);
+            let mut voids = Vec::new();
+            engine.propose_expiry(1, &mut voids);
+        }
+
+        assert_eq!(
+            engine.days_of_slack(),
+            0,
+            "the calendar did not stop at the slack it has"
+        );
+        assert_ne!(
+            engine.records.segment(),
+            engine.expiring_segment().expect("a day has run out"),
+            "the day being written shares a segment with the day being emptied"
+        );
+
+        // And it releases itself: finish the days it was stuck on and the calendar moves again. The *next*
+        // day, not the one the loop reached — a jump of sixty-seven days at once is refused for the same
+        // reason and by the same rule, which is a property worth having and not the one being tested here.
+        let (_, _) = empty_the_day(&mut engine, 1024);
+        assert!(engine.days_of_slack() > 0, "the calendar stayed stopped");
+        assert!(
+            engine.open_day(engine.today + 1, LIFETIME),
+            "the day would not open once the sweep had caught up"
+        );
+    }
+
+    /// A new leader resumes on the oldest day the index says is unfinished, not on whatever its clock makes
+    /// the oldest expired one.
+    ///
+    /// The cursor is leader-local and volatile on purpose — which day has run out is a judgment from the
+    /// leader's clock, never a log entry — so a new leader starts without one. Taking it from the clock
+    /// abandons every day the old leader had not finished: their holds are never released and their pending
+    /// columns never come down. The counts are the recovery because they are a function of the log.
+    ///
+    /// Two engines here rather than one, with the same holds written into the same day, standing in for two
+    /// nodes that applied the same prefix. The second is told a much later day, as a new leader would be.
+    #[test]
+    fn a_new_leader_resumes_on_the_oldest_day_the_counts_say_is_unfinished() {
+        let (mut old_leader, _) = written_on_day_zero();
+        old_leader.open_day(LIFETIME, LIFETIME);
+        assert_eq!(old_leader.days_behind(), 1, "day zero has not run out");
+
+        // The same log, applied by a node that has not been leading — so no cursor, and a clock that has
+        // moved well past the day the old leader is still stuck on.
+        let (mut new_leader, _) = written_on_day_zero();
+        let much_later = LIFETIME + 20;
+        new_leader.open_day(much_later, LIFETIME);
+
+        assert_eq!(
+            new_leader.expiring_segment(),
+            old_leader.expiring_segment(),
+            "the new leader resumed on a different day and abandoned day zero"
+        );
+        assert_eq!(
+            new_leader.days_behind(),
+            much_later - LIFETIME + 1,
+            "the new leader did not see how far behind the day it resumed on is"
+        );
+
+        // And it releases day zero's holds rather than leaving them.
+        let (released, _) = empty_the_day(&mut new_leader, 1024);
+        assert!(released > 0, "the new leader released nothing of day zero");
+    }
+
+    /// A void nobody took is offered again, which is what every "the sweep offers it again" comment in this
+    /// code claimed and none of them delivered.
+    ///
+    /// The sequencer declines an expiry void when its backlog is full and refuses one when the lane is
+    /// quarantined, and both are counted and neither is answered — so the sweep re-offering is the only
+    /// retry there is. It used to re-offer by walking the day again, and it would not walk again until the
+    /// day's live count moved. A declined void that was the last of its day therefore moved nothing, so the
+    /// day never finished — and because days are emptied in order, no later day did either. Deletion stopped
+    /// for the life of the node, silently, on one dropped notice.
+    ///
+    /// Here nothing is committed, which is exactly what a declined void looks like to the engine.
+    #[test]
+    fn a_void_nobody_took_is_offered_again() {
+        let (mut engine, written) = written_on_day_zero();
+        engine.open_day(LIFETIME, LIFETIME);
+
+        let first = offered(&mut engine, 1);
+        assert!(!first.is_empty(), "the day offered nothing to begin with");
+
+        // Twenty rounds, nothing applied. The same voids have to keep coming back.
+        for round in 0..20 {
+            let again = offered(&mut engine, 1);
+            let ids: Vec<TxId> = again.iter().map(|void| void.id).collect();
+            let expected: Vec<TxId> = first.iter().map(|void| void.id).collect();
+            assert_eq!(
+                ids, expected,
+                "round {round} offered something other than the slice nobody took"
+            );
+        }
+        assert!(engine.sweeping(), "the day finished with holds still in it");
+
+        // And once they are applied the walk moves on, so retrying is not a loop the day cannot leave.
+        commit(&mut engine, &first);
+        let (released, _) = empty_the_day(&mut engine, 1);
+        assert_eq!(
+            released + first.len(),
+            written,
+            "the day did not finish after its first slice was taken"
+        );
     }
 
     /// A day is not finished while any of its holds is still there, and a hold nothing releases keeps its

@@ -501,6 +501,17 @@ impl RunReport {
                 self.metrics.expiry_dropped,
                 behind
             );
+            // Zero slack is the calendar having stopped: the day being written would otherwise come to
+            // share a segment with a day the sweep has not emptied, so no further day is opened until it
+            // does. Late deletion, and self-releasing — but a state a run has to be able to see, because
+            // from the outside it looks exactly like a ledger whose days have stopped passing.
+            if self.pending_traffic.days_of_slack == 0 {
+                println!(
+                    "  CALENDAR      stopped: the sweep is as far behind as the address format allows, so no \
+                     new day is opened until it finishes one. Records keep going into the open segment, which \
+                     dates them later than they are — late deletion, not early."
+                );
+            }
             // Blocks read per expiry void released is the sweep's price, and unlike the index scan it
             // replaces it is bounded: a round reads the blocks it was asked for, they belong to the day
             // rather than to the whole table, and they are read in order. Ratio rather than total, because

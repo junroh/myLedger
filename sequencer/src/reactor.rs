@@ -185,6 +185,7 @@ where
 
     pub fn tick(&mut self) -> bool {
         self.metrics.ticks += 1;
+        self.publish_expiry_room();
         let progress = if self.config.profile {
             self.timed_stages()
         } else {
@@ -376,6 +377,17 @@ where
             && self.pending.depth() == 0
     }
 
+    /// Told to the engine each tick, so its sweep offers nothing while this backlog is full. Rule 12's
+    /// pause, for the one backlog whose filler is the ledger rather than a client.
+    fn publish_expiry_room(&mut self) {
+        // A sealed apply path wants none, whatever the backlog says: nothing more will be applied, so every
+        // void offered from here is refused and offered again. Without this the sweep spins for the rest of
+        // the node's life against a node that has already stopped — 77,000 refusals in a thirty-two seed
+        // sweep, almost all of them after a seal.
+        let room = self.expiry.has_room() && !self.safety.is_fail_stopped();
+        self.pending.set_wants_expiry(room);
+    }
+
     pub fn backpressure(&self) -> Backpressure {
         Backpressure {
             intake_paused: self.intake_paused,
@@ -538,6 +550,13 @@ where
         // The ledger does not answer itself. An expiry void was nobody's request, so an ack for it would
         // put a transaction id no client sent into the client's stream.
         if !item.kind.is_client() {
+            // Counted here rather than at admission, which is where it was and which stopped being the same
+            // number the moment the sweep started retrying: an offer declined and made again was admitted
+            // twice and released nothing. Twenty-one million admissions against half a million requests is
+            // what that read like. This is the release — one commit of one expiry void.
+            if outcome == AckOutcome::Committed {
+                self.metrics.holds_expired += 1;
+            }
             return;
         }
         self.outbox.emit(Ack {

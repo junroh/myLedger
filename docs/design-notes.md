@@ -1273,6 +1273,50 @@ its blocks left memory long ago. Asking memory would be a test whose answer is a
 The block range each day wrote is two numbers per segment, because block numbers count on across day
 boundaries and a day's blocks are consecutive by construction (§12). Nothing else had to be remembered.
 
+### Reclaiming and proposing are two jobs, and the wheel is what tells them apart
+
+Handing a day's blocks back and asking for its holds to be released look like one job and are not, and the
+question that separates them is *who may do it*.
+
+**Reclaiming needs nothing.** A segment the index has no entry in holds only dead records — that is what the
+count means — and it is equally true of a day whose retention ran out and of one whose holds all resolved the
+ordinary way weeks early. No clock, no cursor, no consensus, and no notion of retention. So every node does
+it for itself and they need not agree on when. That is not a convenience: on a follower nothing proposes
+voids, so a reclaim tied to the expiry cursor would leave its store growing while the leader's shrank.
+
+It also reclaims sooner than expiry ever did. Waiting for the retention window was never the rule; it was an
+artefact of the search. Finding a day empty used to cost a pass over the index, so only the one day that had
+to be checked was checked. Sixty-three counts cost nothing to read.
+
+**Proposing needs the leader's clock**, because which day has run out is a judgment and a proposal needs
+somewhere to go. That is the half a leadership gate belongs on, and the half whose cursor is volatile.
+
+### What survives a leadership change, and what does not
+
+The cursor is leader-local on purpose — it is a judgment from a clock, never a log entry — so a new leader
+starts without one. Taking it from the clock alone, as `today - lifetime`, **abandons every day the old
+leader had not finished**: those holds are never released, their pending columns never come down, and their
+blocks never go back. It is the defect `Sweep` records having been found once already, reached from the other
+end.
+
+The counts are the recovery, and they can be because they are a function of the log: a node that has applied
+the same prefix has the same counts, whatever its table size or its clock — a count is placement-independent.
+A segment with entries in it whose day has already expired is a day somebody left unfinished, and the oldest
+of those is where to resume. So the same sixty-four numbers answer three questions: is this day done, may
+these blocks go back, and where does a new leader start.
+
+The rest of what a leadership change loses costs a walk and nothing else. The offered-and-unlanded slice goes,
+and the new leader rediscovers it by walking the day. A void the old leader proposed and did not commit may
+still commit afterwards; the new leader's re-offer carries the same id, derived from the hold, so the second
+is a duplicate. That is what the derivation is for.
+
+**And one thing it is easy to get backwards.** A leader whose clock is fast does not make nodes diverge. The
+void goes through consensus, so every node applies the same release at the same log position — the execution
+is deterministic and that is design §5.2 working. What it does is make the *whole ledger* delete early,
+uniformly and durably, with no downstream check possible because a record carries no timestamp. So the clock
+defence in §5.3 is not a consistency mechanism; it protects the promise, and it is the one place expiry can
+be wrong rather than late.
+
 The expiry void is then **judged like any other resolution, not applied**. It has to be: a client void or
 a settle may be in flight for the same hold, and only the judge sees both. So it takes a slot, a place in
 its lane and a lookup, and it is refused by the same rules — a hold already resolved, a quarantined lane, a

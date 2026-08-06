@@ -60,8 +60,12 @@ pub struct Metrics {
     /// means the node sealed its apply path — the hold is in the log and no resolution of it can ever be
     /// answered.
     pub holds_not_stored: u64,
-    /// Expiry voids the engine asked for and the sequencer admitted: a hold whose retention ran out, whose
-    /// remainder has to be released or the pending column it reserved never comes down.
+    /// Holds released for outliving their retention: expiry voids that **committed**, one each.
+    ///
+    /// Counted at the commit and not at the admission, which is where it was. The two were the same number
+    /// while a declined void was never offered again; once the sweep retries, an admission count says how
+    /// many times the ledger tried and a release count says how many holds came back. The first read as
+    /// twenty-one million against half a million real requests.
     pub holds_expired: u64,
     /// Expiry voids that could not be admitted — no slot, a quarantined lane, a sealed apply path. Not a
     /// loss: nobody asked for them and the sweep offers them again. Non-zero for long means the sweep is

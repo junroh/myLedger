@@ -213,6 +213,10 @@ struct PendingState {
     notices: VecDeque<PendingNotice>,
     /// Reused by every sweep round, so expiry allocates nothing.
     expiring: Vec<Transfer>,
+    /// Whether the sequencer says it has room for more expiry voids. The real port carries this too, and
+    /// the fake has to as well: without it the sweep re-offers a declined void every round, which is a
+    /// shape the seeds should see rather than one only the real worker has.
+    wants_expiry: bool,
     expiries_offered: u64,
     ready: VecDeque<PendingReply>,
     now: u64,
@@ -262,6 +266,7 @@ impl PendingFake {
             exempt_replies: 0,
             notices: VecDeque::new(),
             expiring: Vec::new(),
+            wants_expiry: true,
             expiries_offered: 0,
             ready: VecDeque::new(),
             now: 0,
@@ -342,12 +347,15 @@ impl PendingFake {
             state.store.counts_agree(),
             "the index's per-segment counts no longer add up to its entries"
         );
-        if !state.store.sweeping() || !state.notices.is_empty() {
+        // Every node reclaims for itself, leader or not: a segment the index has no entry in holds only
+        // dead records. Driven here as well as in the real worker, so the seeds see the same split.
+        state.store.reclaim();
+        if !state.store.sweeping() || !state.notices.is_empty() || !state.wants_expiry {
             return;
         }
         let mut found = std::mem::take(&mut state.expiring);
         found.clear();
-        state.store.expiring(blocks_per_round, &mut found);
+        state.store.propose_expiry(blocks_per_round, &mut found);
         state.expiries_offered += found.len() as u64;
         for void in &found {
             state
@@ -518,6 +526,10 @@ impl PendingPort for PendingFake {
 
     fn poll(&self) -> Option<PendingReply> {
         self.0.borrow_mut().ready.pop_front()
+    }
+
+    fn set_wants_expiry(&mut self, wanted: bool) {
+        self.0.borrow_mut().wants_expiry = wanted;
     }
 
     fn notices(&self) -> Option<PendingNotice> {

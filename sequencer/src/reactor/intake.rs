@@ -148,10 +148,7 @@ where
     pub(super) fn admit_expiry(&mut self, void: Transfer) {
         let request = Request::single(void, self.clock.now_nanos());
         match self.prepare(&request, None) {
-            Ok(slot) => {
-                self.metrics.holds_expired += 1;
-                self.dispatch_or_defer(slot);
-            }
+            Ok(slot) => self.dispatch_or_defer(slot),
             // Nobody to tell: no client asked for this. The sweep offers it again next round, and if the
             // reason was terminal — a sealed apply path — nothing is being released anyway.
             Err(_) => self.metrics.expiry_refused += 1,

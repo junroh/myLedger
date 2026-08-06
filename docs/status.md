@@ -95,6 +95,33 @@ runs out is emptied by releasing whatever survived it. Design notes §14.
   thinning towards empty scanned most of the table per round and the round that ended it scanned all of
   it, 2.2s at the design's size, on the thread that answers lookups. Rule 20, and design notes §14 has
   both measurements.
+- **Reclaiming a day's blocks and proposing its voids are two jobs, and only one is the leader's.**
+  `reclaim` hands back the blocks of *any* segment the index has no entry in — no clock, no cursor, no
+  retention, because a segment with no entries holds only dead records whether its day ran out or its
+  holds all resolved early. Every node runs it for itself, which is what keeps a follower's store from
+  growing while the leader's shrinks. `propose_expiry` walks an expired day and offers voids, and that
+  needs the leader's clock. Once consensus is real the leadership gate goes on the second one only.
+- **A void nobody took is offered again, and that is now true rather than claimed.** The engine keeps the
+  slice it handed over — bounded by `expiry_blocks_per_round` times the records on a block, not by the
+  size of a day — and re-offers whatever the index still points at. Four comments claimed the sweep
+  re-offered a declined void; none did, because the re-walk was gated on the day's live count moving, so
+  a declined void that was the last of its day left that day unfinished for ever — and with it every
+  later day, since deletion is strictly ordered. Storage then grew without bound and the index never
+  filled to stop it, because ongoing traffic churns its own slots.
+- **The sequencer says when it has room** (`set_wants_expiry`), and the sweep offers nothing while it has
+  not. Retrying without that pause cost 780,000 declines in a five-second run and tripled p99.9: the
+  sweep is the only thing that retries a void, so a full backlog turned into a re-offer every round.
+  Rule 12's pause, for the one backlog whose filler is the ledger rather than a client.
+- **The calendar stops before two live days can share a segment.** A segment's number is its day modulo
+  63, so a sweep far enough behind meets its own target as the day being written — one block range over
+  two days, one count for both, and a day that can never finish. `open_day` refuses instead; records keep
+  going into the open segment, which dates them later than they are. Late, self-releasing, and rule 20:
+  the ceiling was the address format's, enforced by whichever structure misbehaved first.
+- **A new leader resumes from the counts, not from its clock.** The cursor is leader-local and volatile
+  on purpose — which day has run out is a judgment from the leader's own clock, never a log entry — so a
+  new leader has none. Deriving it from the clock as `today - lifetime` abandons every day the old leader
+  had not finished. The counts are the recovery because they are a function of the log: a segment with
+  entries whose day has already expired is a day somebody left unfinished.
 - **The slice sizes itself from the day, and no longer waits on a policy.** The requirement was always
   `drain rate >= a day's survivors / a day`; a design day is 2.9M blocks against 86,400 seconds, so two
   blocks a round leaves three orders of headroom and the binding constraint is a single round rather than
@@ -159,19 +186,6 @@ the split exists and that residency keeps IO off resolutions inside it.
   bounded rather than bound it. What is left is knowing which component a tail belongs to, and that no
   latency gate on a long run is measuring this ledger. Reproduce with
   `ledgerfio run --workload void-heavy --duration 10s --rate 100k --resolve-after 900000 --repeat 8`.
-- **The sweep falling far enough behind can reuse a day's segment, and only the seal stops it.** A
-  segment's number is its day modulo 63, so day *D*'s segment comes round again at day *D + 63*. If the
-  sweep is more than `63 - lifetime` days behind, that day arrives before *D* was ever emptied, and the
-  two days share both a segment count and a block range. The result is late, not early: the count never
-  reaches zero, so the day is never freed and the store stops shrinking — and the walk reads block
-  numbers that belong to another day, whose records fail the index's address check and offer no void.
-  Verified by driving the engine there by hand. Unreachable on a real node because the index is sized
-  for `lifetime` days of survivors and seals a few days behind, long before sixty; `validate` refuses a
-  lifetime that needs more segments than exist, but nothing refuses a sweep this far behind. So the
-  bound is real and undeclared, which is rule 20's shape — recorded rather than fixed, because the fix
-  is a question about what a node should do when expiry has stopped working at all, which is the first
-  entry under *Decisions waiting on someone*.
-
 ### Where the documents and the code have diverged
 
 Two places where the design names a mechanism this code does not have. Kept as a section of its own
@@ -185,6 +199,20 @@ neither is outstanding work.
   computed deadline and nothing can express a per-hold one. The design's own lazy-load note is why this
   is not a shortfall — a wheel holding the holds would be 38GB, so it was never meant to hold them.
   Design notes §14.
+- **There is no High Water Mark on the day, and the design asks for one.** Design §5.3 defends the
+  *judgment* of when a day has expired with three things: an infrastructure that slews rather than steps
+  the clock, `CLOCK_MONOTONIC` for ticks, and an HWM so the day only ever advances. `DaySource::WallClock`
+  reads the clock raw and has none of them.
+  What that costs is not a divergence between nodes, and getting that backwards is easy: an expiry void
+  goes through consensus, so every node applies the same release at the same log position. A leader whose
+  clock is a day fast makes the whole ledger delete a day early, uniformly and durably, and the judge
+  cannot catch it — a record carries no timestamp, so nothing downstream knows the hold's age. `grace_days`
+  absorbs it up to the grace and no further. So this is the one place expiry can produce a wrong answer
+  rather than a late one, and it is unbuilt.
+- **Nothing marks the sweep as the leader's work.** The engine has no notion of leadership, so
+  `propose_expiry` runs in the worker loop regardless. On a real cluster a follower would offer voids it
+  cannot propose. `reclaim` is the opposite and must keep running everywhere — see the built entry above.
+  The split exists in the code; the gate does not, because there is nothing yet to gate on.
 - **There is no `min_live_seg_id`, and it is verified that there needs to be none.** Design §3.1 and
   §4.6 give the index an epoch, and there they need one: `apply_expire` unlinks a segment on a *time*
   condition, so slots addressing it survive the unlink and two jobs have to cope — a lookup answers Dead
@@ -222,11 +250,19 @@ Every entry says the same three things: **the question**, the **default** the co
 unanswered, and **when that default stops being safe**. The source design's own open questions are tagged
 `SE-OQ-n` where one matches, because until now those numbers appeared nowhere in this repository.
 
-- **What should a node do once expiry has stopped working altogether?**
-  *Default:* nothing — it falls further behind for ever, silently, and the store stops shrinking. The
-  segment-reuse entry above has the mechanism.
-  *Stops being safe:* when a deployment can reach that state without the index sealing first. Today two
-  independently chosen sizes make the seal come first, which is rule 20's shape rather than a guarantee.
+- **When does the day get a High Water Mark, and what decides the clock policy around it?**
+  *Default:* the day is whatever the leader's wall clock says, read raw. A leader a day fast makes the
+  whole ledger delete a day early — uniformly, durably, and undetectably, because a record carries no
+  timestamp for anything downstream to check against.
+  *Stops being safe:* the first time two nodes' clocks can disagree by more than `grace_days`, which is
+  the first real cluster. It is half an infrastructure decision (slew, not step) and half an engine one,
+  which is why it is a question rather than a task.
+
+- **What marks the sweep as the leader's work, once there is a leader?**
+  *Default:* nothing. `propose_expiry` runs wherever the worker runs, and `reclaim` should — the two are
+  already separate calls for exactly this reason.
+  *Stops being safe:* the day consensus is real. A follower offering voids it cannot propose is waste
+  rather than corruption, but it is waste that grows with the cluster.
 
 - **What threshold should the load-factor alarm fire at, and what should the node do when it fires?**
   *Default:* it reports and nothing acts. Inserts succeed until one cannot be placed, and that seals.

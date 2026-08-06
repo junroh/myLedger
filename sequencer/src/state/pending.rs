@@ -22,6 +22,13 @@ pub struct PendingChannel<P: PendingPort> {
 }
 
 impl<P: PendingPort> PendingChannel<P> {
+    /// Tells the engine whether the sequencer has room for more expiry voids. One-way and advisory: the
+    /// engine's sweep reads it before offering, so a full backlog stops the offers instead of declining them
+    /// one at a time.
+    pub fn set_wants_expiry(&mut self, wanted: bool) {
+        self.port.set_wants_expiry(wanted);
+    }
+
     pub fn new(port: P, limit: usize, reserve: usize) -> Self {
         Self {
             port,

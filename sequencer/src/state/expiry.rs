@@ -40,6 +40,16 @@ impl ExpiryQueue {
     pub fn take(&mut self) -> Option<Transfer> {
         self.waiting.pop_front()
     }
+
+    /// Whether there is room for another slice. Published to the engine, which offers nothing while there
+    /// is not: the sweep is the only thing that retries a declined void, so without this it re-offers every
+    /// round and each one costs a slot and a lane place to decline again.
+    ///
+    /// A slice rather than one void, because that is the unit the engine offers in — room for a single void
+    /// would let it hand over a slice the queue then declines most of.
+    pub fn has_room(&self) -> bool {
+        self.waiting.len() < self.limit
+    }
 }
 
 #[cfg(test)]

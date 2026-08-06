@@ -340,6 +340,7 @@ struct TrafficGauge {
     overflowed: AtomicU64,
     segment: AtomicU64,
     days_behind: AtomicU64,
+    days_of_slack: AtomicU64,
     swept_blocks: AtomicU64,
 }
 
@@ -374,6 +375,8 @@ impl TrafficGauge {
             .store(u64::from(traffic.segment), Ordering::Relaxed);
         self.days_behind
             .store(traffic.days_behind, Ordering::Relaxed);
+        self.days_of_slack
+            .store(traffic.days_of_slack, Ordering::Relaxed);
         self.swept_blocks
             .store(traffic.swept_blocks, Ordering::Relaxed);
     }
@@ -397,13 +400,14 @@ impl TrafficGauge {
             overflowed: self.overflowed.load(Ordering::Relaxed),
             segment: self.segment.load(Ordering::Relaxed) as u8,
             days_behind: self.days_behind.load(Ordering::Relaxed),
+            days_of_slack: self.days_of_slack.load(Ordering::Relaxed),
             swept_blocks: self.swept_blocks.load(Ordering::Relaxed),
         }
     }
 }
 
 /// The store's occupancy as the worker last published it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Occupancy {
     holds: MapGauge,
     budgets: MapGauge,
@@ -421,6 +425,29 @@ struct Occupancy {
     /// What putting each lane back in order cost. Published because it is the one cost no per-read bound
     /// covers, and until now the engine computed it and nobody could read it.
     order_wait: OrderWaitGauge,
+    /// Whether the sequencer has room for more expiry voids, as it last said. The sweep offers nothing while
+    /// this is false: a declined void is re-offered by the sweep and by nothing else, so without a pause here
+    /// a full backlog becomes a re-offer every round. Advisory — a stale read costs one wasted offer.
+    wants_expiry: AtomicBool,
+}
+
+impl Default for Occupancy {
+    /// `wants_expiry` starts true and every other field at zero. Derived would start it false, which would
+    /// stop the sweep until the sequencer's first tick had spoken — a pause nobody asked for, and one that
+    /// would never lift in a test that drives the engine without a reactor.
+    fn default() -> Self {
+        Self {
+            holds: MapGauge::default(),
+            budgets: MapGauge::default(),
+            blocks: MapGauge::default(),
+            buffer: MapGauge::default(),
+            resident: MapGauge::default(),
+            traffic: TrafficGauge::default(),
+            applied: AtomicU64::default(),
+            order_wait: OrderWaitGauge::default(),
+            wants_expiry: AtomicBool::new(true),
+        }
+    }
 }
 
 /// The orderer's four numbers across the thread boundary. A gauge rather than part of `LogTraffic`
@@ -628,6 +655,10 @@ impl PendingPort for MemoryPending {
     fn notices(&self) -> Option<PendingNotice> {
         self.notices.pop()
     }
+
+    fn set_wants_expiry(&mut self, wanted: bool) {
+        self.occupancy.wants_expiry.store(wanted, Ordering::Relaxed);
+    }
 }
 
 impl PendingOverlay for MemoryPending {
@@ -764,7 +795,15 @@ impl PendingWorker {
         self.owed.push_back(notice);
     }
 
-    /// Moves the day on when the wall clock says it has, and offers a bounded slice of whatever ran out.
+    /// Moves the day on when the wall clock says it has, hands back the blocks of any day nothing points
+    /// into, and offers a bounded slice of whatever ran out.
+    ///
+    /// **The three are not the same job and the middle one is not the leader's.** Reclaiming needs no clock
+    /// and no consensus — a segment the index has no entry in holds only dead records — so every node does
+    /// it for itself. Proposing an expiry void is the leader's, because a proposal needs somewhere to go.
+    /// Once consensus is real this method splits along that line; today there is one node and the split is
+    /// stated rather than enforced, which is why `reclaim` is called before the leader-only part and not
+    /// inside it.
     ///
     /// Wall time, not the monotonic clock the rest of this file runs on: retention is a promise in calendar
     /// terms and has to survive a restart, which an origin-relative clock cannot do. Read once a round and
@@ -772,25 +811,33 @@ impl PendingWorker {
     fn sweep_expiry(&mut self) -> bool {
         let day = self.days.today();
         let opened = self.store.open_day(day, self.lifetime_days);
+        let reclaimed = self.store.reclaim() > 0;
         if !self.store.sweeping() {
-            return opened;
+            return opened || reclaimed;
         }
         // Owed notices are still waiting, so the sequencer has not kept up with the last slice; offering
         // more would grow this queue rather than release anything sooner.
         if !self.owed.is_empty() {
-            return opened;
+            return opened || reclaimed;
+        }
+        // And the sequencer's own backlog is full, so a slice offered now would be declined a void at a
+        // time. The sweep is the only thing that retries a declined void, so offering into a full backlog
+        // is how a retry becomes a loop: it costs a slot and a lane place per void, per round, to be told
+        // no again. Rule 12's pause, for the backlog no client fills.
+        if !self.occupancy.wants_expiry.load(Ordering::Relaxed) {
+            return opened || reclaimed;
         }
         self.expiring.clear();
         let mut found = std::mem::take(&mut self.expiring);
         self.store
-            .expiring(self.expiry_blocks_per_round, &mut found);
+            .propose_expiry(self.expiry_blocks_per_round, &mut found);
         for void in &found {
             self.owed
                 .push_back(PendingNotice::HoldExpired { void: *void });
         }
         let offered = !found.is_empty();
         self.expiring = found;
-        opened || offered
+        opened || reclaimed || offered
     }
 
     /// Once per round rather than once per command: the store's size is asked for by a report at the

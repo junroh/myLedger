@@ -232,4 +232,17 @@ pub trait PendingPort: PendingOverlay {
     /// speaking first. A method rather than a trait of its own, because one component answers all
     /// three and splitting them would be three traits for one seam.
     fn notices(&self) -> Option<PendingNotice>;
+
+    /// Tells the engine whether the sequencer has room for more expiry voids. The fourth direction, and the
+    /// only one that carries no work: advisory, one-way, in the shape `Backpressure` already uses. A stale
+    /// read costs one wasted offer rather than a wrong answer.
+    ///
+    /// It exists because a declined expiry void is not free. The sweep is the only thing that retries one, so
+    /// it re-offers whatever it has not seen land — and with nothing to pace that, a full backlog becomes a
+    /// re-offer every round, each costing a slot and a lane place for the sequencer to decline again.
+    /// Measured before it existed: 780,000 declines in a five-second run and p99.9 three times what it was,
+    /// against 21 million admissions of half a million real requests. Rule 12 says a backlog reaching its
+    /// limit pauses whatever fills it — this is that signal for the one backlog whose filler is the ledger
+    /// rather than a client, so there is no client to refuse instead.
+    fn set_wants_expiry(&mut self, wanted: bool);
 }

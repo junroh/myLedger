@@ -513,6 +513,12 @@ impl RecordLog {
         freed
     }
 
+    /// Blocks this day wrote. Asked before freeing a day, because a store frees a segment by going looking
+    /// for its blocks and that costs something even when there are none.
+    pub fn blocks_in_day(&self, segment: u8) -> u64 {
+        self.days[segment as usize].blocks
+    }
+
     /// Every record of one of a day's blocks, by position within the day. `false` means the day has no
     /// block there, which is how a walk knows it has reached the end.
     ///
@@ -773,6 +779,11 @@ pub struct LogTraffic {
     /// so this is where "deleting late is safe" stops being true, and a run has to be able to see it.
     pub segment: u8,
     pub days_behind: u64,
+    /// Days the sweep may still fall behind before the calendar stops moving. Zero means it has stopped —
+    /// the day being written would otherwise come to share a segment with a day not yet emptied. Reported
+    /// rather than derived by the reader, because the formula it follows from is the address format's and a
+    /// report that made the reader know it would be a second place the rule lives.
+    pub days_of_slack: u64,
     /// Blocks of expiring days the sweep has read. The sweep's whole cost, and a bounded one: a round reads
     /// the blocks it was asked for, and they are the day's own rather than the index's. The number this
     /// replaces was index slots walked, which nothing bounded.

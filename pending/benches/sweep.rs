@@ -227,7 +227,7 @@ fn empty_one_day_timed(
     while day.rounds < 1_000_000 {
         voids.clear();
         let started = Instant::now();
-        engine.expiring(black_box(blocks), voids);
+        engine.propose_expiry(black_box(blocks), voids);
         let elapsed = started.elapsed();
         day.rounds += 1;
         day.voids += voids.len() as u64;
