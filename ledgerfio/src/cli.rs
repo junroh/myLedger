@@ -40,9 +40,9 @@ pub struct Options {
     /// first day's records sit in the segment that day owns, and nothing about them expires until the
     /// lifetime they were promised has run out.
     pub expiry_days: u64,
-    /// Expiry voids the engine offers per sweep round. The slice `docs/status.md` says is a constant where
-    /// it should be a policy, exposed so a run can say what each value costs.
-    pub expiry_per_round: usize,
+    /// Blocks of an expiring day the engine reads per sweep round — the slice that paces expiry, exposed
+    /// so a run can say what each value costs.
+    pub expiry_blocks_per_round: usize,
     /// Length of the measured phase. Funding the accounts happens first and is not measured.
     pub duration: Duration,
     /// Target submissions per second, or 0 to submit as fast as the ledger accepts. Use a rate
@@ -119,7 +119,7 @@ impl Default for Options {
             expiry_days: 0,
             // The engine's own, not a second copy of it: what a round offers is its policy, and this tool
             // only asks for a different value.
-            expiry_per_round: MemoryPendingConfig::default().expiry_per_round,
+            expiry_blocks_per_round: MemoryPendingConfig::default().expiry_blocks_per_round,
             duration: Duration::from_secs(3),
             rate: 0,
             in_flight: 20_000,
@@ -255,7 +255,9 @@ impl Cli {
             "residency" => options.capacity.residency_hours = Self::count(value)?,
             "index-budget" => options.index_budget = Self::count(value)?,
             "expiry-days" => options.expiry_days = Self::count(value)?,
-            "expiry-per-round" => options.expiry_per_round = (Self::count(value)? as usize).max(1),
+            "expiry-blocks" => {
+                options.expiry_blocks_per_round = (Self::count(value)? as usize).max(1)
+            }
             "duration" => options.duration = Self::duration(value)?,
             "rate" => options.rate = Self::count(value)?,
             "in-flight" => options.in_flight = Self::count(value)?,

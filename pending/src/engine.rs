@@ -28,14 +28,11 @@ pub struct PendingEngine {
     /// every call, because it is what decides whether the sweep's day has run out yet.
     lifetime_days: u64,
     sweep: Sweep,
-    /// Reused by every sweep round, so expiry allocates nothing however often it is asked.
-    expiring: Vec<BlockAddr>,
-    /// Index slots the sweep has walked. Counted because it is the sweep's real cost and the only one
-    /// nothing bounds: a round stops once it has collected `want` voids, so a segment with few survivors
-    /// left walks whatever it takes to find them — up to the whole table — and does it on this thread,
-    /// ahead of the commands being drained. A tail that moves when the sweep runs cannot be explained
-    /// without this number.
-    swept_slots: u64,
+    /// Blocks of expiring days the sweep has read. The sweep's whole cost, and now a bounded one: a round
+    /// reads as many blocks as it was asked for, and the records in them are that day's own. Counted so a
+    /// run can say what expiry cost it rather than inferring it — the number this replaces was index slots
+    /// walked, which nothing bounded.
+    swept_blocks: u64,
     overflowed: u64,
     /// Committed decisions applied, counted so an answer can say which of them it reflects. The
     /// sequencer knows how many it had sent when it asked, and an answer from before one of them is a
@@ -65,28 +62,27 @@ pub enum Started {
 /// again, which costs a walk and loses nothing — the index is the authority on what survived.
 ///
 /// One cursor, not one per day. The oldest day that is not finished is the only one worked on, and it is
-/// finished when a whole pass over the index finds nothing pointing into it — which is the same moment its
-/// blocks can be handed back. Days therefore cannot be skipped: an earlier version restarted the walk at
-/// whatever had just expired, so a day still being walked when the next arrived was abandoned and its holds
-/// were never released at all. Falling behind here is late, which costs space rather than correctness.
+/// finished when the index has no entries left in it — which is the same moment its blocks can be handed
+/// back. Days therefore cannot be skipped: an earlier version restarted the walk at whatever had just
+/// expired, so a day still being walked when the next arrived was abandoned and its holds were never
+/// released at all. Falling behind here is late, which costs space rather than correctness.
 #[derive(Debug, Clone, Copy, Default)]
 struct Sweep {
     /// The oldest day whose holds are not all released and whose blocks are not handed back. `None` until
     /// the engine has been told what day it is: a fresh one has no history, and a cursor starting at day
     /// zero would walk days that predate it — and step over the day its own records are in on the way.
     day: Option<u64>,
-    /// Slots already walked in this pass, so a round is bounded and the next resumes rather than
-    /// restarting.
-    at: usize,
-    /// Whether this pass has found anything still pointing into the day. A pass that finds nothing is what
-    /// says the day is empty.
-    found: bool,
-    /// Live index entries as of a pass that ended with holds still in the day. While that number has not
+    /// Which of the expiring day's blocks the walk has reached. Blocks of that day, not slots of the index:
+    /// a day's survivors are recorded in its own blocks, so the walk costs what that day wrote instead of
+    /// what every day did. The index scan this replaces cost 2.2 seconds a pass at the design's table, on
+    /// this same thread, ahead of the lookups it would otherwise be answering.
+    at_block: u64,
+    /// Entries left in the day when the walk last reached the end of its blocks. While that number has not
     /// moved, nothing has been released, so walking again would offer the same voids a second time — and
     /// each of those takes a slot and a lane place for the judge to refuse, which at a small index outruns
-    /// the commits and fills the pool with work that cannot succeed. So the sweep waits for the index to
-    /// move rather than spinning against it.
-    waiting_at: Option<usize>,
+    /// the commits and fills the pool with work that cannot succeed. So the sweep waits for the day to
+    /// empty a little rather than spinning against it.
+    waiting_at: Option<u32>,
 }
 
 /// A hold the index could not take, on its way out of the engine. Named rather than returned as a bare
@@ -371,7 +367,7 @@ impl PendingEngine {
             overflowed: self.overflowed,
             segment: self.records.segment(),
             days_behind: self.days_behind(),
-            swept_slots: self.swept_slots,
+            swept_blocks: self.swept_blocks,
             ..self.records.traffic()
         }
     }
@@ -458,42 +454,48 @@ impl PendingEngine {
         true
     }
 
-    /// The next holds whose retention has run out, as the resolutions that release them. Bounded per call,
-    /// so a day's expiry is spread over the day rather than arriving as one burst — falling behind deletes
-    /// late, which is safe, so this is a capacity dial and not a correctness one.
+    /// The next holds whose retention has run out, as the resolutions that release them. Bounded per call
+    /// by blocks of the expiring day, so a day's expiry is spread over the day rather than arriving as one
+    /// burst — falling behind deletes late, which is safe, so this is a capacity dial and not a correctness
+    /// one.
     ///
-    /// The survivors identify themselves: a record is alive exactly when the index points at it, so
-    /// scanning the index for addresses in the expiring segment finds them without reading a single dead
-    /// record. What the index cannot give is the key — a slot holds a fingerprint — so the records these
-    /// addresses name are read, which is needed anyway to name the two accounts the void moves between.
+    /// **Blocks of the day, not slots of the index.** Both find the same survivors and both are exact: a
+    /// record is alive exactly when the index points at it, so the walk needs no other bookkeeping either
+    /// way. What differs is what a round costs. Searching the index for addresses in the segment bounded
+    /// the voids *collected* and not the slots *visited*, and a day thinning towards empty runs out of
+    /// voids long before it runs out of table — so the last rounds of every day walked all of it, 2.2
+    /// seconds at the design's size, on this thread, ahead of the lookups waiting behind it. A day's own
+    /// blocks are what that day wrote: bounded by declaration, and read sequentially.
     ///
-    /// A pass that goes all the way round finding nothing is what says the day is done: nothing points into
-    /// it, so its holds are all released and its blocks can be handed back. Until then the pass starts over,
-    /// which re-offers voids still in flight — harmless, because their ids are derived from the holds and
-    /// the judge refuses a second resolution of one already taken.
-    pub fn expiring(&mut self, want: usize, into: &mut Vec<Transfer>) {
+    /// **The day is done when the index has nothing left in it**, which `live_in_segment` answers in
+    /// constant time. That is what the whole-index pass was being used to find out, and it is the reason
+    /// the count exists.
+    pub fn expiring(&mut self, blocks: usize, into: &mut Vec<Transfer>) {
         let Some(segment) = self.expiring_segment() else {
             return;
         };
-        // The last pass left holds behind and nothing has been released since. Offering them again would be
-        // the same voids for the judge to refuse a second time.
-        if self.sweep.waiting_at == Some(self.index.live()) {
+        let left = self.index.live_in_segment(segment);
+        if left == 0 {
+            // Nothing points into the day, which is the one moment its blocks are known to be dead.
+            // Handing them back is the only place the store shrinks.
+            self.records.free_segment(segment);
+            self.sweep = Sweep {
+                day: self.sweep.day.map(|day| day + 1),
+                at_block: 0,
+                waiting_at: None,
+            };
             return;
         }
-        self.expiring.clear();
-        let mut addrs = std::mem::take(&mut self.expiring);
-        let from = self.sweep.at;
-        self.sweep.at = self
-            .index
-            .addresses_in_segment(segment, from, want, &mut addrs);
-        self.swept_slots += (self.sweep.at - from) as u64;
-        self.sweep.found |= !addrs.is_empty();
-        for &addr in &addrs {
-            // Read through to the store rather than only from memory: a record the sweep declined to read
-            // is a hold it never expires, and its pending column would stay reserved for good.
-            let Some((key, hold)) = self.records.read_background(addr) else {
-                continue;
-            };
+        // The last walk left holds behind and nothing has been released since. Offering them again would be
+        // the same voids for the judge to refuse a second time.
+        if self.sweep.waiting_at == Some(left) {
+            return;
+        }
+        let index = &self.index;
+        let mut visit = |key: TxId, hold: HoldData, addr: BlockAddr| {
+            if !index.points_at(key, addr) {
+                return;
+            }
             into.push(Transfer {
                 id: TxId::ledger_resolution_of(key),
                 pending_ref: key,
@@ -505,31 +507,22 @@ impl PendingEngine {
                 ledger: hold.ledger,
                 flags: TransferFlags::VOID_PENDING,
             });
-        }
-        self.expiring = addrs;
-        if self.sweep.at < self.index.slots() {
-            return;
-        }
-        if self.sweep.found {
-            // Something is still there: those voids are in flight, or the judge refused them. Wait for the
-            // index to move before walking again — the day stays open, which is late rather than wrong.
-            self.sweep = Sweep {
-                day: self.sweep.day,
-                at: 0,
-                found: false,
-                waiting_at: Some(self.index.live()),
-            };
-            return;
-        }
-        // A whole pass found nothing pointing into the day, which is the one moment its blocks are known
-        // to be dead. Handing them back is the only place the store shrinks.
-        self.records.free_segment(segment);
-        self.sweep = Sweep {
-            day: self.sweep.day.map(|day| day + 1),
-            at: 0,
-            found: false,
-            waiting_at: None,
         };
+        for _ in 0..blocks.max(1) {
+            if !self
+                .records
+                .each_record_in_day(segment, self.sweep.at_block, &mut visit)
+            {
+                // The end of the day's blocks with holds still in it: those voids are in flight, or the
+                // judge refused them. Wait for the day to empty a little before walking again — it stays
+                // open, which is late rather than wrong.
+                self.sweep.at_block = 0;
+                self.sweep.waiting_at = Some(left);
+                return;
+            }
+            self.sweep.at_block += 1;
+            self.swept_blocks += 1;
+        }
     }
 
     /// The oldest day still waiting to be emptied, and how many such days there are. Days are finished
@@ -549,6 +542,17 @@ impl PendingEngine {
         self.behind().map(|(day, _)| (day % SEGMENTS) as u8)
     }
 
+    /// That the index's per-segment counts still add up to its entries. Constant time in the number of
+    /// segments, so it belongs with the per-round self-invariants rather than with `audit`.
+    ///
+    /// What it catches is a slot written somewhere other than `set_slot`. That does not lose money — the
+    /// slots themselves are right, only the summary is wrong — but it does mean a day that is empty is never
+    /// declared empty, so its blocks are never handed back and the store stops shrinking. Silent, and
+    /// visible only as capacity, which is exactly the kind of thing that goes unnoticed for a month.
+    pub fn counts_agree(&self) -> bool {
+        self.index.counts_agree()
+    }
+
     /// How many expired days are still waiting to be emptied. One is the ordinary state — the day that
     /// just ran out is being worked through. More than `grace_days` is the throttle behind by longer than
     /// the slack the index was sized with: `declared_maximum` assumes a hold leaves within
@@ -559,6 +563,12 @@ impl PendingEngine {
     }
 
     /// Whether a day is still waiting to be emptied at all.
+    /// Blocks of expiring days the sweep has read. Exported for this crate's own bench: what a day of
+    /// expiry costs can only be measured by driving the engine, and the walk it does is the whole cost.
+    pub fn swept_blocks(&self) -> u64 {
+        self.swept_blocks
+    }
+
     pub fn sweeping(&self) -> bool {
         self.days_behind() > 0
     }
@@ -1102,9 +1112,9 @@ mod expiry_tests {
         (engine, holds - holds % RECORDS_PER_BLOCK)
     }
 
-    fn offered(engine: &mut PendingEngine, want: usize) -> Vec<Transfer> {
+    fn offered(engine: &mut PendingEngine, blocks: usize) -> Vec<Transfer> {
         let mut voids = Vec::new();
-        engine.expiring(want, &mut voids);
+        engine.expiring(blocks, &mut voids);
         voids
     }
 
@@ -1123,12 +1133,18 @@ mod expiry_tests {
 
     /// Offers and commits until the day is done, answering how many holds were released and in how many
     /// rounds. Bounded, so a sweep that never converged fails rather than hanging.
-    fn empty_the_day(engine: &mut PendingEngine, per_round: usize) -> (usize, usize) {
+    fn empty_the_day(engine: &mut PendingEngine, blocks_per_round: usize) -> (usize, usize) {
         let mut released = 0;
         let mut rounds = 0;
         while engine.sweeping() {
-            let voids = offered(engine, per_round);
-            assert!(voids.len() <= per_round, "a round offered more than asked");
+            let voids = offered(engine, blocks_per_round);
+            // Blocks bound the work and the voids both: a round reads the blocks it was asked for and every
+            // void it offers came out of one of them. That is the property the bound being on blocks buys —
+            // a bound on voids alone said nothing about how much was read to find them.
+            assert!(
+                voids.len() <= blocks_per_round * RECORDS_PER_BLOCK,
+                "a round offered more voids than the blocks it read could hold"
+            );
             commit(engine, &voids);
             released += voids.len();
             rounds += 1;
@@ -1222,16 +1238,19 @@ mod expiry_tests {
     /// A day's holds are offered a bounded number at a time and the sweep resumes where it stopped, so a
     /// day's expiry spreads over the day instead of arriving as one burst. Falling behind releases late,
     /// which is safe — so this is a capacity dial and not a correctness one.
+    ///
+    /// The bound is blocks of the day, and that is the half worth testing: a bound on voids collected left
+    /// the work to find them unbounded, which is how a round came to walk the whole index.
     #[test]
     fn a_days_holds_are_released_a_bounded_number_at_a_time() {
         let (mut engine, written) = written_on_day_zero();
         engine.open_day(LIFETIME, LIFETIME);
 
-        let per_round = 8;
-        let (released, rounds) = empty_the_day(&mut engine, per_round);
+        let blocks_per_round = 1;
+        let (released, rounds) = empty_the_day(&mut engine, blocks_per_round);
         assert_eq!(released, written, "the sweep lost holds along the way");
         assert!(
-            rounds > written / per_round,
+            rounds > written / (blocks_per_round * RECORDS_PER_BLOCK),
             "the day came in too few rounds"
         );
     }

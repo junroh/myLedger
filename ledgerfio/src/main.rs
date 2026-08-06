@@ -223,9 +223,11 @@ fn print_help() {
         "                              retention+grace to reach the expiry of this run's own holds"
     );
     println!(
-        "  --expiry-per-round <n>      (64) voids one sweep round offers. Bounds what it collects, not"
+        "  --expiry-blocks <n>         (2) blocks of an expiring day one sweep round reads. Bounds the"
     );
-    println!("                              the slots it walks: see the sweep line in the report");
+    println!(
+        "                              work and the voids both, at 51 records a block: see `sweep`"
+    );
     println!();
     println!("measuring:");
     println!("  --sweep <knob=v1,v2>        run once per value and print one row each");

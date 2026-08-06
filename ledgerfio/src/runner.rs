@@ -127,7 +127,7 @@ impl Runner {
                 },
                 capacity: options.capacity,
                 index_budget_bytes: options.index_budget as usize,
-                expiry_per_round: options.expiry_per_round,
+                expiry_blocks_per_round: options.expiry_blocks_per_round,
                 ..MemoryPendingConfig::default()
             },
             calendar.source(),

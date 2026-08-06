@@ -54,7 +54,7 @@ pub struct Timings {
     /// Days a record lives: the promise plus the grace that keeps deletion from being early.
     pub lifetime_days: u64,
     /// Expiry voids offered per step, so a day's worth spreads out instead of arriving as one burst.
-    pub expiry_per_round: usize,
+    pub expiry_blocks_per_round: usize,
 }
 
 /// What misbehaves, and by how much. Every one of these is off in `capacity`, whose question is what
@@ -118,7 +118,7 @@ impl Timings {
                 (40 + pick(120)) * step_nanos
             },
             lifetime_days: 1 + pick(3),
-            expiry_per_round: 1 + pick(8) as usize,
+            expiry_blocks_per_round: 1 + pick(8) as usize,
         }
     }
 }
@@ -142,7 +142,7 @@ impl From<&crate::sim::Plan> for Timings {
             // question: whether the throttle keeps up while clients are being served.
             day_nanos: plan.day_nanos,
             lifetime_days: plan.lifetime_days.max(1),
-            expiry_per_round: plan.expiry_per_round,
+            expiry_blocks_per_round: plan.expiry_blocks_per_round,
         }
     }
 }
@@ -330,15 +330,24 @@ impl PendingFake {
     }
 
     /// Offers the next slice of whatever ran out, as the voids that release it. Bounded per call for the
-    /// same reason the real worker bounds it: a day's expiry must not arrive as one burst.
-    pub fn sweep_expiry(&self, per_round: usize) {
+    /// same reason the real worker bounds it: a day's expiry must not arrive as one burst — in blocks of the
+    /// expiring day, which is what bounds the work as well as the voids.
+    pub fn sweep_expiry(&self, blocks_per_round: usize) {
         let mut state = self.0.borrow_mut();
+        // The engine's own numbers, every round, the way `PendingWorker` checks them (rule 6). Asserted
+        // here as well and not only there because this is the loop the fault seeds drive: the simulator
+        // works the engine directly and never runs the worker, so an invariant living only in the worker is
+        // one no seed would ever reach.
+        debug_assert!(
+            state.store.counts_agree(),
+            "the index's per-segment counts no longer add up to its entries"
+        );
         if !state.store.sweeping() || !state.notices.is_empty() {
             return;
         }
         let mut found = std::mem::take(&mut state.expiring);
         found.clear();
-        state.store.expiring(per_round, &mut found);
+        state.store.expiring(blocks_per_round, &mut found);
         state.expiries_offered += found.len() as u64;
         for void in &found {
             state

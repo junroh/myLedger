@@ -23,6 +23,11 @@ const INDEX_BITS: u32 = 6;
 /// fingerprint is shared, so an address has forty-seven. Four kilobytes times two to the thirty-five is
 /// a hundred and thirty-seven terabytes, against the one the design sizes.
 const BLOCK_BITS: u32 = 35;
+/// Width of the segment field, and so how many values it can take. Exported because a per-segment array
+/// is sized from it — the index keeps one live count per segment — and a length written beside the field
+/// rather than derived from it is a length that can disagree with it.
+pub const SEGMENT_BITS: u32 = 6;
+pub const SEGMENT_VALUES: usize = 1 << SEGMENT_BITS;
 const INDEX_MASK: u64 = (1 << INDEX_BITS) - 1;
 const BLOCK_MASK: u64 = (1 << BLOCK_BITS) - 1;
 
@@ -201,7 +206,7 @@ impl BlockStore for MemBlockStore {
 /// waiting to be flushed. Segments are days and thirty-four are ever live, so the top of the six-bit
 /// field is free for this — and making the two forms distinguishable is what lets the buffer hand out
 /// addresses before it knows where a record will end up.
-pub const BUFFER_SEGMENT: u8 = (1 << 6) - 1;
+pub const BUFFER_SEGMENT: u8 = (SEGMENT_VALUES - 1) as u8;
 
 /// Segments a stored record can be in: every value of the six-bit field but the one above. A segment is
 /// a day and its number is the day modulo this, so it is also the ceiling on how many days of records can
@@ -216,6 +221,31 @@ impl BlockAddr {
 
     pub const fn is_buffered(self) -> bool {
         self.segment() == BUFFER_SEGMENT
+    }
+}
+
+/// The blocks one day wrote: where its first went and how many followed. Empty until the day seals its
+/// first block, which is also the state a freed day goes back to.
+///
+/// A range rather than a list of block numbers, and that is a property of the format rather than a
+/// convenience: block numbers count on across day boundaries and a day's records are sealed while that day
+/// is the open one, so a day's blocks are consecutive by construction.
+#[derive(Debug, Clone, Copy, Default)]
+struct BlockRange {
+    first: u64,
+    blocks: u64,
+}
+
+impl BlockRange {
+    fn note(&mut self, block: u64) {
+        if self.blocks == 0 {
+            self.first = block;
+        }
+        self.blocks += 1;
+    }
+
+    fn block_at(&self, at: u64) -> Option<u64> {
+        (at < self.blocks).then_some(self.first + at)
     }
 }
 
@@ -370,6 +400,10 @@ pub struct RecordLog {
     /// it makes the steady state — drop one, seal one — allocate nothing.
     spare: Vec<Filling>,
     segment: u8,
+    /// The blocks each day wrote, so expiry can read a day's own records instead of searching the index
+    /// for them. Block numbers count on across day boundaries, so a day owns a contiguous range and two
+    /// numbers describe it — which is the property that makes this a pair of counters rather than a list.
+    days: [BlockRange; SEGMENT_VALUES],
     next_block: u64,
     /// Read into, so a lookup allocates nothing.
     scratch: Vec<u8>,
@@ -421,6 +455,7 @@ impl RecordLog {
             resident_blocks,
             spare: Vec::new(),
             segment: 0,
+            days: [BlockRange::default(); SEGMENT_VALUES],
             next_block: 0,
             scratch: vec![0; BLOCK_BYTES],
             fetching: FxHashMap::default(),
@@ -474,7 +509,50 @@ impl RecordLog {
     pub fn free_segment(&mut self, segment: u8) -> usize {
         let freed = self.store.free_segment(segment);
         self.freed += freed as u64;
+        self.days[segment as usize] = BlockRange::default();
         freed
+    }
+
+    /// Every record of one of a day's blocks, by position within the day. `false` means the day has no
+    /// block there, which is how a walk knows it has reached the end.
+    ///
+    /// One store read for the whole block, and it does not try memory first. A day being expired is
+    /// `retention + grace` days old and a configuration is refused unless residency is shorter than that,
+    /// so its blocks left memory long ago — the same reason `free_segment` does not touch residency. Asking
+    /// memory would be a test whose answer is always no.
+    ///
+    /// A closure rather than an iterator because the block is decoded out of the log's own scratch buffer,
+    /// so nothing is allocated per record or per block. The address goes with each record because that is
+    /// what the caller checks the index against — a record is alive exactly when the index still points at
+    /// it, which is the same test compaction makes.
+    pub fn each_record_in_day(
+        &mut self,
+        segment: u8,
+        at: u64,
+        visit: &mut dyn FnMut(TxId, HoldData, BlockAddr),
+    ) -> bool {
+        let Some(block) = self.days[segment as usize].block_at(at) else {
+            return false;
+        };
+        if !self
+            .store
+            .read(BlockAddr::new(segment, block, 0), &mut self.scratch)
+        {
+            // The range says this block was written, so the store not having it is this node's own
+            // bookkeeping disagreeing with itself. Nothing here can repair it; the walk goes on and the
+            // day's count is what refuses to reach zero.
+            return true;
+        }
+        self.store_reads += 1;
+        for index in 0..RECORDS_PER_BLOCK {
+            let addr = BlockAddr::new(segment, block, index as u8);
+            let from = index * RECORD_BYTES;
+            let (key, hold) = decode(&self.scratch[from..from + RECORD_BYTES], addr);
+            if key != TxId::ABSENT {
+                visit(key, hold, addr);
+            }
+        }
+        true
     }
 
     /// Moves to a new day. The open store block is sealed first: it was promised addresses in the old
@@ -564,20 +642,6 @@ impl RecordLog {
         self.read_from_store(addr)
     }
 
-    /// The same, for the expiry sweep. Separate only so the read is not counted against the apply path:
-    /// that counter is the one a read cache would remove, and the sweep is not on it.
-    ///
-    /// Synchronous, which the sweep can afford and apply cannot for a different reason — it is background
-    /// work, bounded per round, and a record it declined to read would be one it never expired, leaving a
-    /// pending column reserved for good. Against a real device this should submit and harvest like a lookup
-    /// does; with the store in memory it is a move, and the bound is what keeps it honest.
-    pub fn read_background(&mut self, addr: BlockAddr) -> Option<(TxId, HoldData)> {
-        if let Some(found) = self.try_read(addr) {
-            return Some(found);
-        }
-        self.read_from_store(addr)
-    }
-
     fn read_from_store(&mut self, addr: BlockAddr) -> Option<(TxId, HoldData)> {
         self.store_reads += 1;
         if !self.store.read(addr, &mut self.scratch) {
@@ -655,6 +719,7 @@ impl RecordLog {
     fn seal_store_block(&mut self) {
         let addr = BlockAddr::new(self.segment, self.next_block, 0);
         self.store.write(addr, &self.store_open.bytes);
+        self.days[self.segment as usize].note(self.next_block);
         let fresh = self.spare.pop().unwrap_or_else(Filling::new);
         let sealed = std::mem::replace(&mut self.store_open, fresh);
         self.resident.push_back(sealed);
@@ -708,10 +773,10 @@ pub struct LogTraffic {
     /// so this is where "deleting late is safe" stops being true, and a run has to be able to see it.
     pub segment: u8,
     pub days_behind: u64,
-    /// Index slots the expiry sweep has walked. The one cost in the engine that no bound applies to — a
-    /// round is bounded by the voids it collects, not by the slots it visits — so a run that cannot see it
-    /// cannot say why its tail moved when the sweep ran.
-    pub swept_slots: u64,
+    /// Blocks of expiring days the sweep has read. The sweep's whole cost, and a bounded one: a round reads
+    /// the blocks it was asked for, and they are the day's own rather than the index's. The number this
+    /// replaces was index slots walked, which nothing bounded.
+    pub swept_blocks: u64,
 }
 
 #[cfg(test)]

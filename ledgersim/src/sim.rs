@@ -256,7 +256,7 @@ pub struct Plan {
     /// a default rather than a fact so that question can actually be asked.
     pub day_nanos: u64,
     pub lifetime_days: u64,
-    pub expiry_per_round: usize,
+    pub expiry_blocks_per_round: usize,
 }
 
 impl Plan {
@@ -480,7 +480,7 @@ struct Sim {
     day_nanos: u64,
     day: u64,
     lifetime_days: u64,
-    expiry_per_round: usize,
+    expiry_blocks_per_round: usize,
     /// The furthest behind the expiry sweep ever fell, in days. Watched every step rather than read at
     /// the end, because it is a level: a sweep five days behind halfway through and caught up by the last
     /// step is the run that matters, and the final reading calls it zero.
@@ -824,7 +824,7 @@ impl Sim {
             day_nanos: timings.day_nanos,
             day: 0,
             lifetime_days: timings.lifetime_days,
-            expiry_per_round: timings.expiry_per_round,
+            expiry_blocks_per_round: timings.expiry_blocks_per_round,
             days_behind_worst: 0,
             unsent: VecDeque::new(),
             now: 0,
@@ -946,7 +946,7 @@ impl Sim {
             self.day = day;
             self.pending.open_day(day, self.lifetime_days);
         }
-        self.pending.sweep_expiry(self.expiry_per_round);
+        self.pending.sweep_expiry(self.expiry_blocks_per_round);
         self.days_behind_worst = self.days_behind_worst.max(self.pending.days_behind());
     }
 

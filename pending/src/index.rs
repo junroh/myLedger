@@ -2,7 +2,7 @@ use std::hash::BuildHasher;
 
 use ledger_base::{FxBuildHasher, LineFit, Prng, TxId};
 
-use crate::block::BlockAddr;
+use crate::block::{BlockAddr, SEGMENT_VALUES};
 
 /// Slots per bucket. Four ways over two candidate buckets is what makes a load factor near one
 /// reachable while a probe stays inside two buckets — a generic hash table reaches the same average
@@ -131,6 +131,17 @@ pub struct HoldTable {
     buckets: Vec<Bucket>,
     mask: u64,
     live: usize,
+    /// Live entries per segment, which is per day. Expiry asks one question of the index — is this day
+    /// empty yet — and this answers it in constant time; the alternative was a pass over every slot, which
+    /// at the design's table is 2.2 seconds on the engine's own thread. The design calls this the day
+    /// wheel's counts, and this is them: 64 numbers, one per value of the address's segment field, the
+    /// writeback buffer's included.
+    ///
+    /// Maintained in `set_slot` alone. Four public methods move an address into or out of a slot and the
+    /// kick cascade moves them between slots; a count kept at each of those sites would be four chances to
+    /// forget, and forgetting means a day that is empty is never declared empty — its blocks are never
+    /// handed back. So there is one write point and this derives from it (rule 18).
+    live_per_segment: [u32; SEGMENT_VALUES],
     /// Which way a full bucket gives up. A fixed seed, because a table that evicted differently
     /// between two runs could not be compared with itself — the same reason the hasher is unseeded.
     victims: Prng,
@@ -166,6 +177,7 @@ impl HoldTable {
             buckets: vec![Bucket::default(); buckets],
             mask: buckets as u64 - 1,
             live: 0,
+            live_per_segment: [0; SEGMENT_VALUES],
             victims: Prng::new(0x9E37_79B9),
             max_hops: max_hops.max(1),
             hops: 0,
@@ -195,43 +207,36 @@ impl HoldTable {
     /// that decided a record was alive and then lost the race — nothing here can repair that, so it is
     /// counted rather than guessed at.
     pub fn replace(&mut self, key: TxId, old: BlockAddr, new: BlockAddr) -> bool {
-        let Some((bucket, way)) = self.slot_at(key, old) else {
+        let Some(at) = self.slot_at(key, old) else {
             return false;
         };
-        let slot = self.buckets[bucket].slots[way];
-        self.buckets[bucket].slots[way] = pack(fingerprint_of(slot), new) | (slot & AMBIGUOUS);
+        let slot = self.slot_word(at);
+        self.set_slot(at, pack(fingerprint_of(slot), new) | (slot & AMBIGUOUS));
         true
     }
 
-    /// Addresses in a segment, resumed from `from` and stopping once `want` of them are found or the
-    /// table runs out. Answers where scanning got to, so a sweep is bounded per round and never walks the
-    /// whole table at once — the table is tens of millions of slots and expiry is background work.
+    /// Entries still pointing into a segment, which is a day. Expiry's one question, answered in constant
+    /// time: zero means the day's records are all dead and its blocks can be handed back.
     ///
-    /// This is the same principle compaction rests on: a record is alive exactly when the index points at
-    /// it, so the survivors of an expiring day identify themselves and the dead are never touched. What it
-    /// cannot give is the keys — a slot holds a fingerprint, not a key — so the caller reads the records
-    /// these addresses name, which it needs anyway to build the resolution.
-    pub fn addresses_in_segment(
-        &self,
-        segment: u8,
-        from: usize,
-        want: usize,
-        into: &mut Vec<BlockAddr>,
-    ) -> usize {
-        let slots = self.buckets.len() * WAYS;
-        let mut at = from;
-        while at < slots && into.len() < want {
-            let slot = self.buckets[at / WAYS].slots[at % WAYS];
-            at += 1;
-            if slot == EMPTY {
-                continue;
-            }
-            let addr = address_of(slot);
-            if addr.segment() == segment {
-                into.push(addr);
-            }
-        }
-        at
+    /// It replaces a pass over every slot. Both answer the same question and both are exact, so the choice
+    /// was never about correctness — a pass costs 2.2 seconds at the design's table and runs on the thread
+    /// that answers lookups, which is three orders past the speed contract. What a pass also gave was the
+    /// *addresses* of the survivors; those now come from the day's own blocks, which is a walk over the
+    /// records of one day instead of over the slots of every day.
+    pub fn live_in_segment(&self, segment: u8) -> u32 {
+        self.live_per_segment[segment as usize]
+    }
+
+    /// That the counts add up to the entries. Constant time in the number of segments and independent of
+    /// the table's size, so it belongs with the per-tick self-invariants rather than with `audit`: what it
+    /// catches is a slot written somewhere other than `set_slot`, and the cost of missing that is a day
+    /// whose blocks are never freed.
+    pub fn counts_agree(&self) -> bool {
+        self.live_per_segment
+            .iter()
+            .map(|&at| at as usize)
+            .sum::<usize>()
+            == self.live
     }
 
     fn slot_at(&self, key: TxId, addr: BlockAddr) -> Option<(usize, usize)> {
@@ -257,8 +262,8 @@ impl HoldTable {
         if !clashes.is_empty() {
             slot |= AMBIGUOUS;
             for at in 0..clashes.len() {
-                let (bucket, way) = clashes.slot(at);
-                self.buckets[bucket].slots[way] |= AMBIGUOUS;
+                let at = clashes.slot(at);
+                self.set_slot(at, self.slot_word(at) | AMBIGUOUS);
             }
             self.ambiguous += 1;
         }
@@ -282,11 +287,11 @@ impl HoldTable {
         addr: BlockAddr,
         verify: &mut dyn FnMut(BlockAddr) -> bool,
     ) -> bool {
-        let Some((bucket, way)) = self.resolve(key, verify) else {
+        let Some(at) = self.resolve(key, verify) else {
             return false;
         };
-        let slot = self.buckets[bucket].slots[way];
-        self.buckets[bucket].slots[way] = pack(fingerprint_of(slot), addr) | (slot & AMBIGUOUS);
+        let slot = self.slot_word(at);
+        self.set_slot(at, pack(fingerprint_of(slot), addr) | (slot & AMBIGUOUS));
         true
     }
 
@@ -319,11 +324,10 @@ impl HoldTable {
         key: TxId,
         verify: &mut dyn FnMut(BlockAddr) -> bool,
     ) -> Option<BlockAddr> {
-        let (bucket, way) = self.resolve(key, verify)?;
-        let slot = self.buckets[bucket].slots[way];
-        self.buckets[bucket].slots[way] = EMPTY;
+        let at = self.resolve(key, verify)?;
+        let cleared = self.set_slot(at, EMPTY);
         self.live -= 1;
-        Some(address_of(slot))
+        Some(address_of(cleared))
     }
 
     /// Entries the table is holding. `live` rather than `len` because that is what the number is called
@@ -401,6 +405,25 @@ impl HoldTable {
         self.buckets[bucket].slots[way]
     }
 
+    /// The one place a slot is written, so the per-segment counts cannot drift from the slots they count.
+    /// Answers what was there, because two callers need it: a cascade carries the displaced entry on, and
+    /// a removal reports the address it cleared.
+    ///
+    /// Marking a slot ambiguous goes through here too even though it moves no address. That is deliberate:
+    /// an exception for "this write does not change the count" is an exception someone has to be right
+    /// about, and being wrong about it is silent.
+    fn set_slot(&mut self, (bucket, way): (usize, usize), slot: Slot) -> Slot {
+        let previous = self.buckets[bucket].slots[way];
+        if previous != EMPTY {
+            self.live_per_segment[address_of(previous).segment() as usize] -= 1;
+        }
+        if slot != EMPTY {
+            self.live_per_segment[address_of(slot).segment() as usize] += 1;
+        }
+        self.buckets[bucket].slots[way] = slot;
+        previous
+    }
+
     /// `Err` carries the entry left without a home, which the caller has to place somewhere.
     fn place(&mut self, mut slot: Slot, home: usize, alternate: usize) -> Result<(), Slot> {
         if self.put(home, slot) || self.put(alternate, slot) {
@@ -410,7 +433,7 @@ impl HoldTable {
         let mut came_from = alternate;
         for hop in 1..=self.max_hops {
             let way = self.victim(bucket, came_from);
-            core::mem::swap(&mut slot, &mut self.buckets[bucket].slots[way]);
+            slot = self.set_slot((bucket, way), slot);
             came_from = bucket;
             bucket = self.alternate(bucket, fingerprint_of(slot));
             if self.put(bucket, slot) {
@@ -440,7 +463,7 @@ impl HoldTable {
     fn put(&mut self, bucket: usize, slot: Slot) -> bool {
         for way in 0..WAYS {
             if self.buckets[bucket].slots[way] == EMPTY {
-                self.buckets[bucket].slots[way] = slot;
+                self.set_slot((bucket, way), slot);
                 return true;
             }
         }

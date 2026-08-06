@@ -106,10 +106,10 @@ fn default_plan() -> Plan {
         resident_blocks: ledger_pending::DEFAULT_RESIDENT_BLOCKS,
         resolve_after: 0,
         // No day passes unless one is asked for, so a capacity number stays comparable with every one
-        // taken before expiry existed. `--day-ms` with `--expiry-per-round` is what turns the sweep on.
+        // taken before expiry existed. `--day-ms` with `--expiry-blocks` is what turns the sweep on.
         day_nanos: 0,
         lifetime_days: 1,
-        expiry_per_round: 0,
+        expiry_blocks_per_round: 0,
         // What share of resolutions the pending engine answers from memory. Declared: how many entries
         // that takes is that component's own question.
     }
@@ -163,7 +163,7 @@ fn apply(options: &mut Options, key: &str, value: &str) -> Result<(), String> {
         // the default; a short day is what lets a run of seconds cross a window measured in days.
         "day-ms" => plan.day_nanos = number(key, value)? * 1_000_000,
         "lifetime-days" => plan.lifetime_days = number(key, value)?.max(1),
-        "expiry-per-round" => plan.expiry_per_round = number(key, value)? as usize,
+        "expiry-blocks" => plan.expiry_blocks_per_round = number(key, value)? as usize,
         "slo-p999-us" => options.slo_nanos = Some(micros(value)?),
         other => return Err(format!("unknown option `--{other}`")),
     }
@@ -534,7 +534,7 @@ fn help() {
     println!("  --slo-p999-us <n>   the tail to hold; fails the run (exit 1) when it is worse");
     println!("  --day-ms <n>        how long a day is on the virtual clock; 0 passes none (0)");
     println!("  --lifetime-days <n> retention plus grace: how long a hold lives (1)");
-    println!("  --expiry-per-round <n>  voids the sweep may offer per round; 0 is off (0)");
+    println!("  --expiry-blocks <n>     blocks of an expiring day the sweep reads per round; 0 is off (0)");
     println!(
         "                      the last three put expiry against the traffic: how far the sweep \n\
          \x20                     falls behind is reported in days"
@@ -655,7 +655,7 @@ mod tests {
             // traffic that has nothing to do with what it is measuring.
             day_nanos: 0,
             lifetime_days: 1,
-            expiry_per_round: 0,
+            expiry_blocks_per_round: 0,
         };
         let faults = |violate| crate::fakes::Faults {
             violate_order_every: violate,
@@ -724,7 +724,7 @@ mod tests {
             raft_tail_nanos: 0,
             day_nanos: 0,
             lifetime_days: 1,
-            expiry_per_round: 0,
+            expiry_blocks_per_round: 0,
         };
         let faults = crate::fakes::Faults {
             reorder_every: 2,

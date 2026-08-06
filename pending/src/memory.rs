@@ -54,10 +54,16 @@ pub struct MemoryPendingConfig {
     /// The most the index may take. A configuration whose declared worst case needs more than this is
     /// refused at the start rather than discovered as an allocation nobody planned.
     pub index_budget_bytes: usize,
-    /// Expiry voids offered per round, so a day's worth spreads over the day instead of arriving as one
-    /// burst that competes with live traffic. Falling behind deletes late, which is safe, so this trades
-    /// promptness for headroom rather than correctness for speed.
-    pub expiry_per_round: usize,
+    /// Blocks of an expiring day the sweep reads per round, so a day's worth spreads over the day instead
+    /// of arriving as one burst that competes with live traffic. Falling behind deletes late, which is
+    /// safe, so this trades promptness for headroom rather than correctness for speed.
+    ///
+    /// Blocks rather than voids, and the unit is the point: a bound on voids collected is no bound on the
+    /// work done to collect them, which is how the index scan this replaced came to cost 2.2 seconds a pass
+    /// at the design's size. Blocks bound both — the voids one round can offer are at most this many times
+    /// `RECORDS_PER_BLOCK`, which is also what the notice queue has to absorb before the sweep is asked
+    /// again.
+    pub expiry_blocks_per_round: usize,
 }
 
 /// Where the engine gets the day retention is measured in.
@@ -276,7 +282,10 @@ impl Default for MemoryPendingConfig {
             eviction_per_round: 4096,
             capacity: PendingCapacity::default(),
             index_budget_bytes: 1 << 30,
-            expiry_per_round: 64,
+            // Two blocks, so a round offers at most a hundred-odd voids — about what the sixty-four of the
+            // scan it replaces did, and the notice queue is sized against that rather than against a
+            // number chosen for its own sake.
+            expiry_blocks_per_round: 2,
             store: StoreModel {
                 queue_depth: 128,
                 ..StoreModel::default()
@@ -331,7 +340,7 @@ struct TrafficGauge {
     overflowed: AtomicU64,
     segment: AtomicU64,
     days_behind: AtomicU64,
-    swept_slots: AtomicU64,
+    swept_blocks: AtomicU64,
 }
 
 impl TrafficGauge {
@@ -365,8 +374,8 @@ impl TrafficGauge {
             .store(u64::from(traffic.segment), Ordering::Relaxed);
         self.days_behind
             .store(traffic.days_behind, Ordering::Relaxed);
-        self.swept_slots
-            .store(traffic.swept_slots, Ordering::Relaxed);
+        self.swept_blocks
+            .store(traffic.swept_blocks, Ordering::Relaxed);
     }
 
     fn read(&self) -> LogTraffic {
@@ -388,7 +397,7 @@ impl TrafficGauge {
             overflowed: self.overflowed.load(Ordering::Relaxed),
             segment: self.segment.load(Ordering::Relaxed) as u8,
             days_behind: self.days_behind.load(Ordering::Relaxed),
-            swept_slots: self.swept_slots.load(Ordering::Relaxed),
+            swept_blocks: self.swept_blocks.load(Ordering::Relaxed),
         }
     }
 }
@@ -489,7 +498,7 @@ impl MemoryPending {
                 owed: VecDeque::new(),
                 expiring: Vec::new(),
                 lifetime_days: config.capacity.lifetime_days(),
-                expiry_per_round: config.expiry_per_round,
+                expiry_blocks_per_round: config.expiry_blocks_per_round,
                 days,
                 orderer: Orderer::new(config.violate_order_every),
                 stale_answer_every: config.stale_answer_every,
@@ -689,7 +698,7 @@ struct PendingWorker {
     /// How long a record may live and how many expiry voids one round may offer. The second is what
     /// keeps a day's expiry from arriving as a burst; falling behind deletes late, which is safe.
     lifetime_days: u64,
-    expiry_per_round: usize,
+    expiry_blocks_per_round: usize,
     days: DaySource,
     orderer: Orderer<PendingReply>,
     /// Claim to have applied less than it has, every nth answer. A fault: the data check on the reply is
@@ -723,6 +732,14 @@ impl PendingWorker {
             if progress {
                 self.publish();
             }
+            // The engine's own numbers, checked every round in constant time (rule 6). Drifted counts do
+            // not lose money — the slots are right and only their summary is wrong — so this asserts in a
+            // debug build and does nothing in a release one, where the consequence surfaces as
+            // `days_behind` climbing and then as an index that cannot take an insert.
+            debug_assert!(
+                self.store.counts_agree(),
+                "the index's per-segment counts no longer add up to its entries"
+            );
             backoff.record(progress);
         }
     }
@@ -765,7 +782,8 @@ impl PendingWorker {
         }
         self.expiring.clear();
         let mut found = std::mem::take(&mut self.expiring);
-        self.store.expiring(self.expiry_per_round, &mut found);
+        self.store
+            .expiring(self.expiry_blocks_per_round, &mut found);
         for void in &found {
             self.owed
                 .push_back(PendingNotice::HoldExpired { void: *void });

@@ -1059,20 +1059,46 @@ It has to be **wall** time, not the monotonic clock the rest of the engine runs 
 clock restarts at zero, and a promise in calendar terms has to outlive a restart. Read to the day, so
 drift of minutes changes nothing.
 
-**There is no timing wheel.** The trigger is a segment running out, which is an event the engine already
-processes, and only per-hold deadlines firing at arbitrary times would need one. Nothing can express a
-per-hold lifetime today — `Transfer` is sixty-four bytes and full, and a hold's `pending_ref` already
-means its budget group — so a wheel would be a structure for a feature that cannot be asked for (rule 4).
+**There is no timing wheel, and what stands in its place is one counter per day.** The engine's design has
+a hierarchical wheel — day, hour, minute, second, with only the imminent day loaded in detail — and its own
+lazy-load note is the reason this is not that: a wheel holding the holds would be 38GB at the design's 4.8
+billion, against the 2GB it budgets, so the wheel was never meant to hold them. What it holds is counts.
 
-### The survivors identify themselves, and the void is judged
+Here that is `HoldTable::live_per_segment`: sixty-four numbers, one per value of the address's segment
+field, maintained by the one method that writes a slot. Expiry asks the index exactly one question — *is
+this day empty yet* — and a count answers it in constant time. There are no hour, minute or second levels
+because nothing needs them: every hold in a day shares that day's deadline, since the deadline is computed
+from the segment (above). Per-hold deadlines firing at arbitrary times would need the rest of the wheel,
+and nothing can express a per-hold lifetime today — `Transfer` is sixty-four bytes and full, and a hold's
+`pending_ref` already means its budget group — so the other three levels are structure for a feature that
+cannot be asked for (rule 4).
 
-A day's records are found through the index, not the store: a record is alive exactly when the index
-points at it, which is the same sentence compaction rests on. So the dead are never read. What the index
-cannot give is the *key* — a slot holds a fingerprint — so the survivors' records are read, which the void
-needs anyway to name the two accounts it moves between. The read goes through to the store when residency
-has dropped the record, counted apart from the apply path's reads: the sweep can wait and apply cannot,
-and a record the sweep declined to read would be a hold it never expired and a pending column reserved for
-good.
+### The survivors are found in the day's own blocks, and the void is judged
+
+Two ways to find a day's survivors, both exact, because a record is alive exactly when the index points at
+it — the same sentence compaction rests on. The choice between them was never about correctness.
+
+**Searching the index** for addresses in the expiring segment reads no dead record at all, which is why it
+was the first answer. What it cannot do is bound a round. The bound was on the voids a round *collected*,
+and a day thinning towards empty runs out of voids long before it runs out of table — so the last rounds of
+every day scanned most of it, and the round that found the day empty scanned all of it. Measured: 0.42ns a
+slot, flat from 33MB to 2.1GB, which is **2.2 seconds** at the design's 5.33 billion slots. On the engine's
+own thread, ahead of the lookups queued behind it, against a 5ms speed contract. This is rule 20 — the real
+ceiling was the segment's density, which nobody declared and no build could check.
+
+**Reading the day's own blocks** is what replaced it. A day's survivors are recorded in that day's blocks,
+so the walk costs what that day wrote rather than what every day did, the reads are sequential, and a round
+is bounded by a declared number of blocks — which bounds the voids too, at `RECORDS_PER_BLOCK` each. It
+reads dead records, and that is the price: at a tenth of a day still alive it reads ten records per void.
+Measured, the worst round is tens of microseconds at any density and a design day's work is a few seconds
+spread across the day.
+
+The read goes to the store without trying memory first, and that is not an oversight: a day being expired
+is `retention + grace` days old and a configuration is refused unless residency is shorter than that, so
+its blocks left memory long ago. Asking memory would be a test whose answer is always no.
+
+The block range each day wrote is two numbers per segment, because block numbers count on across day
+boundaries and a day's blocks are consecutive by construction (§12). Nothing else had to be remembered.
 
 The void is then **judged like any other resolution, not applied**. It has to be: a settle the client
 submitted may be in flight for the same hold, and only the judge sees both. So it takes a slot, a place in
