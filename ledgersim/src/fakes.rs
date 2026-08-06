@@ -595,7 +595,7 @@ impl PendingOverlay for PendingFake {
     }
 }
 
-/// Dedup with a virtual delay. Verdicts are independent of each other, but replies still leave in
+/// Idem with a virtual delay. Verdicts are independent of each other, but replies still leave in
 /// each lane's order, like the real one.
 #[derive(Clone)]
 pub struct IdemFake(Rc<RefCell<IdemState>>);

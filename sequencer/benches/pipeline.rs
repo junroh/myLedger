@@ -9,7 +9,7 @@ use ledger_base::{
     Seq, Transfer, TransferFlags, TxId,
 };
 use ledger_benchkit::{BenchOptions, Samples, STRIDE};
-use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
+use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
 use ledger_pending::{MemoryPending, MemoryPendingConfig};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, LaneTable, Reactor, ReactorConfig, Transport};
@@ -54,7 +54,7 @@ impl PipelineBench {
                 ..Default::default()
             })
             .expect("a bench engine config"),
-            MemoryDedup::start(MemoryDedupConfig {
+            MemoryIdem::start(MemoryIdemConfig {
                 latency: LatencyRange::fixed(Duration::ZERO),
                 ..Default::default()
             }),
@@ -92,7 +92,7 @@ impl Driver {
 
     fn drive(
         &mut self,
-        reactor: &mut Reactor<MemoryAccounts, MemoryPending, MemoryDedup, EchoRaft>,
+        reactor: &mut Reactor<MemoryAccounts, MemoryPending, MemoryIdem, EchoRaft>,
         requests: u64,
         accounts: u64,
     ) {

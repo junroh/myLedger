@@ -1,3 +1,3 @@
 mod memory;
 
-pub use memory::{MemoryDedup, MemoryDedupConfig};
+pub use memory::{MemoryIdem, MemoryIdemConfig};

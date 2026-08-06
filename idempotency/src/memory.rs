@@ -10,14 +10,14 @@ use ledger_base::{
 use ledger_stubkit::{IdleBackoff, LaneOrderer, LatencyRange, WorkerThread};
 
 #[derive(Debug, Clone, Copy)]
-pub struct MemoryDedupConfig {
+pub struct MemoryIdemConfig {
     pub queue_capacity: usize,
     pub latency: LatencyRange,
     pub violate_order_every: u32,
     pub seed: u64,
 }
 
-impl Default for MemoryDedupConfig {
+impl Default for MemoryIdemConfig {
     fn default() -> Self {
         Self {
             queue_capacity: 8192,
@@ -28,10 +28,10 @@ impl Default for MemoryDedupConfig {
     }
 }
 
-/// In-memory dedup, run off the reactor core because each verdict is independent of every
+/// In-memory idem, run off the reactor core because each verdict is independent of every
 /// other. The rotating generations that expire the one-hour window are not built yet, so
 /// this map only grows.
-pub struct MemoryDedup {
+pub struct MemoryIdem {
     requests: Producer<IdemRequest>,
     results: Consumer<IdemReply>,
     /// What the map is holding, published by the worker because the map lives on its thread.
@@ -39,8 +39,8 @@ pub struct MemoryDedup {
     _thread: WorkerThread,
 }
 
-impl MemoryDedup {
-    pub fn start(config: MemoryDedupConfig) -> Self {
+impl MemoryIdem {
+    pub fn start(config: MemoryIdemConfig) -> Self {
         let (requests, request_rx) = channel(config.queue_capacity);
         let (result_tx, results) = channel(config.queue_capacity);
         let seen = Arc::new(MapGauge::default());
@@ -70,12 +70,12 @@ impl MemoryDedup {
     /// steady state, and sizing the real thing needs the expiry that does not exist yet.
     pub fn footprint(&self) -> Footprint {
         let mut footprint = Footprint::new();
-        footprint.gauged_table::<TxId, u64>("dedup keys", &self.seen);
+        footprint.gauged_table::<TxId, u64>("idem keys", &self.seen);
         footprint
     }
 }
 
-impl IdempotencyPort for MemoryDedup {
+impl IdempotencyPort for MemoryIdem {
     fn dispatch(&self, request: IdemRequest) -> Result<(), IdemRequest> {
         self.requests.push(request)
     }

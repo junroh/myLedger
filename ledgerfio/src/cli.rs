@@ -82,7 +82,7 @@ pub struct Options {
     /// Holds the engine's overlay may keep before idle ones are evicted. Small enough and a resolution
     /// has to ask the engine, which is the only way a run reaches the fetch path at all.
     pub overlay_limit: usize,
-    /// Simulated dedup latency. Every request pays it.
+    /// Simulated idem latency. Every request pays it.
     pub idem_latency: LatencyRange,
     /// Make the pending engine return every nth lane reply out of order, to prove the sequencer
     /// detects a contract-1 violation. 0 leaves it well behaved.

@@ -218,7 +218,7 @@ the place and hangs the lane instead of testing it. Trading means both replies s
 other's turn, and what the sequencer sees is an arrival out of order.
 
 It lives beside the engine rather than in `stubkit` because contract 1 is the engine's to keep.
-`stubkit`'s simpler queue stays for the dedup stand-in, which answers every command where it dequeues it
+`stubkit`'s simpler queue stays for the idem stand-in, which answers every command where it dequeues it
 and so never needs a place at all. And what remains of `MemoryPending`'s invented latency is now a test
 fault rather than a model: the index, the buffer and the block store do real work, so a delay on top of
 them would count the same time twice.
@@ -950,7 +950,7 @@ traffic, and this is what append-only means.
 
 **The space comes back only with segment expiry, and expiry is not built.** So the record blocks grow
 with holds *created*, not holds *alive* — a run that creates and resolves the same hold count over and
-over keeps every version. The load driver says so in the same breath as the dedup map and the log,
+over keeps every version. The load driver says so in the same breath as the idem map and the log,
 because a total that looks like a steady state and is not is worse than no total.
 
 **Growing the index reads the keys back.** A home bucket comes from the whole hash, so doubling the
@@ -1420,7 +1420,7 @@ expired, against one that never existed. It is refused, and not for cost.
 
 Answering "expired" means keeping something about that hold past its retention, and **a tombstone is
 exactly the data the promise says is deleted**. There is no way to infer it either: a `TxId` is
-client-chosen and carries no time, so an unknown id cannot be dated; the dedup map's window is an hour
+client-chosen and carries no time, so an unknown id cannot be dated; the idem map's window is an hour
 against thirty-two days; and the consensus log is compacted and not queryable by id. So the split cannot
 be built without breaking the promise it exists to serve.
 

@@ -229,7 +229,7 @@ fn bookkeeping_that_stops_adding_up_seals_the_apply_path() {
         },
         Forgetful(accounts),
         ledger_pending::MemoryPending::start(NoLatency::pending()).expect("a test engine config"),
-        ledger_idempotency::MemoryDedup::start(NoLatency::idem()),
+        ledger_idempotency::MemoryIdem::start(NoLatency::idem()),
         ledger_raft::EchoRaft::start(NoLatency::raft()),
     )
     .expect("config");

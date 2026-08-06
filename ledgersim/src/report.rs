@@ -254,7 +254,7 @@ fn sizing(plan: &Plan, prediction: &Prediction) {
     // Said in the output and not only in this function's doc: a total that silently leaves out the two
     // largest structures would be read as the whole answer.
     println!(
-        "                not sized here: the pending engine's store and the dedup map are stand-ins in \
+        "                not sized here: the pending engine's store and the idem map are stand-ins in \
          this tool, so their size would be a stand-in's — `ledgerfio` measures the real ones"
     );
     // Append-only, no snapshot or compaction in this design, so what was appended is what it holds.

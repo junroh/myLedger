@@ -173,11 +173,11 @@ the split exists and that residency keeps IO off resolutions inside it.
   its worst cascade, but nothing warns or refuses before an insert fails. The channel it would warn
   over now exists; what is missing is the threshold and what a warning should make the node do —
   a question about operations rather than about the code, listed under *Decisions waiting on someone*.
-- **Consensus is an echo**, the dedup map has no expiry, and the log has no compaction. All three
+- **Consensus is an echo**, the idem map has no expiry, and the log has no compaction. All three
   grow with a run, which the tools say out loud.
-- **A long run's worst tail belongs to the dedup stand-in, not to the ledger.** A ten-second
+- **A long run's worst tail belongs to the idem stand-in, not to the ledger.** A ten-second
   `void-heavy` run at 100k/s shows p99.9 between 1.7ms and 24ms across repeats, with single maxima up
-  to 114ms; a five-second run of the same thing never does. What grows with the run is the dedup map,
+  to 114ms; a five-second run of the same thing never does. What grows with the run is the idem map,
   which has no expiry and so rehashes as it crosses each power of two — on the thread every request
   passes through. Reserving four million entries in it turns eight repeats of p99.9 1.7–24ms into
   1.7–4.3ms and removes every maximum above 11ms, which is what establishes the cause. The reservation
@@ -233,7 +233,7 @@ neither is outstanding work.
 Four earlier entries are closed: the in-chain fallback read is now exercised by the `linked`
 workload (half its chains create a hold and resolve it inside the chain), the stub orderer's
 metrics struct is `FakeOrderWait` so `OrderWait` names one thing, unordered replies skip lane
-ordering in the dedup stub and both fakes, and the simulator now creates holds on the unconstrained
+ordering in the idem stub and both fakes, and the simulator now creates holds on the unconstrained
 account so `check` exercises the order exemption itself — the sweep test asserts it did.
 
 ## Decisions waiting on someone
@@ -290,7 +290,7 @@ unanswered, and **when that default stops being safe**. The source design's own 
   a much larger `daily_arrivals`, or a store whose reads are slow enough that a round no longer fits
   beside the lookups.
 
-- **When does the dedup engine get its rotating generations?**
+- **When does the idem engine get its rotating generations?**
   *Default:* a map that only grows, which owns the worst tail of any long run (see above).
   *Stops being safe:* it already is not, for measurement — no latency gate on a run longer than a few
   seconds is measuring this ledger rather than the stand-in. It becomes a correctness-adjacent question

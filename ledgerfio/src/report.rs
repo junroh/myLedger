@@ -301,7 +301,7 @@ impl RunReport {
     /// occupancy to report — a log figure here is what the log would append, and the engine's figures
     /// are what it was told to do, not what its layout would cost. Retention is what turns volume into
     /// occupancy, and retention lives in code that does not exist: consensus keeps no snapshot or
-    /// compaction, the dedup map has no expiry, and the pending engine has no disk tier.
+    /// compaction, the idem map has no expiry, and the pending engine has no disk tier.
     fn print_sizing(&self) {
         let mb = |bytes: usize| bytes as f64 / 1e6;
         let total: usize = self.footprints.iter().map(|(_, part)| part.bytes()).sum();
@@ -364,7 +364,7 @@ impl RunReport {
         // with them — but a run measured in seconds crosses no day, so a run's own total still shows the
         // unbounded shape rather than the steady state expiry produces.
         println!(
-            "                unbounded so far: the dedup map has no expiry and the log no compaction, so \
+            "                unbounded so far: the idem map has no expiry and the log no compaction, so \
              both grow with the run; the engine's blocks are bounded by retention, which no run this \
              short reaches"
         );

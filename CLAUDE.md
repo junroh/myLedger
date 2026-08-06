@@ -54,7 +54,7 @@ base/          contracts and foundation: model, client protocol, layout budget, 
 account/       account component: durable four-column records, DRAM-resident, persists itself
 sequencer/     reactor S1..S5, slots, lane state, hold view, linked groups
 pending/       pending engine (memory tier today, disk tier later)
-idempotency/   dedup engine (map today, rotating generations later)
+idempotency/   idem engine (map today, rotating generations later)
 raft/          consensus and log (echo today, five nodes later)
 service/       assembles the node: owns the reactor thread, the log stream drain and the client endpoint
 stubkit/       what a stand-in component needs and the ledger does not: latency ranges, the lane

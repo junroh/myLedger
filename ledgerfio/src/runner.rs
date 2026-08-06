@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{Ack, AckOutcome, LedgerError, Transfer};
-use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
+use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
 use ledger_pending::{DaySource, MemoryPending, MemoryPendingConfig, StoreModel};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, ReactorConfig};
@@ -87,7 +87,7 @@ impl Runner {
             footprints: vec![
                 ("sequencer", stopped.reactor.footprint()),
                 ("accounts", stopped.reactor.accounts().footprint()),
-                ("dedup", stopped.reactor.idem().footprint()),
+                ("idem", stopped.reactor.idem().footprint()),
                 ("pending engine", stopped.reactor.pending().footprint()),
                 ("consensus", stopped.reactor.raft().footprint()),
             ],
@@ -105,7 +105,7 @@ impl Runner {
         options: &Options,
         workload: &Workload,
     ) -> (
-        LedgerService<MemoryAccounts, MemoryPending, MemoryDedup, EchoRaft>,
+        LedgerService<MemoryAccounts, MemoryPending, MemoryIdem, EchoRaft>,
         ClientEndpoint,
         Calendar,
     ) {
@@ -149,10 +149,10 @@ impl Runner {
             },
             Self::open_accounts(workload),
             pending,
-            MemoryDedup::start(MemoryDedupConfig {
+            MemoryIdem::start(MemoryIdemConfig {
                 latency: options.idem_latency,
                 seed: options.seed ^ 0x1de3,
-                ..MemoryDedupConfig::default()
+                ..MemoryIdemConfig::default()
             }),
             EchoRaft::start(EchoRaftConfig {
                 round_trip: options.raft_round_trip,

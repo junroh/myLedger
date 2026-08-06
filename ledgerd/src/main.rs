@@ -4,7 +4,7 @@ use std::time::Duration;
 use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{AccountId, Signals};
-use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
+use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
 use ledger_pending::{MemoryPending, MemoryPendingConfig};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_service::{ClientEndpoint, LedgerService, ServiceConfig};
@@ -24,7 +24,7 @@ fn main() {
         open_accounts(accounts),
         MemoryPending::start(MemoryPendingConfig::default())
             .expect("the default engine config is valid"),
-        MemoryDedup::start(MemoryDedupConfig::default()),
+        MemoryIdem::start(MemoryIdemConfig::default()),
         EchoRaft::start(EchoRaftConfig::default()),
     );
     let (service, endpoint) = match started {

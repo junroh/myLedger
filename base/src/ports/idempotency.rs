@@ -1,7 +1,7 @@
 use crate::ids::{AccountId, Seq, TxId};
 use crate::ports::Correlation;
 
-/// Dedup fact from the idempotency engine. The verdict is data; the response to the client
+/// Idem fact from the idempotency engine. The verdict is data; the response to the client
 /// is the sequencer's decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdemVerdict {

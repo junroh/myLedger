@@ -43,6 +43,21 @@ Every name of the first mechanism contains `Linked`, every name of the second co
 either scenario is one grep away. "Group" alone never means a chain, and "chain" never means a budget
 group. The two meet only where a chain resolves a group, which is the coverage check.
 
+## The four components
+
+| term | means | in code |
+|---|---|---|
+| **account** | the durable four columns, one record per account, held in DRAM and persisted by the component itself. | `MemoryAccounts`, `AccountPort`, `AccountRecord` |
+| **pending engine** | where holds live: the index, the two memory windows, the blocks. | `MemoryPending`, `PendingPort`, `PendingEngine` |
+| **idem** | the component that records transaction ids so a resend is answered as a duplicate — **and** returns a lane's replies in seq order. Only the second is why anything calls it (rule 21). | `MemoryIdem`, `IdempotencyPort`, `IdemAsk`, `IdemVerdict` |
+| **consensus** | the replicated log. An echo today. | `EchoRaft`, `RaftPort` |
+
+**One name for the third one, and it took a rename to get there.** The crate, the port and every message
+said `Idem`; the type said `Dedup`, so every assembler that constructed it — the load driver, `ledgerd`, the
+test harness, two benches, the simulator — said `dedup` too, and so did the prose. Two words for one
+component is what rule 3 forbids, and this is what it looks like when the offender is a *type* name: the
+minority word spreads to everything that mentions the type. `idem` is the one word now.
+
 ## Order and safety
 
 | term | means | in code |

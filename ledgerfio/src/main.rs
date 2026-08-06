@@ -165,7 +165,7 @@ fn print_help() {
         "  --store-iops <n>            (0) reads a second that store can serve, 0 for no ceiling"
     );
     println!("  --overlay-limit <n>         (1M) ceiling on the sequencer's own hold decisions; in flight bounds it");
-    println!("  --idem-latency <us>         (1:5) dedup; every request pays it");
+    println!("  --idem-latency <us>         (1:5) idem; every request pays it");
     println!("  --violate-order-every <n>   (0) return every nth lane reply out of order");
     println!("  --raft-fail-every <n>       (0) refuse every nth batch");
     println!();

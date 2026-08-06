@@ -12,7 +12,7 @@ use ledger_base::{
     channel, AccountId, Ack, AckOutcome, Amount, Clock, Consumer, Effect, LogStream, ManualClock,
     Producer, Request, SystemClock, Transfer, TransferFlags, TxId,
 };
-use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
+use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
 use ledger_pending::{DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, Reactor, ReactorConfig, Transport};
@@ -32,7 +32,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const CLIENT_QUEUE: usize = 1 << 12;
 
 pub type TestReactor<C = SystemClock> =
-    Reactor<MemoryAccounts, MemoryPending, MemoryDedup, EchoRaft, C>;
+    Reactor<MemoryAccounts, MemoryPending, MemoryIdem, EchoRaft, C>;
 
 /// Zero-latency stubs, so a functional test observes decisions rather than timing.
 pub struct NoLatency;
@@ -98,10 +98,10 @@ impl NoLatency {
         }
     }
 
-    pub fn idem() -> MemoryDedupConfig {
-        MemoryDedupConfig {
+    pub fn idem() -> MemoryIdemConfig {
+        MemoryIdemConfig {
             latency: LatencyRange::fixed(Duration::ZERO),
-            ..MemoryDedupConfig::default()
+            ..MemoryIdemConfig::default()
         }
     }
 
@@ -215,7 +215,7 @@ impl<C: Clock> Harness<C> {
             },
             accounts,
             MemoryPending::start_with_days(pending, days).expect("a test engine config"),
-            MemoryDedup::start(NoLatency::idem()),
+            MemoryIdem::start(NoLatency::idem()),
             EchoRaft::start(raft),
             clock,
         )

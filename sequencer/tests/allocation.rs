@@ -10,7 +10,7 @@ use ledger_account::MemoryAccounts;
 use ledger_base::ports::AccountFlags;
 use ledger_base::{channel, Consumer, Producer};
 use ledger_base::{AccountId, Ack, Request, Transfer, TransferFlags, TxId};
-use ledger_idempotency::{MemoryDedup, MemoryDedupConfig};
+use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
 use ledger_pending::{MemoryPending, MemoryPendingConfig};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, Reactor, ReactorConfig, Transport};
@@ -49,7 +49,7 @@ const ACCOUNTS: u64 = 64;
 const IN_FLIGHT: u64 = 2_048;
 
 struct Load {
-    reactor: Reactor<MemoryAccounts, MemoryPending, MemoryDedup, EchoRaft>,
+    reactor: Reactor<MemoryAccounts, MemoryPending, MemoryIdem, EchoRaft>,
     requests: Producer<Request>,
     acks: Consumer<Ack>,
     next_id: u128,
@@ -85,9 +85,9 @@ impl Load {
                 ..MemoryPendingConfig::default()
             })
             .expect("a test engine config"),
-            MemoryDedup::start(MemoryDedupConfig {
+            MemoryIdem::start(MemoryIdemConfig {
                 latency: LatencyRange::fixed(Duration::ZERO),
-                ..MemoryDedupConfig::default()
+                ..MemoryIdemConfig::default()
             }),
             EchoRaft::start(EchoRaftConfig {
                 round_trip: LatencyRange::fixed(Duration::ZERO),

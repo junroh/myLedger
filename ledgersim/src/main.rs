@@ -408,7 +408,7 @@ impl Solve {
         match self {
             Self::Pending => "the pending engine",
             Self::Raft => "a consensus round trip",
-            Self::Idem => "a dedup answer",
+            Self::Idem => "a idem answer",
         }
     }
 
@@ -431,7 +431,7 @@ impl Solve {
             }
         };
         format!(
-            "pending engine {} at {}/s, consensus {}, dedup {}, client qd {}",
+            "pending engine {} at {}/s, consensus {}, idem {}, client qd {}",
             latency(matches!(self, Self::Pending), plan.pending_nanos),
             plan.pending_rate,
             latency(matches!(self, Self::Raft), plan.raft_nanos),
@@ -517,7 +517,7 @@ fn help() {
     println!("  --skew <n>          account concentration, 1 is uniform (1)");
     println!("  --arrivals <kind>   poisson or smooth (poisson)");
     println!("  --batches-in-flight <n> proposals consensus may have outstanding (8)");
-    println!("  --idem-us <n>       dedup (3)");
+    println!("  --idem-us <n>       idem (3)");
     println!("  --raft-us <n>       consensus round trip (10000)");
     println!("  --linger-us <n>     how long a partial batch waits (200)");
     println!("  --cost-intake <ns>  per request, from `ledgerfio run --cpu` (181)");

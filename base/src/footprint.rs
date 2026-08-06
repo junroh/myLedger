@@ -209,7 +209,7 @@ mod tests {
     #[test]
     fn a_hash_table_is_priced_by_its_buckets_and_says_it_is_approximate() {
         let mut footprint = Footprint::new();
-        footprint.hash_table::<u64, u64>("dedup", 700, 1_000, 900);
+        footprint.hash_table::<u64, u64>("idem", 700, 1_000, 900);
         // 1000 * 8 / 7 rounds up to 2048 buckets, each holding a pair and a control byte.
         assert_eq!(footprint.bytes(), 2_048 * 17);
         assert!(!footprint.exact());

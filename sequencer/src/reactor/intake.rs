@@ -225,7 +225,7 @@ where
         // but they ask for something different once they get there (`IdemAsk::Serialize`). Dropping the
         // dependency was the mistake: it did avoid the map, which a derived id must, and it also left the
         // request out of the queue that puts a lane back in order. A resolution waiting only on the engine
-        // and a transfer waiting only on dedup then had nothing ordering them, and whichever component
+        // and a transfer waiting only on idem then had nothing ordering them, and whichever component
         // answered first was judged first — a seq gap, and a lane quarantined for a fault of ours.
         let gate = self
             .linked
