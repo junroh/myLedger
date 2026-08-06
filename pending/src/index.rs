@@ -1,6 +1,6 @@
 use std::hash::BuildHasher;
 
-use ledger_base::{FxBuildHasher, LineFit, Prng, TxId};
+use ledger_base::{FxBuildHasher, FxHashMap, LineFit, Prng, TxId};
 
 use crate::block::{BlockAddr, SEGMENT_VALUES};
 
@@ -142,6 +142,19 @@ pub struct HoldTable {
     /// forget, and forgetting means a day that is empty is never declared empty — its blocks are never
     /// handed back. So there is one write point and this derives from it (rule 18).
     live_per_segment: [u32; SEGMENT_VALUES],
+    /// Buckets copied aside because a snapshot has not read them yet, and how far it has read.
+    ///
+    /// **The kick cascade is why this exists**, and not the effects. An entry displaced from one bucket to
+    /// another while a snapshot is being written appears twice in it — and then one `remove` clears one slot,
+    /// the other survives, and a resolved hold is alive again with its money reserved for good — or it appears
+    /// nowhere, and no replay restores it because a relocation is in no log. Design notes §15.
+    ///
+    /// Not a second copy of the table: only the buckets modified between a snapshot starting and reaching
+    /// them, each dropped as it is read. That is tens of megabytes against 42.7GB, and its size follows the
+    /// dump's duration, which a throttle declares.
+    shadow: FxHashMap<usize, [Slot; WAYS]>,
+    /// Buckets a snapshot in progress has already read. `None` when none is.
+    read_through: Option<usize>,
     /// Which way a full bucket gives up. A fixed seed, because a table that evicted differently
     /// between two runs could not be compared with itself — the same reason the hasher is unseeded.
     victims: Prng,
@@ -178,6 +191,8 @@ impl HoldTable {
             mask: buckets as u64 - 1,
             live: 0,
             live_per_segment: [0; SEGMENT_VALUES],
+            shadow: FxHashMap::default(),
+            read_through: None,
             victims: Prng::new(0x9E37_79B9),
             max_hops: max_hops.max(1),
             hops: 0,
@@ -238,6 +253,43 @@ impl HoldTable {
     /// implicitly by order.
     pub fn bucket_words(&self, at: usize) -> [u64; WAYS] {
         self.buckets[at].slots
+    }
+
+    /// Starts shadowing, so a snapshot can read the table as it is now while the engine keeps writing.
+    pub fn begin_snapshot(&mut self) {
+        self.shadow.clear();
+        self.read_through = Some(0);
+    }
+
+    /// One bucket for a snapshot: the copy taken before it changed, or the live one if it has not. Buckets are
+    /// asked for in order, which is what lets a shadow entry be dropped as it is read and what bounds the
+    /// shadow to the buckets modified while the snapshot was behind them.
+    ///
+    /// `None` when no snapshot is in progress or the request is out of order, which is a caller that has lost
+    /// track of its own cursor rather than a state to recover from.
+    pub fn bucket_for_snapshot(&mut self, at: usize) -> Option<[Slot; WAYS]> {
+        if self.read_through? != at || at >= self.buckets.len() {
+            return None;
+        }
+        self.read_through = Some(at + 1);
+        Some(
+            self.shadow
+                .remove(&at)
+                .unwrap_or_else(|| self.buckets[at].slots),
+        )
+    }
+
+    /// Stops shadowing. Whatever is left in the shadow was never read, which only happens when a snapshot was
+    /// abandoned part way — the copies go with it.
+    pub fn end_snapshot(&mut self) {
+        self.shadow.clear();
+        self.read_through = None;
+    }
+
+    /// Buckets held aside for a snapshot in progress. Reported so a run can see what the stable read costs,
+    /// which is the number design notes §15 sizes against a second copy of the table.
+    pub fn shadowed(&self) -> usize {
+        self.shadow.len()
     }
 
     /// Puts one bucket's slots back, through the one write point so both counts follow. `false` means a
@@ -437,6 +489,13 @@ impl HoldTable {
     /// an exception for "this write does not change the count" is an exception someone has to be right
     /// about, and being wrong about it is silent.
     fn set_slot(&mut self, (bucket, way): (usize, usize), slot: Slot) -> Slot {
+        // A snapshot that has not reached this bucket has to see it as it was. Copied whole rather than per
+        // slot, because a bucket is what a snapshot writes.
+        if self.read_through.is_some_and(|read| bucket >= read) {
+            self.shadow
+                .entry(bucket)
+                .or_insert_with(|| self.buckets[bucket].slots);
+        }
         let previous = self.buckets[bucket].slots[way];
         if previous != EMPTY {
             self.live_per_segment[address_of(previous).segment() as usize] -= 1;

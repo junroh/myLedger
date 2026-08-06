@@ -69,58 +69,74 @@ pub enum NotASnapshot {
     Malformed,
 }
 
-/// Writes the engine's state out in chunks. Borrows what it walks, so nothing is copied to be written and a
-/// caller cannot forget to keep the engine still — which the type says and the missing stable read does not
-/// yet make true.
-pub struct SnapshotWriter<'a> {
-    index: &'a HoldTable,
-    records: &'a RecordLog,
-    groups: Vec<(BudgetGroup, BudgetState)>,
+/// A snapshot being written, one chunk at a time.
+///
+/// It owns what it needs rather than borrowing the engine, and that is not a style choice: a paced dump spans
+/// many worker rounds, and a borrow that lasted that long would forbid the engine to apply anything for the
+/// whole of it. What keeps the read stable instead is the index's shadow — see `HoldTable::begin_snapshot`.
+///
+/// The group totals are copied at the start. That is a real cost at the design's scale, and it is the one
+/// part of a snapshot that is not read incrementally: they change while the dump runs, and the position they
+/// reflect is what makes them replay-safe, so they have to be one instant's worth.
+pub struct SnapshotWriter {
     coverage: ApplyIndex,
     groups_reflect: ApplyIndex,
+    groups: Vec<(BudgetGroup, BudgetState)>,
+    buckets: u64,
     /// Records already written, header included, so a chunk resumes rather than restarting.
     at: u64,
 }
 
-impl<'a> SnapshotWriter<'a> {
+impl SnapshotWriter {
     pub fn new(
-        index: &'a HoldTable,
-        records: &'a RecordLog,
+        buckets: usize,
         budgets: &FxHashMap<BudgetGroup, BudgetState>,
         coverage: ApplyIndex,
         groups_reflect: ApplyIndex,
     ) -> Self {
-        // Sorted, so two writers over the same state produce the same bytes. A map's iteration order is not
-        // a promise, and a snapshot that differed between nodes for no reason would be one nothing could
-        // compare.
+        // Sorted, so two writers over the same state produce the same bytes. A map's iteration order is not a
+        // promise, and a snapshot that differed between nodes for no reason would be one nothing could compare.
         let mut groups: Vec<(BudgetGroup, BudgetState)> =
             budgets.iter().map(|(id, state)| (*id, *state)).collect();
         groups.sort_by_key(|(id, _)| id.raw());
         Self {
-            index,
-            records,
-            groups,
             coverage,
             groups_reflect,
+            groups,
+            buckets: buckets as u64,
             at: 0,
         }
     }
 
     /// Records the whole stream holds: the header, one per bucket, one per group.
     pub fn records(&self) -> u64 {
-        HEADER + self.index.bucket_count() as u64 + self.groups.len() as u64
+        HEADER + self.buckets + self.groups.len() as u64
     }
 
     pub fn bytes(&self) -> u64 {
         self.records() * RECORD as u64
     }
 
-    /// Fills `into` with as many whole records as fit and answers how many bytes were written. Zero means
-    /// the stream is finished, or that `into` was too small to hold one record.
-    pub fn next_chunk(&mut self, into: &mut [u8]) -> usize {
+    pub fn is_complete(&self) -> bool {
+        self.at == self.records()
+    }
+
+    /// Fills `into` with as many whole records as fit and answers how many bytes were written. Zero means the
+    /// stream is finished, or that `into` was too small to hold one record.
+    ///
+    /// `index` is asked for each bucket in turn, and hands back the copy taken before it changed where one was
+    /// needed. Sealed-block state is asked of `records`, because a slot pointing anywhere else is written out
+    /// empty.
+    pub fn next_chunk(
+        &mut self,
+        into: &mut [u8],
+        index: &mut HoldTable,
+        records: &RecordLog,
+    ) -> usize {
         let mut written = 0;
         while written + RECORD <= into.len() {
-            let Some(()) = self.write_one(&mut into[written..written + RECORD]) else {
+            let Some(()) = self.write_one(&mut into[written..written + RECORD], index, records)
+            else {
                 break;
             };
             written += RECORD;
@@ -129,45 +145,41 @@ impl<'a> SnapshotWriter<'a> {
         written
     }
 
-    fn write_one(&self, into: &mut [u8]) -> Option<()> {
-        let buckets = self.index.bucket_count() as u64;
+    fn write_one(&self, into: &mut [u8], index: &mut HoldTable, records: &RecordLog) -> Option<()> {
         match self.at {
             0 => {
                 into.fill(0);
                 into[0..8].copy_from_slice(&MAGIC.to_le_bytes());
                 into[8..12].copy_from_slice(&VERSION.to_le_bytes());
-                into[12..20].copy_from_slice(&buckets.to_le_bytes());
+                into[12..20].copy_from_slice(&self.buckets.to_le_bytes());
                 into[20..24].copy_from_slice(&(self.groups.len() as u32).to_le_bytes());
                 into[24..32].copy_from_slice(&self.coverage.raw().to_le_bytes());
                 Some(())
             }
             1 => {
                 into.fill(0);
-                // The position the group totals reflect, which is this writer's own instant rather than the
-                // coverage above — see `PendingEngine::groups_reflect`. The two differ by whatever the
-                // writeback buffer is holding, and replay needs both.
+                // The position the group totals reflect, which is this snapshot's own instant rather than the
+                // coverage above — see `PendingEngine::replay`. The two differ by whatever the writeback
+                // buffer is holding, and replay needs both.
                 into[0..8].copy_from_slice(&self.groups_reflect.raw().to_le_bytes());
                 Some(())
             }
-            at if at < HEADER + buckets => {
-                let words = self.index.bucket_words((at - HEADER) as usize);
+            at if at < HEADER + self.buckets => {
+                let words = index.bucket_for_snapshot((at - HEADER) as usize)?;
                 for (way, word) in words.iter().enumerate() {
                     // A slot pointing at a record that is not on a sealed block is written out empty. Its
-                    // record is in the writeback buffer or in the block still being filled, so it will not
-                    // be there on restore, and an index entry naming a block nobody has is worse than a hold
-                    // the log can create again.
-                    let keep = *word != 0 && self.records.is_sealed(address_in(*word));
+                    // record is in the writeback buffer or in the block still being filled, so it will not be
+                    // there on restore, and an index entry naming a block nobody has is worse than a hold the
+                    // log can create again.
+                    let keep = *word != 0 && records.is_sealed(address_in(*word));
                     let out = if keep { *word } else { 0 };
                     into[way * 8..way * 8 + 8].copy_from_slice(&out.to_le_bytes());
                 }
                 Some(())
             }
             at => {
-                let (id, state) = self.groups.get((at - buckets - HEADER) as usize)?;
+                let (id, state) = self.groups.get((at - self.buckets - HEADER) as usize)?;
                 into.fill(0);
-                // Sixteen for the id, four for the members, and the remaining and the watermark packed into
-                // the eight bytes each that are left. A group's totals are useless without the position they
-                // reflect — see `BudgetState::at` — so both travel or neither does.
                 into[0..16].copy_from_slice(&id.raw().to_le_bytes());
                 into[16..24].copy_from_slice(&state.remaining().to_le_bytes());
                 into[24..28].copy_from_slice(&state.members().to_le_bytes());
@@ -370,12 +382,12 @@ mod tests {
     }
 
     /// Writes the whole stream out chunk by chunk, then reads it back into a fresh engine.
-    fn round_trip(from: &PendingEngine, into: &mut PendingEngine) -> Result<(), NotASnapshot> {
-        let mut writer = from.snapshot();
+    fn round_trip(from: &mut PendingEngine, into: &mut PendingEngine) -> Result<(), NotASnapshot> {
+        let mut writer = from.begin_snapshot();
         let mut reader = SnapshotReader::new();
         let mut chunk = vec![0u8; CHUNK];
         loop {
-            let written = writer.next_chunk(&mut chunk);
+            let written = from.next_snapshot_chunk(&mut writer, &mut chunk);
             if written == 0 {
                 break;
             }
@@ -405,7 +417,7 @@ mod tests {
                 .expect("the index took the hold");
         }
 
-        round_trip(&engine, &mut restored).expect("a snapshot of this engine");
+        round_trip(&mut engine, &mut restored).expect("a snapshot of this engine");
 
         let mut carried = 0;
         for id in 1..=holds {
@@ -452,7 +464,7 @@ mod tests {
             "the hold is not there to begin with"
         );
 
-        round_trip(&engine, &mut restored).expect("a snapshot of this engine");
+        round_trip(&mut engine, &mut restored).expect("a snapshot of this engine");
 
         assert!(
             restored.lookup(TxId(1)).is_none(),
@@ -516,11 +528,11 @@ mod tests {
         // And the claim itself: every hold at or below coverage is carried, every one above it is not.
         let mut restored =
             PendingEngine::sized(1 << 12, 4, 1024, Box::new(MemBlockStore::default()));
-        let mut writer = engine.snapshot();
+        let mut writer = engine.begin_snapshot();
         let mut reader = SnapshotReader::new();
         let mut chunk = vec![0u8; CHUNK];
         loop {
-            let written = writer.next_chunk(&mut chunk);
+            let written = engine.next_snapshot_chunk(&mut writer, &mut chunk);
             if written == 0 {
                 break;
             }
@@ -599,7 +611,7 @@ mod tests {
             "coverage {covered:?} is not between nothing and everything, so this proves little"
         );
 
-        round_trip(&engine, &mut restored).expect("a snapshot of this engine");
+        round_trip(&mut engine, &mut restored).expect("a snapshot of this engine");
         assert_eq!(
             restored.coverage(),
             covered,
@@ -681,6 +693,87 @@ mod tests {
         );
     }
 
+    /// A snapshot reads the table as it was when it started, even while the engine keeps writing into it.
+    ///
+    /// **The kick cascade is what this is for**, not the effects. An entry displaced from one bucket to
+    /// another mid-dump appears twice in the stream — and then one `remove` clears one slot, the other
+    /// survives, and a resolved hold is alive again with its money reserved for good — or it appears nowhere,
+    /// and no replay restores it because a relocation is in no log. The test writes enough between chunks to
+    /// make the table relocate, and asserts the snapshot is still the one it began.
+    #[test]
+    fn a_snapshot_reads_the_table_it_began_with_while_the_engine_writes() {
+        // A table at its load target, so inserts cascade rather than finding room.
+        let slots = 1 << 10;
+        let holds = (slots as f64 * crate::index::LOAD_TARGET) as u64 / 2;
+        let (mut engine, mut restored) = pair(slots, 1);
+        for id in 1..=holds {
+            engine
+                .write(create(id as u128, BudgetGroup::ABSENT), ApplyIndex(id))
+                .expect("the index took the hold");
+        }
+        let mut writer = engine.begin_snapshot();
+        let coverage = engine.coverage();
+        let mut reader = SnapshotReader::new();
+        let mut chunk = vec![0u8; CHUNK];
+        let mut next = holds;
+        let mut shadow_peak = 0;
+        loop {
+            let written = engine.next_snapshot_chunk(&mut writer, &mut chunk);
+            if written == 0 {
+                break;
+            }
+            reader
+                .take_chunk(&chunk[..written], restored.index_mut())
+                .expect("a stream this table can take");
+            // Between chunks: more holds, which is what makes buckets move under the reader.
+            for _ in 0..3 {
+                next += 1;
+                let _ = engine.write(create(next as u128, BudgetGroup::ABSENT), ApplyIndex(next));
+            }
+            shadow_peak = shadow_peak.max(engine.shadowed_buckets());
+        }
+        assert!(
+            shadow_peak > 0,
+            "nothing was written into a bucket the snapshot had not reached, so this proves nothing"
+        );
+        assert_eq!(
+            engine.shadowed_buckets(),
+            0,
+            "the shadow outlived the snapshot that needed it"
+        );
+        assert!(reader.is_complete());
+        restored.restore(reader.into_groups(), coverage);
+
+        // Nothing lost: every position coverage claims is there. Coverage is a *lower* bound on what has been
+        // sealed — it errs low on purpose — so the snapshot carrying more than it claims is right, and a hold
+        // at or below it missing is the relocation that appeared nowhere.
+        for id in 1..=coverage.raw() {
+            assert!(
+                restored.lookup(TxId(id as u128)).is_some(),
+                "hold {id} is at or below coverage {} and was not carried",
+                coverage.raw()
+            );
+        }
+
+        // Nothing twice: one key cannot hold two slots. A lookup finds one of them, so counting the holds
+        // that answer and comparing against the table's entries is what catches the relocation written twice.
+        let found = (1..=next)
+            .filter(|id| restored.lookup(TxId(*id as u128)).is_some())
+            .count() as u64;
+        assert_eq!(
+            found,
+            restored.traffic().index_live as u64,
+            "the table has more entries than holds answer, so a relocation was written twice"
+        );
+        for id in (holds + 1)..=next {
+            assert!(
+                restored.lookup(TxId(id as u128)).is_none(),
+                "hold {id} arrived after the snapshot began and was carried anyway"
+            );
+        }
+        assert!(restored.counts_agree());
+    }
+
     /// A snapshot only restores into a table of the same size, and a mismatch is refused rather than
     /// interpreted. A bucket's position in the stream *is* its position in the table — a slot holds a
     /// fingerprint and not a key, so nothing can be placed again — which makes the bucket count part of what
@@ -693,7 +786,7 @@ mod tests {
             .expect("the index took the hold");
 
         let mut wrong = PendingEngine::sized(1 << 14, 1, 64, Box::new(MemBlockStore::default()));
-        let refused = round_trip(&engine, &mut wrong).expect_err("a table of another size");
+        let refused = round_trip(&mut engine, &mut wrong).expect_err("a table of another size");
         assert!(
             matches!(refused, NotASnapshot::Buckets { .. }),
             "refused for the wrong reason: {refused:?}"

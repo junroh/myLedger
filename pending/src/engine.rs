@@ -790,14 +790,40 @@ impl PendingEngine {
     /// A writer over this engine's state. Borrows it, so nothing is copied to be written — and so a caller
     /// cannot apply anything while a snapshot is in flight, which is the stable read the design asks for and
     /// the only form of it that exists yet (design notes §15).
-    pub fn snapshot(&self) -> SnapshotWriter<'_> {
+    /// Starts one, and shadows the index so the read is stable while the engine keeps writing. Answers what
+    /// the stream will be, so a caller can size or pace it.
+    ///
+    /// Only one at a time: a second would need a second shadow, and the reason for the first — a kick cascade
+    /// moving an entry between buckets — makes two overlapping reads two different tables.
+    pub fn begin_snapshot(&mut self) -> SnapshotWriter {
+        self.index.begin_snapshot();
         SnapshotWriter::new(
-            &self.index,
-            &self.records,
+            self.index.bucket_count(),
             &self.budgets,
             self.coverage(),
             self.applied_through,
         )
+    }
+
+    /// The next chunk of a snapshot, into a buffer the caller sizes. Zero when the stream is finished, and
+    /// that is when the shadow goes: whatever is left in it was never read, which only happens if a caller
+    /// abandoned the snapshot.
+    pub fn next_snapshot_chunk(&mut self, writer: &mut SnapshotWriter, into: &mut [u8]) -> usize {
+        let written = writer.next_chunk(into, &mut self.index, &self.records);
+        if writer.is_complete() {
+            self.index.end_snapshot();
+        }
+        written
+    }
+
+    /// Abandons one, dropping the buckets held aside for it.
+    pub fn abandon_snapshot(&mut self) {
+        self.index.end_snapshot();
+    }
+
+    /// Buckets held aside for a snapshot in progress: what the stable read is costing right now.
+    pub fn shadowed_buckets(&self) -> usize {
+        self.index.shadowed()
     }
 
     /// Puts a snapshot's group totals back, once its stream is complete. The index restores itself as the

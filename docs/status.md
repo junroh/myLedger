@@ -188,10 +188,21 @@ earlier — so replay counted every member created in between a second time, and
 `Create`'s increment at or below it. It is an argument to `replay` rather than state the engine keeps, so a
 caller cannot forget to supply it.
 
-One thing is not built: the **stable read**, so nothing may apply while a snapshot is in flight — the writer
-borrows the engine, which says it in the type without making it true under a worker.
+**The stable read is built too**, and it is copy-on-write rather than a second copy of the table. The kick
+cascade is what it is for and not the effects: an entry displaced between buckets mid-dump appears twice in
+the stream — one `remove` then clears one slot and the other survives, a resolved hold alive again with its
+money reserved for good — or nowhere, and no replay restores it because a relocation is in no log. So the one
+method that writes a slot copies a bucket the snapshot has not reached, and each copy is dropped as it is
+read. The engine owns the progress rather than the writer borrowing it, because a paced dump spans many worker
+rounds and a borrow that long would forbid applying anything for the whole of it.
 
-Nothing writes a snapshot anywhere yet, and nothing calls `replay` outside its tests.
+The test writes between chunks until the table relocates, then asserts the two failures away: everything at
+or below coverage is carried, and the holds that answer equal the table's entries — the second is what a
+relocation written twice would break.
+
+What is left is **where it goes**: nothing writes a snapshot anywhere, nothing calls `replay` outside its
+tests, and the throttle that would pace it is a decision rather than code (`status.md`'s list). §15 has the
+interval arithmetic and the one number it waits on.
 
 Nothing writes one anywhere yet, and **design notes §15 is the design for the rest** — reasoning with no code
 behind it, which is why it says so at the top.
