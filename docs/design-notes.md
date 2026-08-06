@@ -402,14 +402,16 @@ gap: keeping "expired" needs per-hold state past retention, which is the data th
 
 ## 3. Linked groups need two mechanisms the design did not spell out
 
-> **Tried** — the design's chain semantics as written.
-> **Broke** — two mechanisms were missing and a chain cannot work without either: its own legs could not
-> see the availability an earlier leg brings in, and the group barrier completes groups in the order their
-> results arrive rather than in lane seq order.
-> **Weighed** — asked and unrecoverable. Nothing was written down at the time and the person who decided it
-> does not remember, so this line will stay as it is. Recorded that way on purpose: "not recorded" reads like
-> a gap somebody could still fill, and this one cannot be.
-> **Chose** — a chain scratch holding its own legs' gains, thrown away when the chain is judged, plus lane
+> **Not a decision either, and for the same reason as §7.** What is here is what was intended from the start.
+> The header used to claim alternatives were weighed and then lost; there were none. This implementation kept
+> arriving at something else and being corrected, and what nobody remembers is the sequence of wrong versions
+> — not a set of options.
+>
+> **What the design left implicit**, which is why it could be got wrong repeatedly: a chain needs two
+> mechanisms it does not name. Its own legs cannot see the availability an earlier leg brings in, and the group
+> barrier completes groups in the order their results arrive rather than in lane seq order.
+>
+> **What it is:** a chain scratch holding its own legs' gains, thrown away when the chain is judged, plus lane
 > gates for the barrier the sequencer itself created. Cost accepted and visible: chains sharing a lane
 > serialise, so `linked` runs at about an eighth of the single-phase rate.
 

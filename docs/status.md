@@ -467,11 +467,15 @@ An entry that vanishes reads as a question nobody ever asked.
   `cargo bench -p ledger-pending --bench snapshot`, and design notes §15 has the table.
 - **What sizes the expiry throttle's slice?** The day does. The requirement is met three orders over and the
   binding constraint is a single round, which is bounded by declaration rather than by density.
-- **What was weighed and rejected in §3 and §7?** Asked, and neither turns out to be a decision with
-  alternatives. §7 was never a choice: the design has a linked chain and a budget group apart and always did,
-  and the implementation merged them by misreading rather than by weighing — found afterwards by the person
-  who had separated them. §3's alternatives were never written down and are not remembered, so that line now
-  says unrecoverable rather than unrecorded: the first reads like a gap somebody could fill.
+- **What was weighed and rejected in §3 and §7?** Nothing, in both. Neither was a decision: what is in the
+  code is what was intended, and the implementation reached something else and was corrected. §7 merged a
+  linked chain with a budget group, which the design has apart and always did. §3 kept arriving at other
+  shapes for the chain scratch and the lane gates. What nobody remembers is the sequence of wrong versions,
+  which is not a set of alternatives and does not belong in a `Weighed` line.
+
+  **Worth keeping as a warning about the format itself.** Four lines that ask what was weighed will invite an
+  answer even where the honest one is "this was not a choice" — and a plausible reconstruction is worse than a
+  blank. Both headers now say so outright.
 - **Does the index need a `min_live_seg_id` epoch?** No, and a test says why: a day's blocks go back only
   once the index has no entry in it, so the dead slots are gone before the blocks are.
 - **`SE-OQ-2`** — the index bench measures what cannot be placed at each load factor and cascade cap.
