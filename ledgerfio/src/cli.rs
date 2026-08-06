@@ -96,6 +96,9 @@ pub struct Options {
     /// misbehaves and the worse one, because it answers: without the block checksum this was not a fault at
     /// all but a wrong answer nothing could see.
     pub store_corrupt_every: u32,
+    /// A directory to put the engine's segment files in. Unset is memory, which is what every number in this
+    /// repository was taken against — a run that names a directory is measuring a filesystem as well.
+    pub store_dir: Option<&'static str>,
     /// Holds the engine's overlay may keep before idle ones are evicted. Small enough and a resolution
     /// has to ask the engine, which is the only way a run reaches the fetch path at all.
     pub overlay_limit: usize,
@@ -160,6 +163,7 @@ impl Default for Options {
             store_queue_depth: 128,
             store_fault_every: 0,
             store_corrupt_every: 0,
+            store_dir: None,
             overlay_limit: 1 << 20,
             idem_latency: LatencyRange::new(Duration::from_micros(1), Duration::from_micros(5)),
             violate_order_every: 0,
@@ -298,6 +302,9 @@ impl Cli {
             "store-queue-depth" => options.store_queue_depth = Self::count(value)?.max(1) as usize,
             "store-fault-every" => options.store_fault_every = Self::count(value)? as u32,
             "store-corrupt-every" => options.store_corrupt_every = Self::count(value)? as u32,
+            // Leaked on purpose: `Options` is `Copy` so a run can be repeated and swept without cloning, and
+            // one path per process is not a leak worth a lifetime parameter for.
+            "store-dir" => options.store_dir = Some(Box::leak(value.to_owned().into_boxed_str())),
             "overlay-limit" => options.overlay_limit = Self::count(value)? as usize,
             "idem-latency" => options.idem_latency = Self::latency(value)?,
             "violate-order-every" => options.violate_order_every = Self::count(value)? as u32,

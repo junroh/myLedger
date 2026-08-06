@@ -1,8 +1,9 @@
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
+use std::path::{Path, PathBuf};
 
 use ledger_base::ports::{ApplyIndex, HoldData};
-use ledger_base::{AccountId, Amount, BudgetGroup, FxHashMap, LineFit, Prng, TxId};
+use ledger_base::{AccountId, Amount, BudgetGroup, FxHashMap, LedgerError, LineFit, Prng, TxId};
 use ledger_stubkit::Server;
 
 /// A block is what one read fetches, and the size the speed contract is written against: one hold
@@ -543,9 +544,38 @@ pub struct StoreModel {
     pub corrupt_every: u32,
 }
 
+/// What is under the store, opened and checked before anything is spawned. A directory that cannot be used is
+/// a configuration error and has to be refused where somebody can be told, not on a worker thread whose only
+/// way to report it would be to panic (rule 6) — so this carries the directory already open.
+///
+/// Not `Copy`, which is why it travels beside `DaySource` rather than inside `MemoryPendingConfig`: both are
+/// things the engine is handed from outside rather than sizes it derives.
+pub enum OpenBacking {
+    /// Memory. The exact store, and what every other answer is measured against.
+    Memory,
+    /// One file per segment, in a directory that has been opened.
+    Files { dir: std::fs::File, path: PathBuf },
+}
+
+impl OpenBacking {
+    /// The directory to put a segment's files in, opened and created if it was not there.
+    pub fn files(path: &Path) -> Result<Self, LedgerError> {
+        let (dir, path) =
+            crate::files::open_directory(path).map_err(|_| LedgerError::ConfigInvalid)?;
+        Ok(Self::Files { dir, path })
+    }
+}
+
 impl StoreModel {
-    pub fn build(&self, seed: u64) -> Box<dyn DurableStore> {
-        let exact = Box::new(MemoryStore::default());
+    pub fn build(&self, backing: OpenBacking, seed: u64) -> Box<dyn DurableStore> {
+        let exact: Box<dyn DurableStore> = match backing {
+            OpenBacking::Memory => Box::new(MemoryStore::default()),
+            OpenBacking::Files { dir, path } => Box::new(crate::files::FileStore::new(
+                dir,
+                path,
+                self.queue_depth.max(1),
+            )),
+        };
         if self.is_exact() {
             return exact;
         }
@@ -1426,7 +1456,7 @@ mod tests {
             queue_depth: 8,
             ..StoreModel::default()
         };
-        let mut log = RecordLog::new(model.build(7), 1, 0);
+        let mut log = RecordLog::new(model.build(OpenBacking::Memory, 7), 1, 0);
         // Past the window with survivors carried on, so a block is sealed and residency keeps none of it:
         // only the store has it, which is the one path a device can lie on.
         let mut addrs = Vec::new();

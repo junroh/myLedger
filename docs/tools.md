@@ -138,6 +138,10 @@ decides what the prediction is worth:
   exact store, which every other answer is measured against. Design notes §16 has the measured curves; the
   short of it is that a per-block write is roughly four times as expensive per microsecond as a sync, because
   one sync covers every block a round sealed and a write does not.
+- **`--store-dir <path>` puts the engine's blocks in real files**, one per segment, and unset is memory —
+  which is what every other number in these documents was taken against. It is the only way to measure the
+  syscall path rather than a model of it, and on this machine it is *not* a measurement of a device: macOS has
+  no `O_DIRECT`, so reads come through the page cache. Design notes §16 has both columns.
 - **The read queue's depth is a flag, and it bounds what a slow read can hide behind.**
   `--store-queue-depth` (128) is how many reads the store holds at once; past it reads are refused and the
   engine keeps the command. At 40,000 store reads a second, 5ms reads need about two hundred outstanding — at

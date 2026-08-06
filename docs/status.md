@@ -180,14 +180,22 @@ fail. `MemoryStore` backs it today and `LatencyStore` prices a device in front o
   and it removed the one number this could not answer — the apply path's read latency.
 - **Blocks are 4096-byte aligned buffers**, because direct IO wants the address aligned as well as the offset,
   and an unaligned buffer would cost a bounce copy per IO.
+- **`FileStore` is the real backing**: one file per segment, `pwrite`/`pread`/`fsync`/`unlink`, and **no
+  `unsafe`** — everything has a safe form in `std`'s unix extensions and only the *value* of `O_DIRECT` comes
+  from `libc`. `--store-dir` asks for it. Its `submit`/`poll` reads synchronously, which is the placeholder
+  `SE-OQ-4` replaces rather than an implementation of it.
 
 What it unblocks, and what each is worth now:
 
 - **`SE-OQ-4`**, the read backend — io_uring against a thread pool — is a choice between implementations of
-  `submit` and `poll`, and it now has somewhere to live. Seven methods is the whole of a `FileStore`.
-- **`SE-OQ-6`**, the `≤5ms` worst case, is measurable against the model: at 40,000 store reads a second, 5ms
-  reads sustain 100k tx/s at p99.9 9.7ms — given a queue depth of 512, because 128 refuses reads and reports
-  the depth instead of the device. Against a real device it still needs a Linux host: macOS has no `O_DIRECT`.
+  `submit` and `poll`, and `FileStore` is the baseline both would be measured against: it reads synchronously
+  inside `poll`, so nothing overlaps and any answer improves on it.
+- **`SE-OQ-6`**, the `≤5ms` worst case, has its tooling and not its answer. Against the model: 5ms reads
+  sustain 100k tx/s at p99.9 9.7ms with a queue depth of 512. Against a real filesystem at 40,000 store reads
+  a second: p99 5.4ms and p99.9 6.1ms at depth 2048, against p99 93.7ms at 128 — **twice now a "the device is
+  too slow" number has been a queue too short.** What is still missing is a device: without `O_DIRECT` the
+  reads come through the page cache and twenty megabytes of segment files fit in it, so those figures price
+  the syscall path and the queue rather than a disk. That needs a Linux host.
 - **`SE-OQ-5`**, compression, is narrowed rather than answered: block-level compression would break the offset
   rule, so it belongs inside a block, at the record.
 - **Where a snapshot goes** is still open, and it is the only one of the five that this did not move.
@@ -433,15 +441,16 @@ unanswered, and **when that default stops being safe**. The source design's own 
   is not part of the store's work — and why the store has no `--store-hang-every`, since a knob whose reaction
   does not exist tests nothing.
 
-- **What queue depth should the store model hold, and who says so?**
-  *Default:* a constant, 128, written into `ledgerfio`'s runner rather than into a flag. It is enough until a
-  read is slow: at 40,000 store reads a second — which `--resolve-after 100000 --residency 1` produces — the
-  design's own `≤5ms` worst case needs about two hundred outstanding, so the run refuses reads at 128 and what
-  the report shows is the depth rather than the latency.
-  *Stops being safe:* it already is not, for the one measurement `SE-OQ-6` is about. A `--store-read 5000` run
-  today reports p50 212ms, and that number is a queue too short as much as a device too slow — the two are not
-  separable from outside. It is a flag rather than a decision, and it is here because the value it should
-  default to is the decision.
+- **What queue depth should the store hold, and who says so?**
+  *Default:* 128, and it is now a flag (`--store-queue-depth`) rather than a constant. It is enough until a
+  read is slow, and then it is the whole answer: at 40,000 store reads a second against a real filesystem,
+  128 gives p99 93.7ms and 2048 gives p99 5.4ms. The same thing happened against the modelled store, where a
+  `--store-read 5000` run reported p50 212ms at 128 and p99.9 9.7ms at 512.
+  *Stops being safe:* it already is not, for any run that means to price a device — **twice a number read as
+  "the device is too slow" has been a queue too short**, and the two are not separable from outside. What the
+  depth should follow is arithmetic nobody has written down: reads a second times the latency they take, which
+  is Little's law and the same rule the client's own queue depth obeys. Whether the engine should derive it
+  from `PendingCapacity` rather than be told is the decision.
 
 - **What throttle paces the snapshot's write?**
   *Default:* none — nothing writes one anywhere, so nothing paces it. The unit is settled (a declared number
@@ -564,6 +573,10 @@ command that reproduces it. The ones that decide the most:
 - `ledgerfio run --workload partial-settle --rate 1m --sweep store-write=...` — what a device costs on the
   paths that hold the thread. 1M/s is a ceiling-finding rate rather than a target, and the number that
   transfers off it is a budget: one thread divided by the block seal rate.
+- `ledgerfio run --workload hold-settle --resolve-after 100000 --residency 1 --overlay-limit 10000 --store-dir
+  <path> --store-queue-depth 2048` — the same read path against real files instead of a model. The depth is in
+  the command on purpose: at 128 the same run reports p99 93.7ms and reads as a slow device, at 2048 it is p99
+  5.4ms. Not a device measurement on macOS, which has no `O_DIRECT`.
 - `ledgerfio run --workload hold-settle --resolve-after 900000 --external-ratio 30` — what order
   exemption is worth, as lane depth.
 - `ledgersim check --seeds 64` — every invariant under fault injection, including the store path.

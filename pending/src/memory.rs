@@ -15,7 +15,9 @@ use ledger_base::{
 };
 use ledger_stubkit::{IdleBackoff, LatencyRange, WorkerThread};
 
-use crate::block::{LogTraffic, RecordAddr, StoreModel, BLOCK_BYTES, RECORDS_PER_BLOCK, SEGMENTS};
+use crate::block::{
+    LogTraffic, OpenBacking, RecordAddr, StoreModel, BLOCK_BYTES, RECORDS_PER_BLOCK, SEGMENTS,
+};
 use crate::engine::{BudgetState, PendingEngine, Started};
 use crate::index::{LOAD_TARGET, SLOT_BYTES};
 use crate::orderer::OrderWait;
@@ -467,15 +469,19 @@ impl MemoryPending {
     /// `Reactor::new` does — the sizes here are derived from declared inputs, so an incoherent
     /// declaration has to be an error at the start rather than a window nobody meant.
     pub fn start(config: MemoryPendingConfig) -> Result<Self, LedgerError> {
-        Self::start_with_days(config, DaySource::WallClock)
+        Self::start_with_days(config, DaySource::WallClock, OpenBacking::Memory)
     }
 
-    /// The same, with the day handed in. A retention window is measured in days, so a test or a simulation
-    /// that had to wait for one to pass would never exercise expiry at all — the same reason `Reactor`
-    /// takes a `Clock`.
+    /// The same, with the day and the backing handed in.
+    ///
+    /// Both come from outside rather than out of the configuration, and for the same reason: a retention
+    /// window is measured in days, so a test that had to wait for one would never exercise expiry at all, and
+    /// a directory is a resource that has to be opened and checked before a thread owns it. `MemoryPendingConfig`
+    /// stays `Copy` because neither is in it.
     pub fn start_with_days(
         config: MemoryPendingConfig,
         days: DaySource,
+        backing: OpenBacking,
     ) -> Result<Self, LedgerError> {
         config.validate()?;
         let (commands, command_rx) = channel(config.queue_capacity);
@@ -491,7 +497,7 @@ impl MemoryPending {
                     config.capacity.slots(),
                     config.capacity.flush_blocks(),
                     config.capacity.resident_blocks(),
-                    config.store.build(config.seed ^ 0xb10c),
+                    config.store.build(backing, config.seed ^ 0xb10c),
                 ),
                 occupancy: worker_occupancy,
                 notices: notice_tx,
@@ -1135,7 +1141,8 @@ mod worker_tests {
     #[test]
     fn a_day_that_runs_out_arrives_as_notices_on_the_port() {
         let (days, day) = DaySource::manual(0);
-        let mut engine = MemoryPending::start_with_days(config(), days).expect("a test config");
+        let mut engine = MemoryPending::start_with_days(config(), days, OpenBacking::Memory)
+            .expect("a test config");
 
         let holds = RECORDS_PER_BLOCK + 1;
         for id in 1..=holds {

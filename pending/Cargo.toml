@@ -20,5 +20,10 @@ crc32c = "0.6"
 ledger-base.workspace = true
 ledger-stubkit.workspace = true
 
+# Only for the value of `O_DIRECT`, which `OpenOptions::custom_flags` takes as a number. Linux alone:
+# macOS has no such flag and its `F_NOCACHE` needs `fcntl`, which would need `unsafe` (rule 7).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 ledger-benchkit.workspace = true

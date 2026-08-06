@@ -1954,7 +1954,11 @@ idem and for consensus, so it does not belong inside the store's work. `status.m
 
 ### Still unbuilt, and named so it is not read as done
 
-- **Nothing reconciles at startup.** `reclaim` only frees a segment it has a block count for, and a
-  restart begins with none — so a file left by the previous life would never be removed, and sixty-three
-  days later the segment's reuse would write over the front of it. That is one call at the seam
-  (`existing()`, a bitmap of segments present) and it is not built, because nothing restarts yet.
+- **Nothing reconciles at startup**, but the worst of it is now refused rather than done. `reclaim` only
+  frees a segment it has a block count for and a restart begins with none, so a file a previous life left
+  behind is still never removed — a leak. What no longer happens is the damage: `open_with` uses `O_EXCL`, so
+  reusing that segment sixty-three days later *fails* instead of writing over the file's front and leaving a
+  mix of two days that nothing points into. A refusal seals, which is the safe end of it. The reconcile
+  itself is one call at the seam (`existing()`, a bitmap of segments present) and is not built, because
+  nothing restarts yet — and `a_segment_file_left_behind_is_refused_rather_than_written_over` is what holds
+  the position until it is.

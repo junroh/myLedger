@@ -7,7 +7,7 @@ use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{Ack, AckOutcome, LedgerError, Transfer};
 use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
-use ledger_pending::{DaySource, MemoryPending, MemoryPendingConfig, StoreModel};
+use ledger_pending::{DaySource, MemoryPending, MemoryPendingConfig, OpenBacking, StoreModel};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, ReactorConfig};
 use ledger_service::{ClientEndpoint, LedgerService, ServiceConfig};
@@ -145,6 +145,13 @@ impl Runner {
                 ..MemoryPendingConfig::default()
             },
             calendar.source(),
+            match options.store_dir {
+                None => OpenBacking::Memory,
+                Some(dir) => OpenBacking::files(std::path::Path::new(dir)).unwrap_or_else(|_| {
+                    eprintln!("ledgerfio: --store-dir {dir} cannot be opened");
+                    std::process::exit(2);
+                }),
+            },
         )
         .unwrap_or_else(|err| {
             // Refused rather than discovered: every window in the engine is derived from these
