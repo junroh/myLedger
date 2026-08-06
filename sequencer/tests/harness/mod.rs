@@ -13,7 +13,7 @@ use ledger_base::{
     Producer, Request, SystemClock, Transfer, TransferFlags, TxId,
 };
 use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
-use ledger_pending::{DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity};
+use ledger_pending::{DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity, StoreModel};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, Reactor, ReactorConfig, Transport};
 use ledger_stubkit::LatencyRange;
@@ -51,6 +51,27 @@ impl NoLatency {
         MemoryPendingConfig {
             overlay_soft_limit: 0,
             eviction_per_round: 1024,
+            ..Self::pending()
+        }
+    }
+
+    /// A store that refuses every call, which is the only way to reach the seal a device fault produces:
+    /// nothing else can make `MemoryStore` fail. Short windows beside it, so a run of a few holds actually
+    /// reaches the store rather than resolving everything out of the writeback buffer.
+    pub fn failing_store() -> MemoryPendingConfig {
+        MemoryPendingConfig {
+            // Windows short enough that a handful of holds seals a block, and an index wide enough that it
+            // does not fill first — otherwise `HoldNotStored` fires before the store is ever called, which is
+            // the other seal and not this one.
+            capacity: PendingCapacity {
+                daily_arrivals: 2_400,
+                ..Self::short_windows()
+            },
+            store: StoreModel {
+                fault_every: 1,
+                queue_depth: 8,
+                ..StoreModel::default()
+            },
             ..Self::pending()
         }
     }

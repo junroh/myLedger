@@ -183,15 +183,17 @@ pub fn decode(bytes: &[u8], _from: RecordAddr) -> (TxId, HoldData) {
     (key, hold)
 }
 
-/// What a store can fail at.
-///
-/// One variant, because without a device only one thing can go wrong: the store is asked for a block it
-/// does not have. That is not a miss — the index only ever names blocks that were written — so it is this
-/// node's own record of where blocks are having stopped agreeing with the store. A device that refuses a
-/// read for reasons of its own is a second variant, and it arrives with the device that can produce it.
+/// What a store can fail at. Two, and they are different in kind even though the reaction is the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreFault {
+    /// The store is asked for a block it does not have. Not a miss — the index only ever names blocks that
+    /// were written — so it is this node's own record of where blocks are having stopped agreeing with the
+    /// store.
     Missing,
+    /// The device refused: an `EIO`, or an `ENOSPC` on a store whose size retention was supposed to bound.
+    /// Our bookkeeping is intact and the block is not there anyway, which is why the reaction is the same
+    /// one — a hold this node cannot read is a resolution it cannot answer.
+    Device,
 }
 
 /// Whole blocks at a segment and an offset, written once and freed a segment at a time. Memory backs it
@@ -501,6 +503,10 @@ pub struct StoreModel {
     pub iops: u64,
     /// Reads it will hold at once. Past this the engine keeps the command and asks again.
     pub queue_depth: usize,
+    /// Fail every nth call the store is given, as a device would. A fault, and the only reason this exists:
+    /// the reaction to a store that will not do as it is told is rule 19's seal, and a seal nothing can
+    /// produce is a seal nothing has tested.
+    pub fault_every: u32,
 }
 
 impl StoreModel {
@@ -520,6 +526,7 @@ impl StoreModel {
             && self.sync_base_nanos == 0
             && self.sync_tail_nanos == 0
             && self.iops == 0
+            && self.fault_every == 0
     }
 }
 
@@ -576,6 +583,8 @@ pub struct LatencyStore {
     queue_depth: usize,
     /// Device time charged by synchronous calls and not yet handed to whoever has a clock.
     charged_nanos: u64,
+    fault_every: u32,
+    calls: u64,
 }
 
 impl LatencyStore {
@@ -600,22 +609,37 @@ impl LatencyStore {
             inflight: Vec::with_capacity(queue_depth),
             queue_depth,
             charged_nanos: 0,
+            fault_every: model.fault_every,
+            calls: 0,
         }
     }
 
     fn charge(&mut self, cost: Cost) {
         self.charged_nanos += cost.draw(&mut self.prng);
     }
+
+    /// Whether this call is the one the fault takes. Counted over every call rather than per kind, because a
+    /// device that is failing is not failing at one method.
+    fn refuses(&mut self) -> bool {
+        self.calls += 1;
+        self.fault_every > 0 && self.calls.is_multiple_of(u64::from(self.fault_every))
+    }
 }
 
 impl DurableStore for LatencyStore {
     fn open_with(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
         self.charge(self.write);
+        if self.refuses() {
+            return Err(StoreFault::Device);
+        }
         self.inner.open_with(segment, offset, block)
     }
 
     fn append(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
         self.charge(self.write);
+        if self.refuses() {
+            return Err(StoreFault::Device);
+        }
         self.inner.append(segment, offset, block)
     }
 
@@ -624,6 +648,9 @@ impl DurableStore for LatencyStore {
     /// are charged to it rather than to the device's queue.
     fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault> {
         self.charge(self.read);
+        if self.refuses() {
+            return Err(StoreFault::Device);
+        }
         self.inner.read_at(segment, offset, into)
     }
 
@@ -639,6 +666,9 @@ impl DurableStore for LatencyStore {
     fn poll(&mut self, now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
         let at = self.inflight.iter().position(|(.., due)| *due <= now)?;
         let (handle, segment, offset, _) = self.inflight.swap_remove(at);
+        if self.refuses() {
+            return Some(Err(StoreFault::Device));
+        }
         Some(self.inner.read_at(segment, offset, into).map(|()| handle))
     }
 
@@ -648,6 +678,9 @@ impl DurableStore for LatencyStore {
 
     fn sync(&mut self) -> Result<(), StoreFault> {
         self.charge(self.sync);
+        if self.refuses() {
+            return Err(StoreFault::Device);
+        }
         self.inner.sync()
     }
 
@@ -725,6 +758,15 @@ pub struct RecordLog {
     flushed: u64,
     /// Blocks handed back to the store, which is the only way it shrinks.
     freed: u64,
+    /// Faults the store has reported, and whether one is still owed to whoever can act on it.
+    ///
+    /// Latched rather than returned up the call stack, and the one round of delay is deliberate: a seal
+    /// belongs to the sequencer, the paths that meet a fault are three (a write inside compaction, an
+    /// apply-path read, a harvested completion), and threading a `Result` out of all three would put the
+    /// same decision in three places. Rule 19 is still what happens — nothing is answered from a faulted
+    /// read, and the seal follows on the next round.
+    faults: u64,
+    fault_owed: bool,
     left_memory: u64,
     buffer_reads: u64,
     resident_reads: u64,
@@ -774,6 +816,8 @@ impl RecordLog {
             died_in_buffer: 0,
             flushed: 0,
             freed: 0,
+            faults: 0,
+            fault_owed: false,
             left_memory: 0,
             buffer_reads: 0,
             resident_reads: 0,
@@ -831,6 +875,18 @@ impl RecordLog {
         freed
     }
 
+    /// Records that the store refused, whatever it refused. One counter and one flag: the reaction does not
+    /// vary with which call met it, because every one of them means a record this node cannot read.
+    fn note_fault(&mut self) {
+        self.faults += 1;
+        self.fault_owed = true;
+    }
+
+    /// Whether a fault is owed to whoever can act on it, taken as it is read.
+    pub fn take_fault(&mut self) -> bool {
+        std::mem::take(&mut self.fault_owed)
+    }
+
     /// Device time the store's synchronous calls have cost since this was last asked. Whoever has a clock
     /// turns it into a deadline of its own: the charge has one owner and each driver has its own time.
     pub fn take_store_charge(&mut self) -> u64 {
@@ -849,6 +905,11 @@ impl RecordLog {
         // store that can fail at it.
         if self.store.sync().is_ok() {
             self.unsynced = None;
+        } else {
+            // Coverage stops advancing on its own — `unsynced` is what it stops at and it is still set — so
+            // a snapshot cannot claim a block this failed to make durable. The seal is for the same reason
+            // as a failed write: a device refusing is one this node cannot go on writing to.
+            self.note_fault();
         }
         true
     }
@@ -1064,6 +1125,7 @@ impl RecordLog {
             .read_at(addr.segment(), addr.block_offset(), &mut self.scratch)
             .is_err()
         {
+            self.note_fault();
             return None;
         }
         let at = addr.index() as usize * RECORD_BYTES;
@@ -1087,7 +1149,14 @@ impl RecordLog {
     /// The next fetch finished by `now`. Completions may arrive in an order the reads were not asked
     /// in, which is what the orderer exists for.
     pub fn harvest(&mut self, now: u64) -> Option<(u64, RecordAddr, TxId, HoldData)> {
-        let handle = self.store.poll(now, &mut self.scratch)?.ok()?;
+        let completed = self.store.poll(now, &mut self.scratch)?;
+        let Ok(handle) = completed else {
+            // The lookup that asked will never be answered, and that is the honest outcome rather than a
+            // gap: its lane stalls, the seal below stops anything more being applied, and a drain that
+            // never completes is what says to replace this leader (rule 19).
+            self.note_fault();
+            return None;
+        };
         let addr = self.fetching.remove(&handle)?;
         self.store_reads += 1;
         let at = addr.index() as usize * RECORD_BYTES;
@@ -1111,6 +1180,7 @@ impl RecordLog {
             apply_store_reads: self.apply_store_reads,
             inflight_peak: self.inflight_peak,
             freed: self.freed,
+            store_faults: self.faults,
             ..LogTraffic::default()
         }
     }
@@ -1157,7 +1227,11 @@ impl RecordLog {
         // Nothing here can repair a store that would not take a block, and nothing here decides what to do
         // about it either: the index already points at these records, so the reaction is rule 19's seal and
         // it arrives with a store that can actually fail.
-        let _ = written;
+        if written.is_err() {
+            // The index already points at every record on this block, so they are unreachable and the log
+            // says they exist. Nothing here can repair that; the sequencer seals.
+            self.note_fault();
+        }
         // The oldest block a sync has not covered, and the position it began at. Only the first seal since a
         // sync records it: later ones are newer, and it is the oldest that bounds both coverage and which
         // slots a snapshot may keep.
@@ -1193,6 +1267,9 @@ pub struct LogTraffic {
     /// Blocks handed back once nothing in the index pointed into their day. The only way the store shrinks,
     /// and what makes its size a steady state rather than a total.
     pub freed: u64,
+    /// Times the store refused a call. Non-zero means the apply path has been sealed, or is about to be:
+    /// every one of them is a record this node cannot read and the log says exists.
+    pub store_faults: u64,
     pub buffer_reads: u64,
     /// Reads answered from a block that is on the store already and still in memory. The second window's
     /// whole return, and zero would mean it is not earning its size.

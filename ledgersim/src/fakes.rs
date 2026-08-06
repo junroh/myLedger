@@ -466,6 +466,9 @@ impl PendingFake {
         // Last in the round, so one sync covers everything it sealed — the cadence `PendingWorker` uses, and
         // the seeds should see the same one.
         state.store.sync();
+        if state.store.take_store_fault() {
+            state.notices.push_back(PendingNotice::StoreFailed);
+        }
         state.charge_device();
         let work = match (
             state.inbox.front().map(|(due, _)| *due),

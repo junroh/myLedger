@@ -80,3 +80,40 @@ fn nothing_is_committed_after_the_seal() {
     );
     harness.assert_consistent();
 }
+
+/// A store that refuses seals the apply path too, and it is counted apart from a hold the index could not
+/// take. Same condition — records the log says exist that this node cannot read — and a different cause, so
+/// a report has to be able to say which one fired.
+///
+/// It needs a fault to reach at all: `MemoryStore` cannot fail, which is why `--store-fault-every` exists.
+/// Without it this seal would be code nothing had ever run.
+#[test]
+fn a_store_that_refuses_seals_the_apply_path_and_says_so_separately() {
+    let mut harness = Harness::with_stubs(NoLatency::failing_store(), NoLatency::raft());
+    harness.fund(ALICE, FUNDING);
+
+    // Enough holds to push blocks out of the writeback buffer, because it is compaction that first hands
+    // one to the store — a block still in the buffer has never been written.
+    for _ in 0..512 {
+        let mut tx = harness.transfer(ALICE, BOB, 1);
+        tx.flags = TransferFlags::PENDING;
+        harness.submit(tx);
+    }
+    harness.tick_until("the store never reported refusing a call", |r| {
+        r.metrics().store_failures > 0
+    });
+
+    assert!(
+        harness.reactor.is_fail_stopped(),
+        "the store refused and the node kept applying"
+    );
+    assert!(
+        harness.logged(LogKind::STORE_FAILED),
+        "the seal went unrecorded, so there is nothing to diagnose it with"
+    );
+    assert_eq!(
+        harness.reactor.metrics().holds_not_stored,
+        0,
+        "a device fault was counted as an index that ran out, which sends an operator to the wrong place"
+    );
+}

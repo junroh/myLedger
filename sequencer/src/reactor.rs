@@ -469,6 +469,7 @@ where
             progress = true;
             match notice {
                 PendingNotice::HoldNotStored { hold } => self.on_hold_not_stored(hold),
+                PendingNotice::StoreFailed => self.on_store_failed(),
                 PendingNotice::HoldExpired { void } => {
                     if !self.expiry.park(void) {
                         self.metrics.expiry_dropped += 1;
@@ -499,6 +500,18 @@ where
                 hold.raw() as u64,
                 self.metrics.committed,
             );
+        }
+    }
+
+    /// The store under the engine refused something. Same condition as a hold it could not store and the
+    /// same treatment: records the log says exist cannot be read, so nothing more is applied or answered and
+    /// the drain that never completes is what says to replace this leader. Counted apart from
+    /// `holds_not_stored` because the causes are different — one is a table sized too small, the other a
+    /// device — and a report that could not tell them apart would send someone to the wrong place.
+    fn on_store_failed(&mut self) {
+        self.metrics.store_failures += 1;
+        if self.safety.seal_applies() {
+            self.record(LogKind::STORE_FAILED, 0, self.metrics.committed);
         }
     }
 

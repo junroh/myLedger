@@ -525,6 +525,13 @@ impl RunReport {
             };
             println!("  sweep         {swept} blocks of expiring days read ({per_void})");
         }
+        if self.metrics.store_failures > 0 {
+            println!(
+                "  SEALED        the store refused {} calls, so the node stopped applying: records the \
+                 log says exist cannot be read. --store-fault-every is what asks for this.",
+                self.metrics.store_failures
+            );
+        }
         if self.metrics.holds_not_stored > 0 {
             println!(
                 "  SEALED        {} committed holds the engine could not store: its index was sized \

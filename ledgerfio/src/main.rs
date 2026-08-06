@@ -170,6 +170,12 @@ fn print_help() {
     println!(
         "  --store-iops <n>            (0) reads a second that store can serve, 0 for no ceiling"
     );
+    println!(
+        "  --store-queue-depth <n>     (128) reads the store holds at once; past it reads are refused"
+    );
+    println!(
+        "  --store-fault-every <n>     (0) refuse every nth store call, so the seal is exercised"
+    );
     println!("  --overlay-limit <n>         (1M) ceiling on the sequencer's own hold decisions; in flight bounds it");
     println!("  --idem-latency <us>         (1:5) idem; every request pays it");
     println!("  --violate-order-every <n>   (0) return every nth lane reply out of order");

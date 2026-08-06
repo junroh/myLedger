@@ -307,6 +307,7 @@ struct TrafficGauge {
     days_behind: AtomicU64,
     days_of_slack: AtomicU64,
     swept_blocks: AtomicU64,
+    store_faults: AtomicU64,
 }
 
 impl TrafficGauge {
@@ -344,6 +345,8 @@ impl TrafficGauge {
             .store(traffic.days_of_slack, Ordering::Relaxed);
         self.swept_blocks
             .store(traffic.swept_blocks, Ordering::Relaxed);
+        self.store_faults
+            .store(traffic.store_faults, Ordering::Relaxed);
     }
 
     fn read(&self) -> LogTraffic {
@@ -367,6 +370,7 @@ impl TrafficGauge {
             days_behind: self.days_behind.load(Ordering::Relaxed),
             days_of_slack: self.days_of_slack.load(Ordering::Relaxed),
             swept_blocks: self.swept_blocks.load(Ordering::Relaxed),
+            store_faults: self.store_faults.load(Ordering::Relaxed),
         }
     }
 }
@@ -752,6 +756,9 @@ impl PendingWorker {
             // Taken after the round rather than before, because the round is what incurred it: the writes,
             // syncs and apply-path reads it just did are time this thread would have been inside a syscall
             // for. Absolute, so a real device under the model has already spent it and the gate is a no-op.
+            if self.engine.take_store_fault() {
+                self.owe(PendingNotice::StoreFailed);
+            }
             let owed = self.engine.take_store_charge();
             if owed > 0 {
                 self.busy_until = self.now() + owed;

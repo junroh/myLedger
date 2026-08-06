@@ -787,6 +787,12 @@ impl PendingEngine {
         self.records.sync()
     }
 
+    /// Whether the store has refused something since this was last asked. Taken as it is read, so the news
+    /// is handed over once.
+    pub fn take_store_fault(&mut self) -> bool {
+        self.records.take_fault()
+    }
+
     /// Device time the store's synchronous calls have cost since this was last asked. Whoever runs the loop
     /// owes it: it is time the thread would have spent inside a `pwrite`, an `fsync` or a `pread`, and no
     /// lookup gets served during it.

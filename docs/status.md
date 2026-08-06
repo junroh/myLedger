@@ -64,10 +64,11 @@ fences in one order.
   request is told the hold is missing, an answer that crossed the removal is not believed, and the
   judge is told it is resolved. One of the three left open is enough to lose the money.
 - **The engine can speak first.** A third direction on the port (`notices`), with a channel of its
-  own so news the engine sends is neither behind a reply nor in front of one. Two notices exist: a
+  own so news the engine sends is neither behind a reply nor in front of one. Three notices exist: a
   committed hold the index could not take seals the apply path (rule 19, where it used to be
-  detect-and-report), and a hold that outlived its retention is proposed for release. Design notes
-  §13.
+  detect-and-report), a store that refused a call seals it too and is counted apart because the cause is a
+  device rather than a table, and a hold that outlived its retention is proposed for release. Design notes
+  §13 and §16.
 
 ### Retention, and the expiry that makes it true
 
@@ -150,36 +151,48 @@ a resolution reads a record at a declared age rather than one written moments ag
 narrow windows for three seeds in four, so the fetch path runs while faults are on, and the sweep
 test asserts the store was reached.
 
-## Not built
+### The store's interface is a disk's, backed by memory
 
-### The store has a block interface, not a disk one — and that is the next piece of work
+`DurableStore` is a filesystem's vocabulary: a segment is a file, brought into being by its first block
+(`open_with`), appended to at an offset, read at an offset, made durable by `sync`, removed whole, and able to
+fail. `MemoryStore` backs it today and `LatencyStore` prices a device in front of any backend. Design notes
+§16.
 
-`BlockStore` is addressed the way the engine thinks (`write(addr, bytes)`, `read(addr, into)`,
-`free_segment`), and `MemBlockStore` is the whole of it. That was right while there was nothing below it, and
-it is the reason five of the design's storage questions cannot even be asked: what it does *not* have is
-anything a filesystem does. No file, no offset, no `fsync`, no notion of a write that has been accepted but
-not made durable, and no way for a read to fail.
+- **The offset is a function of the address** — the block number times the block size — so nothing has to be
+  restored to know where a block sits: a segment's file begins with a hole and its own blocks are one extent
+  inside it, and the extent map a filesystem already keeps *is* the layout. The relative form needed the
+  segment's first block, which is not derivable from the live slots, and a restore test proved it rather than
+  arguing it.
+- **Written is not durable**, and coverage follows the later one. A block a sync has not covered is not
+  carried by a snapshot, because a restart could not read it.
+- **A read can fail**, and both kinds do the same thing: `StoreFault::Missing` is this node's own record of
+  where blocks are disagreeing with the store, `Device` is an `EIO` or an `ENOSPC`. Either seals the apply
+  path through `PendingNotice::StoreFailed`, counted apart from `holds_not_stored` because one is a table
+  sized too small and the other a device. `--store-fault-every` is what produces one, and without it the seal
+  would be code nothing had run.
+- **A device's cost is charged where it lands.** A lookup's read occupies the device (`--store-read`,
+  `--store-iops`, `--store-queue-depth`); a write, a sync and an apply-path read occupy the thread
+  (`--store-write`, `--store-sync`), which is the thread every lookup passes through. The second pair is new
+  and it removed the one number this could not answer — the apply path's read latency.
+- **Blocks are 4096-byte aligned buffers**, because direct IO wants the address aligned as well as the offset,
+  and an unaligned buffer would cost a bounce copy per IO.
 
-**So the shape of the change is not "add a disk" but "make the interface a disk's, and back it with memory
-today."** The same move `stubkit` exists for: a seam the real thing slots into without the engine above
-changing, and a stand-in that is honest about being one. Blocks are already the right unit — four kilobytes,
-written once, never rewritten, freed a whole segment at a time — so what has to arrive is the vocabulary
-underneath them.
+What it unblocks, and what each is worth now:
 
-What it unblocks, which is most of why it is next:
-
-- **The speed contract.** `≤5ms worst case` is a claim about a device, and `StoreModel` prices one without
-  being one. `SE-OQ-6` cannot be answered from memory.
 - **`SE-OQ-4`**, the read backend — io_uring against a thread pool — is a choice between implementations of
-  exactly this interface, and there is nowhere to put either.
-- **Where a snapshot goes.** It is a byte stream today with no destination; a file is the destination, and the
-  question in the decisions list below is waiting on there being one.
-- **Durability at all.** Nothing here can yet distinguish "written" from "durable", which is the distinction
-  a checkpoint's coverage and a log's truncation both rest on.
-- **`SE-OQ-5`**, compression, is a property of what is written to a file rather than of a block in a map.
+  `submit` and `poll`, and it now has somewhere to live. Seven methods is the whole of a `FileStore`.
+- **`SE-OQ-6`**, the `≤5ms` worst case, is measurable against the model: at 40,000 store reads a second, 5ms
+  reads sustain 100k tx/s at p99.9 9.7ms — given a queue depth of 512, because 128 refuses reads and reports
+  the depth instead of the device. Against a real device it still needs a Linux host: macOS has no `O_DIRECT`.
+- **`SE-OQ-5`**, compression, is narrowed rather than answered: block-level compression would break the offset
+  rule, so it belongs inside a block, at the record.
+- **Where a snapshot goes** is still open, and it is the only one of the five that this did not move.
 
-Not started. The design's §3.4 and §4.7 are the inputs, and the decisions list has the three questions a
-snapshot's destination waits on.
+Three things are named as unbuilt in §16 rather than left to read as done: a startup reconcile for files a
+previous life left behind, a `Device` fault a real backend produces rather than a knob, and the recording of
+the apply index on each side.
+
+## Not built
 
 ### The negative answer the design asked for is refused
 
@@ -454,13 +467,15 @@ unanswered, and **when that default stops being safe**. The source design's own 
   engine one.
 
 - **Which of the design's storage questions are still untouched, and is that acceptable?**
-  *Default:* untouched. `SE-OQ-3` (a group spilling across blocks and what it costs in IO),
-  `SE-OQ-4` (io_uring against a thread pool), `SE-OQ-5` (compression), `SE-OQ-6` (the ≤5ms worst case
-  verified against a real device) and `SE-OQ-8` (provisioning down on the cache hit rate) all need a disk
-  under the block store, and there is none — `StoreModel` prices a device's latency and IOPS but is not
-  one.
-  *Stops being safe:* at the point a real device goes in, when all five become live at once. That is worth
-  knowing in advance rather than discovering as five surprises.
+  *Default:* three of the five have moved and two have not. `SE-OQ-4` (io_uring against a thread pool) is now
+  a choice between implementations of two methods on `DurableStore` rather than a question with nowhere to
+  live; `SE-OQ-5` (compression) is narrowed to inside a block, because block-level compression would break the
+  offset rule; `SE-OQ-6` (the ≤5ms worst case) is measurable against the model — 5ms reads sustain 100k tx/s
+  at p99.9 9.7ms with a queue depth of 512 — but not against a device, because macOS has no `O_DIRECT`.
+  Untouched: `SE-OQ-3` (a group spilling across blocks and what it costs in IO) and `SE-OQ-8` (provisioning
+  down on the cache hit rate).
+  *Stops being safe:* at the point a real device goes in. Fewer of them go live at once than before, and the
+  two that remain are both about IO volume rather than about the interface.
 
 ### Closed, and kept so a reader can tell a settled question from an open one
 

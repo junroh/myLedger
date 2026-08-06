@@ -19,6 +19,7 @@ impl LogKind {
     pub const APPLY_FAILED: u16 = 12;
     pub const INVARIANT_BROKEN: u16 = 13;
     pub const HOLD_NOT_STORED: u16 = 14;
+    pub const STORE_FAILED: u16 = 15;
 
     pub fn describe(event: &LogEvent) -> String {
         let LogEvent {
@@ -56,6 +57,10 @@ impl LogKind {
             Self::APPLY_FAILED => {
                 format!("[{micros}us] committed effect could not be applied: batch={a} error={b}")
             }
+            Self::STORE_FAILED => format!(
+                "[{micros}us] the store under the engine refused a call after {b} committed effects — \
+                 records the log says exist cannot be read"
+            ),
             Self::HOLD_NOT_STORED => format!(
                 "[{micros}us] the engine could not store a committed hold: hold={a:#x} after {b} \
                  committed effects — the index was sized for a maximum this has passed"

@@ -11,7 +11,7 @@ mod snapshot;
 /// what answers for them can be memory today and a file or a network volume later without the engine above
 /// changing, and without anything having to be restored to know where a block sits. Design notes §16.
 pub use block::{
-    DurableStore, LatencyStore, LogTraffic, MemoryStore, RecordAddr, StoreModel, BLOCK_BYTES,
+    DurableStore, LogTraffic, MemoryStore, RecordAddr, StoreModel, BLOCK_BYTES,
     DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS, RECORDS_PER_BLOCK, RECORD_BYTES, SEGMENTS,
 };
 /// Exported for the same reason as the overlay: a simulation that drives the engine itself needs the

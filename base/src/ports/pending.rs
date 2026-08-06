@@ -130,6 +130,12 @@ pub enum PendingNotice {
     /// building one needs the record — the two accounts, the ledger — which the engine has and the
     /// sequencer does not. The engine reads that record as part of the sweep; it needs it either way.
     HoldExpired { void: Transfer },
+    /// The store refused: a block it would not write, a read it would not answer, or a sync it would not
+    /// make durable. Whichever it was, records the log says exist are ones this node cannot read, and no
+    /// resolution of them can be answered — so it is the same condition as `HoldNotStored` and gets the same
+    /// treatment. It carries no id on purpose: a block holds up to fifty-one records and a failed read is
+    /// about a block, so naming one hold would name the wrong thing.
+    StoreFailed,
 }
 
 /// What the sequencer has decided about a hold and not handed over yet. It exists nowhere else: the

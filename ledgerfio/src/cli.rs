@@ -85,6 +85,13 @@ pub struct Options {
     pub store_sync: LatencyRange,
     /// Reads a second the store can serve, zero for no ceiling.
     pub store_iops: u64,
+    /// Reads the store will hold at once. It bounds what a slow read can hide behind: at a rate that needs
+    /// more outstanding than this, the store refuses reads and the run reports the depth rather than the
+    /// device. 40,000 reads a second at 5ms needs about two hundred.
+    pub store_queue_depth: usize,
+    /// Make the store refuse every nth call, to prove the sequencer seals. A device fault rather than a
+    /// latency, and the only reason it exists: a seal nothing can produce is a seal nothing has tested.
+    pub store_fault_every: u32,
     /// Holds the engine's overlay may keep before idle ones are evicted. Small enough and a resolution
     /// has to ask the engine, which is the only way a run reaches the fetch path at all.
     pub overlay_limit: usize,
@@ -146,6 +153,8 @@ impl Default for Options {
             store_write: LatencyRange::fixed(Duration::ZERO),
             store_sync: LatencyRange::fixed(Duration::ZERO),
             store_iops: 0,
+            store_queue_depth: 128,
+            store_fault_every: 0,
             overlay_limit: 1 << 20,
             idem_latency: LatencyRange::new(Duration::from_micros(1), Duration::from_micros(5)),
             violate_order_every: 0,
@@ -281,6 +290,8 @@ impl Cli {
             "store-write" => options.store_write = Self::latency(value)?,
             "store-sync" => options.store_sync = Self::latency(value)?,
             "store-iops" => options.store_iops = Self::count(value)?,
+            "store-queue-depth" => options.store_queue_depth = Self::count(value)?.max(1) as usize,
+            "store-fault-every" => options.store_fault_every = Self::count(value)? as u32,
             "overlay-limit" => options.overlay_limit = Self::count(value)? as usize,
             "idem-latency" => options.idem_latency = Self::latency(value)?,
             "violate-order-every" => options.violate_order_every = Self::count(value)? as u32,

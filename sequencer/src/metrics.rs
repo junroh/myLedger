@@ -60,6 +60,9 @@ pub struct Metrics {
     /// means the node sealed its apply path — the hold is in the log and no resolution of it can ever be
     /// answered.
     pub holds_not_stored: u64,
+    /// Calls the store under the engine refused. Apart from `holds_not_stored` because one is a table sized
+    /// too small and the other a device, and the two send an operator to different places.
+    pub store_failures: u64,
     /// Holds released for outliving their retention: expiry voids that **committed**, one each.
     ///
     /// Counted at the commit and not at the admission, which is where it was. The two were the same number
@@ -135,6 +138,7 @@ impl Metrics {
             stale_answers,
             invariant_breaks,
             holds_not_stored,
+            store_failures,
             holds_expired,
             expiry_refused,
             expiry_dropped,

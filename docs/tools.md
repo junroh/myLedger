@@ -138,6 +138,14 @@ decides what the prediction is worth:
   exact store, which every other answer is measured against. Design notes §16 has the measured curves; the
   short of it is that a per-block write is roughly four times as expensive per microsecond as a sync, because
   one sync covers every block a round sealed and a write does not.
+- **The read queue's depth is a flag, and it bounds what a slow read can hide behind.**
+  `--store-queue-depth` (128) is how many reads the store holds at once; past it reads are refused and the
+  engine keeps the command. At 40,000 store reads a second, 5ms reads need about two hundred outstanding — at
+  128 the run reports p50 212ms and that number is the depth rather than the device, at 512 it is p99.9 9.7ms
+  with throughput intact. A `--store-read` number is only about the device once the depth is not the limit.
+- **`--store-fault-every` makes the store refuse**, which is the only way to reach the seal a device fault
+  produces: `MemoryStore` cannot fail. The run says `SEALED` and `fail-stop=true`, and the count is separate
+  from a hold the index could not take.
 - **Reaching a store read takes two flags at once, and neither alone does it.** A read happens only when a
   resolution needs a record that is no longer in memory, so the residency window has to be short enough to
   fall out of (`--residency 1`) *and* the hold has to be resolved after it does but still inside the run

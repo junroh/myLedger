@@ -942,9 +942,11 @@ only where marked — is exact, and needs no probability at all.
 > bounding latency. Every length and share is configuration, and the declared share is checkable: `died in
 > buffer` measures the same quantity the declaration claims.
 
-An address is `(segment, block, index)` packed into the forty-eight bits a slot has spare: six bits of
-segment, thirty-six of block, six of index. The source design packs the same three into forty because
-its slot is a byte smaller and spends the difference on a narrower block field. A block is four
+An address is `(segment, block, index)` packed into the forty-seven bits a slot has spare: six bits of
+segment, thirty-five of block, six of index. Forty-seven and not forty-eight because the slot spends its
+last bit on saying whether a fingerprint is shared (§11), which is where the block field's thirty-fifth
+comes from — this said thirty-six, and the code has never been. The source design packs the same three into
+forty because its slot is a byte smaller and spends the difference on a narrower block field. A block is four
 kilobytes — the unit one read fetches, and so the unit the speed contract is written against — and a
 record is eighty bytes packed, which puts fifty-one on a block. The design's sixty-four per block needs
 its 128-byte record halved by compression; uncompressed that figure is thirty-two. The intra-block
@@ -1876,12 +1878,31 @@ which is why the depth is in `status.md`'s decisions list rather than described 
 stress point rather than a design one: forcing every resolution to miss memory is what the two flags are for,
 and a 24-hour residency exists so that a deployment does not.
 
+### The fault a device produces, and the one seal it shares
+
+`StoreFault` has two variants and one reaction, which is the honest shape: `Missing` is this node's own record
+of where blocks are having stopped agreeing with the store, `Device` is an `EIO` or the `ENOSPC` that retention
+was supposed to make impossible, and either way a record the log says exists is one this node cannot read. So
+both seal the apply path, through a third notice — `PendingNotice::StoreFailed`, which carries no id because a
+block holds up to fifty-one records and a failed read is about a block.
+
+Counted apart from `holds_not_stored` all the same. The two conditions are identical and their *causes* are
+not: one is a table sized for a maximum the run passed, the other is a device, and a report that could not
+tell them apart would send an operator to the wrong place.
+
+**The fault is latched rather than returned up the stack, and the one round of delay is deliberate.** Three
+paths meet a fault — a write inside compaction, an apply-path read, a harvested completion — and threading a
+`Result` out of all three would put one decision in three places. Nothing is answered from a faulted read in
+the meantime, so rule 19 still holds: what the latch delays is the seal, not the stopping.
+
+`--store-fault-every` is what produces one, and it is a fault knob for the same reason
+`--violate-order-every` is: `MemoryStore` cannot fail, so without it this seal would be code nothing had ever
+run. `a_store_that_refuses_seals_the_apply_path_and_says_so_separately` is the test, and setting it up found
+its own trap — the short windows that make a test reach the store at all also size the index for two dozen
+holds, so `HoldNotStored` fired first and the test passed for the wrong reason.
+
 ### Still unbuilt, and named so it is not read as done
 
-- **A fault a device can produce.** `StoreFault` has one variant, `Missing`, and it means this node's own
-  record of where blocks are has stopped agreeing with the store. A device variant, and the rule 19 seal
-  that both deserve, arrive with a backend that can fail — today a write that a store would not take is
-  counted by nobody, because no store refuses one.
 - **Nothing reconciles at startup.** `reclaim` only frees a segment it has a block count for, and a
   restart begins with none — so a file left by the previous life would never be removed, and sixty-three
   days later the segment's reuse would write over the front of it. That is one call at the seam

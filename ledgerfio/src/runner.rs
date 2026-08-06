@@ -135,7 +135,8 @@ impl Runner {
                         .saturating_sub(options.store_sync.min))
                     .as_nanos() as u64,
                     iops: options.store_iops,
-                    queue_depth: 128,
+                    queue_depth: options.store_queue_depth,
+                    fault_every: options.store_fault_every,
                 },
                 capacity: options.capacity,
                 index_budget_bytes: options.index_budget as usize,
