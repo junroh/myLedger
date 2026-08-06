@@ -51,12 +51,14 @@ group. The two meet only where a chain resolves a group, which is the coverage c
 | **pending engine** | where holds live: the index, the two memory windows, the blocks. | `MemoryPending`, `PendingPort`, `PendingEngine` |
 | **idem** | the component that records transaction ids so a resend is answered as a duplicate — **and** returns a lane's replies in seq order. Only the second is why anything calls it (rule 21). | `MemoryIdem`, `IdempotencyPort`, `IdemAsk`, `IdemVerdict` |
 | **consensus** | the replicated log. An echo today. | `EchoRaft`, `RaftPort` |
+| **checkpoint** | the pending engine's own state written down so recovery replays the log's tail instead of all of it — and so the log can be truncated at all (`truncate_index <= checkpoint_covered_index`). Raft literature calls this a **snapshot**; one word here, and it is this one. Not durability, which the log already has: this state is a deterministic function of the log, so what a checkpoint buys is recovery time and the right to throw log away. Not built. | design §6.2, and *Recovery is not real* in `status.md` |
 
 **One name for the third one, and it took a rename to get there.** The crate, the port and every message
 said `Idem`; the type said `Dedup`, so every assembler that constructed it — the load driver, `ledgerd`, the
 test harness, two benches, the simulator — said `dedup` too, and so did the prose. Two words for one
 component is what rule 3 forbids, and this is what it looks like when the offender is a *type* name: the
 minority word spreads to everything that mentions the type. `idem` is the one word now.
+
 
 ## Order and safety
 
