@@ -537,8 +537,21 @@ impl RecordLog {
     /// Position zero means it covers nothing, which is a legitimate answer rather than a missing one: a
     /// snapshot of an engine that has applied nothing is what a follower starting from empty receives.
     pub fn sealed_through(&self, applied_through: ApplyIndex) -> ApplyIndex {
-        match self.buffer.front().filter(|block| block.filled > 0) {
-            Some(oldest) => ApplyIndex(oldest.began_at.raw().saturating_sub(1)),
+        // The block being filled comes first when it has anything in it, because its records are *out of the
+        // buffer and not on the store*. Reading only the buffer was a real defect: coverage claimed a
+        // hundred and fifty-three while the records of position a hundred and three sat in this block, so the
+        // snapshot left their slots out and replay started after them. The holds were simply gone.
+        //
+        // Its stamp comes from the buffered block compaction drained into it, which is a lower bound on its
+        // survivors' own positions — conservative in the safe direction.
+        let unsealed = [
+            &self.store_open,
+            self.buffer.front().unwrap_or(&self.store_open),
+        ]
+        .into_iter()
+        .find(|block| block.filled > 0);
+        match unsealed {
+            Some(block) => ApplyIndex(block.began_at.raw().saturating_sub(1)),
             None => applied_through,
         }
     }
@@ -633,13 +646,23 @@ impl RecordLog {
     /// Writes a survivor on towards the store and answers its lasting address. The block it lands in
     /// is written out once full, so survivors of several buffered blocks share one — a block per flush
     /// would multiply the space a tenth of the records occupy.
-    pub fn keep(&mut self, key: TxId, hold: &HoldData) -> BlockAddr {
+    pub fn keep(&mut self, key: TxId, hold: &HoldData, from: ApplyIndex) -> BlockAddr {
         if self.store_open.full() {
             self.seal_store_block();
         }
-        let index = self.store_open.put(key, hold);
+        let index = self.store_open.put_at(key, hold, from);
         self.flushed += 1;
         BlockAddr::new(self.segment, self.next_block, index as u8)
+    }
+
+    /// The position the oldest buffered block began at, for compaction to carry on to the block it drains
+    /// into. A lower bound on the positions of that block's survivors, which is what coverage wants: erring
+    /// low costs replay a little and cannot claim a record is sealed that is not.
+    pub fn oldest_began_at(&self) -> ApplyIndex {
+        self.buffer
+            .front()
+            .map(|block| block.began_at)
+            .unwrap_or_default()
     }
 
     /// Drops the oldest buffered block. Everything in it that mattered has been kept by now.

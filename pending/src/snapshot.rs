@@ -34,10 +34,14 @@ use crate::block::RecordLog;
 use crate::engine::BudgetState;
 use crate::index::{address_in, HoldTable};
 
-/// Every record in the format, header included. Four eight-byte slots make a bucket exactly this wide, and
-/// a group entry fits inside it, so the stream is a sequence of same-sized records and a chunk never splits
-/// one.
+/// Every record in the format, header included. Four eight-byte slots make a bucket exactly this wide, and a
+/// group entry fits inside it, so the stream is a sequence of same-sized records and a chunk never splits one.
 pub const RECORD: usize = 32;
+
+/// The header takes two, because six fields do not fit in one — and widening every record in the format to
+/// hold them would waste the difference on every bucket, of which there are hundreds of millions. Wasting
+/// half of one record once is the cheaper end of that trade.
+const HEADER: u64 = 2;
 
 /// Little-endian by declaration and not by inheritance, for the same reason the block format is (§12): the
 /// moment these bytes leave the process they are a format, and a format that borrows the machine's byte
@@ -47,7 +51,7 @@ const MAGIC: u64 = 0x5041_5f53_4e41_5031;
 /// Bumped when the layout of any record changes. A reader that does not know a version refuses the stream
 /// rather than interpreting it, because the alternative is a table restored from bytes that meant something
 /// else.
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 
 /// Why a stream could not be read. Every one of them is a refusal rather than a repair: a snapshot that
 /// does not describe this table is not a snapshot to make the best of.
@@ -73,6 +77,7 @@ pub struct SnapshotWriter<'a> {
     records: &'a RecordLog,
     groups: Vec<(BudgetGroup, BudgetState)>,
     coverage: ApplyIndex,
+    groups_reflect: ApplyIndex,
     /// Records already written, header included, so a chunk resumes rather than restarting.
     at: u64,
 }
@@ -83,6 +88,7 @@ impl<'a> SnapshotWriter<'a> {
         records: &'a RecordLog,
         budgets: &FxHashMap<BudgetGroup, BudgetState>,
         coverage: ApplyIndex,
+        groups_reflect: ApplyIndex,
     ) -> Self {
         // Sorted, so two writers over the same state produce the same bytes. A map's iteration order is not
         // a promise, and a snapshot that differed between nodes for no reason would be one nothing could
@@ -95,13 +101,14 @@ impl<'a> SnapshotWriter<'a> {
             records,
             groups,
             coverage,
+            groups_reflect,
             at: 0,
         }
     }
 
     /// Records the whole stream holds: the header, one per bucket, one per group.
     pub fn records(&self) -> u64 {
-        1 + self.index.bucket_count() as u64 + self.groups.len() as u64
+        HEADER + self.index.bucket_count() as u64 + self.groups.len() as u64
     }
 
     pub fn bytes(&self) -> u64 {
@@ -134,8 +141,16 @@ impl<'a> SnapshotWriter<'a> {
                 into[24..32].copy_from_slice(&self.coverage.raw().to_le_bytes());
                 Some(())
             }
-            at if at <= buckets => {
-                let words = self.index.bucket_words((at - 1) as usize);
+            1 => {
+                into.fill(0);
+                // The position the group totals reflect, which is this writer's own instant rather than the
+                // coverage above — see `PendingEngine::groups_reflect`. The two differ by whatever the
+                // writeback buffer is holding, and replay needs both.
+                into[0..8].copy_from_slice(&self.groups_reflect.raw().to_le_bytes());
+                Some(())
+            }
+            at if at < HEADER + buckets => {
+                let words = self.index.bucket_words((at - HEADER) as usize);
                 for (way, word) in words.iter().enumerate() {
                     // A slot pointing at a record that is not on a sealed block is written out empty. Its
                     // record is in the writeback buffer or in the block still being filled, so it will not
@@ -148,11 +163,14 @@ impl<'a> SnapshotWriter<'a> {
                 Some(())
             }
             at => {
-                let (id, state) = self.groups.get((at - buckets - 1) as usize)?;
+                let (id, state) = self.groups.get((at - buckets - HEADER) as usize)?;
                 into.fill(0);
+                // Sixteen for the id, four for the members, and the remaining and the watermark packed into
+                // the eight bytes each that are left. A group's totals are useless without the position they
+                // reflect — see `BudgetState::at` — so both travel or neither does.
                 into[0..16].copy_from_slice(&id.raw().to_le_bytes());
-                into[16..20].copy_from_slice(&state.members().to_le_bytes());
-                into[20..28].copy_from_slice(&state.remaining().to_le_bytes());
+                into[16..24].copy_from_slice(&state.remaining().to_le_bytes());
+                into[24..28].copy_from_slice(&state.members().to_le_bytes());
                 Some(())
             }
         }
@@ -165,6 +183,7 @@ pub struct SnapshotReader {
     buckets: u64,
     groups_expected: u64,
     coverage: ApplyIndex,
+    groups_reflect: ApplyIndex,
     /// Records taken so far, header included.
     at: u64,
     groups: FxHashMap<BudgetGroup, BudgetState>,
@@ -176,6 +195,7 @@ impl SnapshotReader {
             buckets: 0,
             groups_expected: 0,
             coverage: ApplyIndex::default(),
+            groups_reflect: ApplyIndex::default(),
             at: 0,
             groups: FxHashMap::default(),
         }
@@ -220,19 +240,23 @@ impl SnapshotReader {
                 }
                 Ok(())
             }
-            at if at <= self.buckets => {
+            1 => {
+                self.groups_reflect = ApplyIndex(u64_at(0));
+                Ok(())
+            }
+            at if at < HEADER + self.buckets => {
                 let words = [u64_at(0), u64_at(8), u64_at(16), u64_at(24)];
-                match index.restore_bucket((at - 1) as usize, words) {
+                match index.restore_bucket((at - HEADER) as usize, words) {
                     true => Ok(()),
                     false => Err(NotASnapshot::Malformed),
                 }
             }
-            at if at <= self.buckets + self.groups_expected => {
+            at if at < HEADER + self.buckets + self.groups_expected => {
                 let id = BudgetGroup(u128::from_le_bytes(
                     record[0..16].try_into().expect("16 bytes"),
                 ));
-                let members = u32_at(16);
-                let remaining = u64_at(20) as Amount;
+                let remaining = u64_at(16) as Amount;
+                let members = u32_at(24);
                 self.groups
                     .insert(id, BudgetState::restored(members, remaining));
                 Ok(())
@@ -246,13 +270,19 @@ impl SnapshotReader {
     /// Whether every record the header promised has arrived. A stream cut short leaves a table that is
     /// partly this snapshot and partly whatever it was, which is why the caller has to ask.
     pub fn is_complete(&self) -> bool {
-        self.at == 1 + self.buckets + self.groups_expected
+        self.at == HEADER + self.buckets + self.groups_expected
     }
 
     /// The log position this snapshot's state reflects: replay starts after it. Meaningful once the header
     /// has arrived, which is the first record.
     pub fn coverage(&self) -> ApplyIndex {
         self.coverage
+    }
+
+    /// The position the group totals reflect — see `PendingEngine::groups_reflect`. Replay needs it beside
+    /// the coverage above, because the two are different instants.
+    pub fn groups_reflect(&self) -> ApplyIndex {
+        self.groups_reflect
     }
 
     /// The group totals, once the stream is complete.
@@ -355,7 +385,8 @@ mod tests {
             reader.is_complete(),
             "the stream ended before its header said"
         );
-        into.restore_groups(reader.into_groups());
+        let coverage = reader.coverage();
+        into.restore(reader.into_groups(), coverage);
         Ok(())
     }
 
@@ -504,6 +535,150 @@ mod tests {
                 "a hold from after coverage was carried, so replay would create it twice"
             );
         }
+    }
+
+    /// Restore plus replay reproduces the engine, which is the whole chain and the reason for all of it.
+    ///
+    /// The log here is the test's own list of what was applied and where, because the real one is Raft's and
+    /// Raft is a stand-in. What is being proved is the engine's half: that a snapshot covering an earlier
+    /// position, plus every effect after it, lands on the same answers as never having stopped.
+    ///
+    /// Deliberately not asserted: that the two engines' blocks match. A replayed `Reduce` appends a version
+    /// again, so the restored engine's layout differs — the index points at the newest either way, so every
+    /// answer agrees and one record is wasted. Answers are the contract; layout is not.
+    #[test]
+    fn restore_and_replay_reproduce_the_engine() {
+        let group = BudgetGroup(9);
+        let (mut engine, mut restored) = pair(1 << 12, 4);
+
+        // A log of what was applied and where, the way a real one would be read back.
+        let mut log: Vec<(PendingEffect, ApplyIndex)> = Vec::new();
+        let holds = RECORDS_PER_BLOCK * 6;
+        for id in 1..=holds as u64 {
+            let at = ApplyIndex(id);
+            let effect = create(id as u128, group);
+            engine.write(effect, at).expect("the index took the hold");
+            log.push((effect, at));
+        }
+        // A settle of one member in full, which is the only way a group member may be resolved, and a
+        // partial settle of a hold with no group, which is the shape that appends a new version.
+        let mut next = holds as u64 + 1;
+        for id in [1u128, 2, 3] {
+            let at = ApplyIndex(next);
+            let effect = PendingEffect::Remove {
+                pending_ref: TxId(id),
+                budget: group,
+                released: 100,
+            };
+            engine.write(effect, at).expect("a removal frees a slot");
+            log.push((effect, at));
+            next += 1;
+        }
+        let lone = next as u128 + 1000;
+        for effect in [
+            create(lone, BudgetGroup::ABSENT),
+            PendingEffect::Reduce {
+                pending_ref: TxId(lone),
+                debit_account: AccountId(1),
+                credit_account: AccountId(2),
+                amount: 100,
+                remaining: 40,
+                ledger: 1,
+                budget: BudgetGroup::ABSENT,
+            },
+        ] {
+            let at = ApplyIndex(next);
+            engine.write(effect, at).expect("applied");
+            log.push((effect, at));
+            next += 1;
+        }
+
+        let covered = engine.coverage();
+        assert!(
+            covered.raw() > 0 && covered.raw() < next,
+            "coverage {covered:?} is not between nothing and everything, so this proves little"
+        );
+
+        round_trip(&engine, &mut restored).expect("a snapshot of this engine");
+        assert_eq!(
+            restored.coverage(),
+            covered,
+            "the restored engine forgot where it stood"
+        );
+
+        // Everything after coverage, in order, the way recovery reads it.
+        let reflects = engine.applied_through();
+        for (effect, at) in log.iter().filter(|(_, at)| *at > covered) {
+            restored
+                .replay(*effect, *at, reflects)
+                .expect("replay applied");
+        }
+
+        for id in 1..=next as u128 + 1000 {
+            let before = engine.lookup(TxId(id)).map(|hold| {
+                (
+                    hold.remaining,
+                    hold.budget_members,
+                    hold.budget_remaining,
+                    hold.debit_account,
+                )
+            });
+            let after = restored.lookup(TxId(id)).map(|hold| {
+                (
+                    hold.remaining,
+                    hold.budget_members,
+                    hold.budget_remaining,
+                    hold.debit_account,
+                )
+            });
+            assert_eq!(before, after, "hold {id} differs after restore and replay");
+        }
+        assert!(
+            restored.counts_agree(),
+            "the restored table's counts do not add up"
+        );
+    }
+
+    /// The one effect that is not idempotent on its own: a `Create` arriving again would give one key two
+    /// slots, and then one `remove` clears one and the other survives — a resolved hold alive again, with its
+    /// money reserved for good. `replay` turns it into a repoint; `write` does not, because that path cannot
+    /// meet the case and finding out costs it a record read (see `Arrival`).
+    #[test]
+    fn a_create_arriving_again_repoints_rather_than_inserting_twice() {
+        let (mut engine, _) = pair(1 << 12, 4);
+        let effect = create(1, BudgetGroup(3));
+        engine.write(effect, ApplyIndex(1)).expect("applied");
+        let once = engine.lookup(TxId(1)).expect("the hold");
+
+        // Told that the totals already reflect this position, which is what a restore's header says. Without
+        // that the group would count the member twice, and it is the caller's to supply for exactly that
+        // reason — see `PendingEngine::replay`.
+        engine
+            .replay(effect, ApplyIndex(1), ApplyIndex(1))
+            .expect("replayed");
+        let twice = engine.lookup(TxId(1)).expect("the hold is still one hold");
+        assert_eq!(once.remaining, twice.remaining);
+        assert_eq!(
+            (once.budget_members, once.budget_remaining),
+            (twice.budget_members, twice.budget_remaining),
+            "the group counted the same member twice"
+        );
+
+        // And one removal is enough to end it, which is the failure a second slot would have caused.
+        engine
+            .write(
+                PendingEffect::Remove {
+                    pending_ref: TxId(1),
+                    budget: BudgetGroup(3),
+                    released: 100,
+                },
+                ApplyIndex(2),
+            )
+            .expect("applied");
+        assert!(
+            engine.lookup(TxId(1)).is_none(),
+            "a second slot survived the removal"
+        );
     }
 
     /// A snapshot only restores into a table of the same size, and a mismatch is refused rather than

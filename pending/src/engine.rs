@@ -99,6 +99,22 @@ struct Sweep {
     at_block: u64,
 }
 
+/// Whether an effect is arriving for the first time or again.
+///
+/// Replay is a mode rather than a flag on the effect because it changes exactly one thing, and that thing
+/// costs a read. A `Create` for a key the index already holds has to become a repoint, and telling "this
+/// key is already here" from "another key with the same fingerprint" means reading a record — a slot
+/// holds a fingerprint, not a key. On the path that applies committed decisions in order that read is an
+/// IO nothing can hide, and §11's claim that the apply path reads nothing is a property worth keeping.
+/// It is also a read for a case that path can never meet: a client cannot create one hold twice, because
+/// idem refuses the resend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Arrival {
+    First,
+    /// Again, with the position the group totals already reflect — see `PendingEngine::replay`.
+    Again(ApplyIndex),
+}
+
 /// A hold the index could not take, on its way out of the engine. Named rather than returned as a bare
 /// `TxId` because what the caller has to do with it is not retry — there is nowhere for the hold to go,
 /// the table was sized for a declared maximum and that maximum has been passed — but tell the sequencer,
@@ -250,6 +266,14 @@ impl PendingEngine {
 
     /// Whether the record at this address carries this key. Only asked when the index says a fingerprint
     /// is shared, which in a deployment that has never seen a collision is never.
+    /// Whether the index already has this key. Reads a record where a fingerprint is shared, which is why
+    /// only `replay` asks — see `Arrival`.
+    fn holds(&mut self, key: TxId) -> bool {
+        let Self { index, records, .. } = self;
+        let mut verify = Self::verifier(records, key);
+        index.addr_of(key, &mut verify).is_some()
+    }
+
     fn verifier(records: &mut RecordLog, key: TxId) -> impl FnMut(BlockAddr) -> bool + '_ {
         move |addr| records.read(addr).is_some_and(|(found, _)| found == key)
     }
@@ -264,6 +288,35 @@ impl PendingEngine {
     /// `Create` inserts — a `Reduce` repoints an existing slot and a `Remove` frees one — so it is the
     /// only variant that can report it.
     pub fn write(&mut self, effect: PendingEffect, at: ApplyIndex) -> Result<(), NotStored> {
+        self.apply_effect(effect, at, Arrival::First)
+    }
+
+    /// The same effect arriving again, which is what recovery does between a snapshot's coverage and now.
+    ///
+    /// Safe to call on state that already reflects the effect, which is the property the whole boundary rests
+    /// on (design notes §15): a `Remove` of a hold that is gone returns before touching anything, a `Reduce`
+    /// repoints to the same or a newer address and appends one wasted record version, a `Reduce`'s group
+    /// arithmetic does not exist because a group member cannot be resolved in part, and a `Create` becomes a
+    /// repoint here rather than a second slot for one key.
+    /// `groups_reflect` is the position the restored group totals already reflect, which the snapshot's
+    /// header carries. It is an argument rather than state the engine keeps because a caller cannot then
+    /// forget to supply it: replay without it silently counts a member twice, and the totals are the one part
+    /// of a snapshot that is accumulated rather than derived.
+    pub fn replay(
+        &mut self,
+        effect: PendingEffect,
+        at: ApplyIndex,
+        groups_reflect: ApplyIndex,
+    ) -> Result<(), NotStored> {
+        self.apply_effect(effect, at, Arrival::Again(groups_reflect))
+    }
+
+    fn apply_effect(
+        &mut self,
+        effect: PendingEffect,
+        at: ApplyIndex,
+        arrival: Arrival,
+    ) -> Result<(), NotStored> {
         self.applied += 1;
         // Recorded before the effect, so a block sealed while this one is being written is stamped with the
         // position *before* it rather than after. Coverage errs early, which costs replay a little and
@@ -278,6 +331,11 @@ impl PendingEngine {
                 ledger,
                 budget,
             } => {
+                // Already here means this effect is arriving again, so the hold keeps its place in the
+                // index and its place in the group: a second insert would give one key two slots, and one
+                // `remove` would then clear only one of them — a resolved hold alive again, its money
+                // reserved for good.
+                let already = matches!(arrival, Arrival::Again(_)) && self.holds(tx_id);
                 let stored = self.put(
                     tx_id,
                     HoldData {
@@ -290,9 +348,19 @@ impl PendingEngine {
                         budget_members: 0,
                         budget_remaining: 0,
                     },
-                    true,
+                    !already,
                 );
-                if !budget.is_absent() {
+                // Counted once, and `already` is not the question. A snapshot carries the group totals as of
+                // its own instant and the slots as of its coverage, which is earlier — so a member can be in
+                // the totals and out of the index at the same time, and asking the index would count it
+                // twice. What decides is whether the totals already reflect this position.
+                //
+                // Measured on the first test that tried it the other way: a group of 303 came back as 456.
+                let counted = match arrival {
+                    Arrival::First => ApplyIndex::default(),
+                    Arrival::Again(reflect) => reflect,
+                };
+                if !budget.is_absent() && at > counted {
                     let state = self.budgets.entry(budget).or_default();
                     state.members += 1;
                     state.remaining += amount;
@@ -370,6 +438,8 @@ impl PendingEngine {
                 let Some(state) = self.budgets.get_mut(&budget) else {
                     return Ok(());
                 };
+                // No guard here: the decrement is behind the index removal, which finds nothing the second
+                // time and returns above before reaching a total.
                 state.members = state.members.saturating_sub(1);
                 state.remaining -= released;
                 if state.members == 0 {
@@ -433,9 +503,12 @@ impl PendingEngine {
                     died += 1;
                 }
             }
+            // The block being drained carries its position on to the one being filled, so coverage knows
+            // where the records that are out of the buffer but not on the store begin.
+            let from = self.records.oldest_began_at();
             for index in 0..self.survivors.len() {
                 let (key, hold, old) = self.survivors[index];
-                let new = self.records.keep(key, &hold);
+                let new = self.records.keep(key, &hold, from);
                 self.index.replace(key, old, new);
             }
             self.records.drop_oldest(died);
@@ -701,6 +774,12 @@ impl PendingEngine {
     /// The log position a snapshot of this engine would cover: everything up to it has reached a block, so
     /// replay starts after it and rebuilds what the writeback buffer still holds.
     ///
+    /// The position the group totals reflect, which is everything this engine has applied. A snapshot carries
+    /// it beside its coverage because the two are different instants, and replay needs both.
+    pub fn applied_through(&self) -> ApplyIndex {
+        self.applied_through
+    }
+
     /// Zero means it covers nothing, which is what an engine that has applied nothing reflects — and a
     /// legitimate snapshot rather than a missing one, since a follower starting from empty receives exactly
     /// that.
@@ -712,7 +791,13 @@ impl PendingEngine {
     /// cannot apply anything while a snapshot is in flight, which is the stable read the design asks for and
     /// the only form of it that exists yet (design notes §15).
     pub fn snapshot(&self) -> SnapshotWriter<'_> {
-        SnapshotWriter::new(&self.index, &self.records, &self.budgets, self.coverage())
+        SnapshotWriter::new(
+            &self.index,
+            &self.records,
+            &self.budgets,
+            self.coverage(),
+            self.applied_through,
+        )
     }
 
     /// Puts a snapshot's group totals back, once its stream is complete. The index restores itself as the
@@ -720,8 +805,13 @@ impl PendingEngine {
     ///
     /// Nothing checks that the two halves came from the same stream: a reader that had taken a partial one
     /// answers `is_complete` with false, and it is the caller's business not to ask for the groups then.
-    pub fn restore_groups(&mut self, groups: FxHashMap<BudgetGroup, BudgetState>) {
+    ///
+    /// The position comes back with them, because the engine's state now reflects it — without that a
+    /// snapshot taken before the first replayed effect would claim to cover nothing, and a buffered block
+    /// would be stamped as if the log had never happened.
+    pub fn restore(&mut self, groups: FxHashMap<BudgetGroup, BudgetState>, coverage: ApplyIndex) {
         self.budgets = groups;
+        self.applied_through = coverage;
     }
 
     /// The table a snapshot's chunks are written into. Exposed for restore alone — the index is otherwise

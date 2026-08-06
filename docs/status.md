@@ -175,10 +175,23 @@ and coverage is the oldest one's minus one — everything up to it has reached a
 claim directly: coverage lags what has been applied by exactly what the buffer holds, it advances as the
 buffer flushes, and no hold from after it is carried.
 
-Two things are not, each named where it is missing: the **stable read**, so nothing may apply while a
-snapshot is in flight — the writer borrows the engine, which says it in the type without making it true under
-a worker; and the **group totals' own boundary**, where a group straddling coverage should carry only its
-sealed members and working that out needs the membership the engine does not index.
+**Replay is built, and the whole chain is asserted**: a snapshot covering an earlier position, plus every
+effect after it, lands on the same answers as never having stopped. `PendingEngine::replay` is a mode of its
+own rather than a flag, because the one effect that is not idempotent — a `Create` arriving again — can only
+be told from a fingerprint clash by reading a record, and the path that applies committed decisions in order
+reads nothing (§11).
+
+The group totals turned out to be the hard part, and the fix is a number rather than the membership index
+§4.8 asks for. They are accumulated, and a snapshot takes them at its own instant while its coverage is
+earlier — so replay counted every member created in between a second time, and a group of 303 came back as
+456. The snapshot now carries the position the totals reflect beside its coverage, and replay skips a
+`Create`'s increment at or below it. It is an argument to `replay` rather than state the engine keeps, so a
+caller cannot forget to supply it.
+
+One thing is not built: the **stable read**, so nothing may apply while a snapshot is in flight — the writer
+borrows the engine, which says it in the type without making it true under a worker.
+
+Nothing writes a snapshot anywhere yet, and nothing calls `replay` outside its tests.
 
 Nothing writes one anywhere yet, and **design notes §15 is the design for the rest** — reasoning with no code
 behind it, which is why it says so at the top.
