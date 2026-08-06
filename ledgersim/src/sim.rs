@@ -287,6 +287,11 @@ pub struct Report {
     /// is zero has not exercised the fetch path, and would say "every invariant held" about a path it
     /// never entered.
     pub store_reads: u64,
+    /// Calls the store refused and blocks it answered whose checksum did not match. Both seal, so a sweep
+    /// reports them for the same reason it reports `overflowed`: the seal is only tested where the path
+    /// was entered.
+    pub store_faults: u64,
+    pub store_corruptions: u64,
     /// Pending replies that kept no place in a lane: the lookups of order-exempt resolutions. Same
     /// standing as `store_reads` — a sweep whose total is zero has covered the exemption's data check
     /// but never the exemption itself.
@@ -601,6 +606,7 @@ pub fn explore(
     }
     let overflowed = sim.pending.overflowed();
     let store_reads = sim.pending.store_reads();
+    let (store_faults, store_corruptions) = sim.pending.store_faults();
     let exempt_lookups = sim.pending.exempt_replies();
     let expiries_offered = sim.pending.expiries_offered();
     let metrics = sim.reactor.metrics();
@@ -622,6 +628,8 @@ pub fn explore(
         halted,
         overflowed,
         store_reads,
+        store_faults,
+        store_corruptions,
         exempt_lookups,
         expiries_offered,
         days_behind_worst: sim.days_behind_worst,

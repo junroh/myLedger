@@ -421,6 +421,7 @@ pub struct Coverage {
     /// is the same event counted from outside, so a sweep says whether every one of them reached the
     /// node that has to stop for it.
     not_stored: u64,
+    store_failures: u64,
     /// Holds whose retention ran out: what the engine offered, what the sequencer admitted, and what it
     /// could not take yet. The third is not a loss — nobody asked for those and the sweep offers them
     /// again — but it is what says the expiry rate is short.
@@ -436,6 +437,8 @@ pub struct Coverage {
     /// being the safe direction and becomes an index that outgrows its declared maximum.
     days_behind_worst: u64,
     store_reads: u64,
+    store_faults: u64,
+    store_corruptions: u64,
     stale_answers: u64,
     lookups: u64,
     evicted: u64,
@@ -458,12 +461,15 @@ impl Coverage {
         self.exempt_lookups += report.exempt_lookups;
         self.overflowed += report.overflowed;
         self.not_stored += m.holds_not_stored;
+        self.store_failures += m.store_failures;
         self.expiries_offered += report.expiries_offered;
         self.expired += m.holds_expired;
         self.expiry_refused += m.expiry_refused;
         self.expiry_dropped += m.expiry_dropped;
         self.days_behind_worst = self.days_behind_worst.max(report.days_behind_worst);
         self.store_reads += report.store_reads;
+        self.store_faults += report.store_faults;
+        self.store_corruptions += report.store_corruptions;
         self.stale_answers += report.metrics.stale_answers;
         self.lookups += m.pending_lookups;
         self.evicted += m.holds_evicted;
@@ -489,6 +495,10 @@ impl Coverage {
             self.store_reads,
             self.overflowed,
             self.not_stored
+        );
+        println!(
+            "           store refused {} answered {} blocks wrongly (sealed {})",
+            self.store_faults, self.store_corruptions, self.store_failures
         );
         println!(
             "           expiry offered {} admitted {} refused {} dropped {}, worst {} \

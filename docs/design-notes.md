@@ -1952,6 +1952,39 @@ missing first is the reaction, and that is a decision: what bound, and whether m
 fail-stops the node. A hang is not lane-local, which argues for the second. And it is the same decision for
 idem and for consensus, so it does not belong inside the store's work. `status.md` has it.
 
+### What the simulator found by being given a store
+
+`ledgersim` used to build the engine on `MemoryStore::default()` and nothing else, so the seeds explored the
+store's *path* — 87,000 reads across sixty-four of them — and none of its behaviour: no latency, no refusal, no
+corruption. It draws a `StoreModel` per seed now, with the backing still memory, because a virtual clock with
+real IO under it measures neither of the two.
+
+**Two seeds in three get timing and the third keeps the exact store, and that share is a measurement rather
+than a taste.** With every seed slowed, the sweep's store reads fell from 87,000 to 4,000: a synchronous write
+or sync holds the component's thread, the step budget per seed is fixed, and the *volume* of the read path
+collapses with it. Keeping a third exact holds the volume while the rest explore completions arriving out of
+the order they were asked in, which is what the orderer exists for.
+
+The fault periods are small — a refusal every four to twenty-four store *calls* — and that is not a taste
+either. The first attempt used two hundred to a thousand, by analogy with the index fault's roominess, and it
+never fired once: a short seed makes a few dozen store calls in total, so a period measured for a load run is
+a fault that never happens. The coverage assertion is what said so, and it is the same one the index overflow
+has: a sweep that met no store fault would be reporting that the seal holds about a path it never entered.
+
+**And it found a defect in the second commit that used it.** When `MemoryStore` refused a write, the record log
+advanced its block number and noted the block in the day's range anyway, so the next block was written one
+place past what the store held — and the memory store's own assertion, that a block goes at the end of its
+segment, caught the disagreement.
+
+Advancing was right and the assertion was wrong. The records on the block that could not be written already
+hold addresses, so reusing the number would give two records one address; what the failed write leaves is a
+**hole**, and a hole is exactly what a store addressed by absolute offsets can express. So the assertion now
+refuses only an offset *before* the end — a block written over one already there, which is a genuine
+bookkeeping disagreement — and a gap is `None` in the memory store's sequence, answered as `Missing`. A file
+differs and it is worth knowing which way: reading a hole in a file gives zeroes, so there the block fails its
+checksum and is counted as corruption instead. Same seal, different cause, and both only after a write has
+already failed.
+
 ### Still unbuilt, and named so it is not read as done
 
 - **Nothing reconciles at startup**, but the worst of it is now refused rather than done. `reclaim` only

@@ -283,6 +283,12 @@ inside that.
   its worst cascade, but nothing warns or refuses before an insert fails. The channel it would warn
   over now exists; what is missing is the threshold and what a warning should make the node do —
   a question about operations rather than about the code, listed under *Decisions waiting on someone*.
+- **`ledgerd` can be pointed at a directory** (`--store-dir`), and `ledgersim` deliberately cannot: a virtual
+  clock with real IO under it measures neither of the two, so the simulator's backing stays memory and what
+  varies per seed is the *model* — read and write timings, a refusal every nth call, a bit flipped in every nth
+  block. Two seeds in three draw a store with timing; the third keeps the exact store, and that share is
+  measured rather than chosen: with every seed slowed, 87,000 store reads across the sweep became 4,000,
+  because a synchronous write holds the component's thread and the sweep's step budget is fixed.
 - **Consensus is an echo**, the idem map has no expiry, and the log has no compaction. All three
   grow with a run, which the tools say out loud.
 - **One `ledgerfio` configuration overloads intermittently, and it is the store-read one.**

@@ -311,19 +311,36 @@ pub struct MemoryStore {
 /// why nothing has to restore it and why memory is allowed to forget it.
 struct SegmentFile {
     base: u64,
-    blocks: Vec<Box<Block>>,
+    /// `None` is a block this segment has a place for and was never given, which happens for one reason: a
+    /// write the store refused. The caller advances its block number anyway — it must, because the records on
+    /// the block it could not write already hold addresses, and reusing the number would give two records one
+    /// address — so the next block lands past the end and leaves a hole.
+    ///
+    /// A file behaves differently here and it is worth knowing which: reading a hole in a file gives zeroes
+    /// rather than an error, so there the block fails its checksum and is counted as corruption. Same seal,
+    /// different cause, and both only after a write already failed.
+    blocks: Vec<Option<Box<Block>>>,
 }
 
 impl SegmentFile {
     fn at(&self, offset: u64) -> Option<&Block> {
         let within = offset.checked_sub(self.base)?;
         self.blocks
-            .get((within / BLOCK_BYTES as u64) as usize)
-            .map(|block| &**block)
+            .get((within / BLOCK_BYTES as u64) as usize)?
+            .as_deref()
     }
 
     fn end(&self) -> u64 {
         self.base + self.blocks.len() as u64 * BLOCK_BYTES as u64
+    }
+
+    /// Puts a block at an offset at or past the end, leaving `None` for anything skipped.
+    fn put(&mut self, offset: u64, block: &Block) {
+        let at = ((offset - self.base) / BLOCK_BYTES as u64) as usize;
+        while self.blocks.len() < at {
+            self.blocks.push(None);
+        }
+        self.blocks.push(Some(Block::copy_of(block)));
     }
 }
 
@@ -359,7 +376,7 @@ impl DurableStore for MemoryStore {
         );
         self.segments[segment as usize] = Some(SegmentFile {
             base: offset,
-            blocks: vec![Block::copy_of(block)],
+            blocks: vec![Some(Block::copy_of(block))],
         });
         Ok(())
     }
@@ -368,15 +385,16 @@ impl DurableStore for MemoryStore {
         let file = self.segments[segment as usize]
             .as_mut()
             .ok_or(StoreFault::Missing)?;
-        // Blocks are written once and a segment's own are consecutive, so its end is the only offset a
-        // write can have. A self-invariant, not a fault: the caller's block numbers and this sequence are
-        // both ours, and disagreeing means one of them is wrong rather than the store being broken.
-        debug_assert_eq!(
-            offset,
-            file.end(),
-            "a block goes at the end of its segment or nowhere"
+        // At the end, or past it. Never before it: blocks are written once, so an offset already occupied is
+        // the caller's block numbers and this sequence disagreeing, which is a self-invariant rather than the
+        // store being broken. Past the end is a hole left by a write this store refused — the caller advances
+        // its block number whether or not the write landed, because the records on the block it could not
+        // write already hold addresses.
+        debug_assert!(
+            offset >= file.end(),
+            "a block was written over one this segment already has"
         );
-        file.blocks.push(Block::copy_of(block));
+        file.put(offset, block);
         Ok(())
     }
 

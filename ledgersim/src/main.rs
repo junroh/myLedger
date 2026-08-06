@@ -552,7 +552,10 @@ mod tests {
         let mut served = 0;
         let mut overflows = 0;
         let mut sealed_for_overflow = 0;
+        let mut sealed_for_store = 0;
         let mut store_reads = 0;
+        let mut store_faults = 0;
+        let mut store_corruptions = 0;
         let mut exempt_lookups = 0;
         let mut expiries = 0;
         let mut stale = 0;
@@ -569,6 +572,20 @@ mod tests {
                     served += u64::from(!report.halted);
                     overflows += report.overflowed;
                     store_reads += report.store_reads;
+                    store_faults += report.store_faults;
+                    store_corruptions += report.store_corruptions;
+                    // The same rule as the overflow above, for the other two ways this node can be told its
+                    // records are unreachable: a store that refused or answered wrongly has to have stopped
+                    // it. Per seed, because one seed sealing would cover for another that did not.
+                    if report.store_faults + report.store_corruptions > 0 {
+                        assert!(
+                            report.metrics.store_failures > 0 && report.halted,
+                            "seed {seed} met {} store faults and {} corrupt blocks and kept serving",
+                            report.store_faults,
+                            report.store_corruptions
+                        );
+                        sealed_for_store += 1;
+                    }
                     exempt_lookups += report.exempt_lookups;
                     expiries += report.expiries_offered;
                     stale += report.metrics.stale_answers;
@@ -597,6 +614,13 @@ mod tests {
         );
         // Not "this never happens" any more, but "the ledger answers it when it does". A sweep where no
         // seed overflowed would be reporting that the seal holds about a path it never entered.
+        // A device that refuses and one that answers wrongly are different causes with one reaction, and a
+        // sweep that met neither would be reporting that the seal holds about a path it never entered.
+        assert!(
+            sealed_for_store > 0,
+            "no seed met a store that refused or lied, so the fault path and its seal are untested here \
+             ({store_faults} refusals, {store_corruptions} corrupt blocks seen)"
+        );
         assert!(
             sealed_for_overflow > 0,
             "no seed outgrew its index, so the notice channel and its seal are untested here \
@@ -656,6 +680,7 @@ mod tests {
             day_nanos: 0,
             lifetime_days: 1,
             expiry_blocks_per_round: 0,
+            store: ledger_pending::StoreModel::default(),
         };
         let faults = |violate| crate::fakes::Faults {
             violate_order_every: violate,
@@ -725,6 +750,7 @@ mod tests {
             day_nanos: 0,
             lifetime_days: 1,
             expiry_blocks_per_round: 0,
+            store: ledger_pending::StoreModel::default(),
         };
         let faults = crate::fakes::Faults {
             reorder_every: 2,

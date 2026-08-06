@@ -13,8 +13,8 @@ use ledger_base::ports::{
 };
 use ledger_base::{Amount, FxHashMap, Prng, Transfer, TxId, UNORDERED};
 use ledger_pending::{
-    HoldOverlay, MemoryStore, PendingEngine, DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS,
-    DEFAULT_SLOTS,
+    HoldOverlay, OpenBacking, PendingEngine, StoreModel, DEFAULT_FLUSH_BLOCKS,
+    DEFAULT_RESIDENT_BLOCKS, DEFAULT_SLOTS,
 };
 use ledger_stubkit::{LaneOrderer, Server, ServerStats};
 
@@ -55,6 +55,13 @@ pub struct Timings {
     pub lifetime_days: u64,
     /// Expiry voids offered per step, so a day's worth spreads out instead of arriving as one burst.
     pub expiry_blocks_per_round: usize,
+    /// What the *store under the engine* costs, as a stand-in charges it. Separate from `pending_nanos`,
+    /// which is the engine as a black box: this is the layer below, and it is the one whose synchronous calls
+    /// hold the component's thread rather than queueing. Zero is the exact store.
+    ///
+    /// The backing stays memory whatever this says — a virtual clock with real IO underneath measures neither
+    /// of the two. What varies is the timing and, in `Faults`, the misbehaviour.
+    pub store: StoreModel,
 }
 
 /// What misbehaves, and by how much. Every one of these is off in `capacity`, whose question is what
@@ -75,6 +82,12 @@ pub struct Faults {
     pub inbox_depth: usize,
     /// Stop reading acks every nth step, so the ack backlog fills and backpressure reaches the client.
     pub slow_client_every: u64,
+    /// Refuse every nth call the store is given, and flip a bit in every nth block it answers a read with.
+    /// The two ways a device misbehaves that this ledger can see — the third, hanging, has no detector
+    /// anywhere (`status.md`) — and both end in the same seal, which is why the seeds should meet them beside
+    /// every other fault rather than only in a unit test.
+    pub store_fault_every: u32,
+    pub store_corrupt_every: u32,
     /// Slots the engine's index gets, zero for the default sizing. A handful means the declared maximum
     /// is passed within a run, which is a hold the log says exists and the store cannot take — the one
     /// thing the engine reports without being asked, and the seal that answers it. A fault rather than a
@@ -119,6 +132,25 @@ impl Timings {
             },
             lifetime_days: 1 + pick(3),
             expiry_blocks_per_round: 1 + pick(8) as usize,
+            // A store with a device's timing in two seeds out of three, and the exact store in the third.
+            //
+            // The share is measured rather than chosen: a synchronous write or sync holds the component's
+            // thread, so a store with timing everywhere does less in two thousand steps and the *volume* of
+            // the read path collapses with it — 87,000 store reads across the seeds became 4,000 when every
+            // seed had one. Keeping a third exact holds the volume while the rest explore reads that complete
+            // out of the order they were asked in, which is what the orderer is for.
+            store: if pick(2) == 0 {
+                StoreModel::default()
+            } else {
+                StoreModel {
+                    read_base_nanos: pick(3) * step_nanos,
+                    read_tail_nanos: pick(3) * step_nanos,
+                    write_base_nanos: pick(1) * step_nanos,
+                    sync_base_nanos: pick(1) * step_nanos,
+                    queue_depth: 8 + pick(120) as usize,
+                    ..StoreModel::default()
+                }
+            },
         }
     }
 }
@@ -131,6 +163,9 @@ impl From<&crate::sim::Plan> for Timings {
             pending_rate: plan.pending_rate,
             flush_blocks: plan.flush_blocks,
             resident_blocks: plan.resident_blocks,
+            // Zero: a capacity run asks what the ledger does against components of a declared speed, and the
+            // store's own timing is one more thing it is not asking about. `ledgerfio` is where that is priced.
+            store: StoreModel::default(),
             // Eviction is not what a capacity run is asking about, so the overlay is given room and the
             // hit ratio is set outright.
             resident_holds: 1 << 20,
@@ -173,6 +208,11 @@ impl Faults {
             } else {
                 0
             },
+            // Rare, and for the same reason `index_slots` is: a store that refuses on its second call seals
+            // and the seed spends the rest of its steps sealed, which explores nothing else. Roomy enough
+            // that the run gets somewhere first.
+            store_fault_every: if pick(4) == 0 { 4 + pick(20) as u32 } else { 0 },
+            store_corrupt_every: if pick(4) == 0 { 4 + pick(20) as u32 } else { 0 },
         }
     }
 
@@ -261,7 +301,12 @@ impl PendingFake {
                 },
                 timings.flush_blocks,
                 timings.resident_blocks,
-                Box::new(MemoryStore::default()),
+                StoreModel {
+                    fault_every: faults.store_fault_every,
+                    corrupt_every: faults.store_corrupt_every,
+                    ..timings.store
+                }
+                .build(OpenBacking::Memory, seed),
             ),
             inbox: VecDeque::new(),
             orderer: LaneOrderer::new(faults.violate_order_every),
@@ -309,6 +354,14 @@ impl PendingFake {
     /// run whose windows answered everything from memory has tested neither.
     pub fn store_reads(&self) -> u64 {
         self.0.borrow().store.traffic().store_reads
+    }
+
+    /// Calls the store refused, and blocks it answered whose checksum did not match. The two ways a device
+    /// misbehaves that this ledger can see, and the number that says whether a sweep met either — both end in
+    /// a seal, so a sweep whose totals are zero has covered that seal about a path it never entered.
+    pub fn store_faults(&self) -> (u64, u64) {
+        let traffic = self.0.borrow().store.traffic();
+        (traffic.store_faults, traffic.store_corruptions)
     }
 
     /// Replies that kept no place in a lane — the lookups of order-exempt resolutions.

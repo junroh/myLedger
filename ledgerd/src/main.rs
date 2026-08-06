@@ -5,7 +5,7 @@ use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{AccountId, Signals};
 use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
-use ledger_pending::{MemoryPending, MemoryPendingConfig};
+use ledger_pending::{DaySource, MemoryPending, MemoryPendingConfig, OpenBacking};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_service::{ClientEndpoint, LedgerService, ServiceConfig};
 
@@ -22,8 +22,7 @@ fn main() {
             ..ServiceConfig::default()
         },
         open_accounts(accounts),
-        MemoryPending::start(MemoryPendingConfig::default())
-            .expect("the default engine config is valid"),
+        start_pending(),
         MemoryIdem::start(MemoryIdemConfig::default()),
         EchoRaft::start(EchoRaftConfig::default()),
     );
@@ -63,6 +62,38 @@ fn serve(_endpoint: ClientEndpoint) {
     while !Signals::requested() {
         thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// The engine, on files if a directory was named and in memory otherwise.
+///
+/// Memory is the default here as it is everywhere: it is what every number in the documents was taken
+/// against, and a node that wrote files without being asked would change what a run means. A directory is
+/// refused loudly rather than fallen back from — somebody asked for durable space and got none is worse than
+/// not starting.
+fn start_pending() -> MemoryPending {
+    let backing = match flag("--store-dir") {
+        None => OpenBacking::Memory,
+        Some(dir) => OpenBacking::files(std::path::Path::new(&dir)).unwrap_or_else(|err| {
+            eprintln!("ledgerd: --store-dir {dir} cannot be opened ({err:?})");
+            std::process::exit(2);
+        }),
+    };
+    MemoryPending::start_with_days(
+        MemoryPendingConfig::default(),
+        DaySource::WallClock,
+        backing,
+    )
+    .expect("the default engine config is valid")
+}
+
+fn flag(name: &str) -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        if arg == name {
+            return args.next();
+        }
+    }
+    None
 }
 
 fn account_count() -> u64 {
