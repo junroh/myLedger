@@ -1280,6 +1280,41 @@ mod expiry_tests {
         assert_eq!(engine.records.blocks().2, 0, "the store did not shrink");
     }
 
+    /// A freed day leaves no slot behind, which is why this index needs no epoch.
+    ///
+    /// The engine's design gives the index a `min_live_seg_id`, and it needs one: there, `apply_expire`
+    /// unlinks a segment on a *time* condition, so slots addressing it survive the unlink and two things
+    /// have to cope with them — a lookup answers Dead by comparing the segment against the epoch, and an
+    /// insert treats such a slot as empty so a 90%-full table does not kick around the dead.
+    ///
+    /// Here the condition is different in kind: a day's blocks go back only once `live_in_segment` is zero,
+    /// so the dead slots are gone *before* the blocks are, and both jobs have nothing to act on — a lookup
+    /// finds no slot at all rather than a stale one, and an insert sees a genuinely empty slot. The epoch is
+    /// absent because the ordering makes it unnecessary, not because it was skipped, and this test is what
+    /// says so: change the free condition to a time and it fails.
+    #[test]
+    fn a_freed_day_leaves_no_slot_behind_so_the_index_needs_no_epoch() {
+        let (mut engine, written) = written_on_day_zero();
+        let day_zero = engine.records.segment();
+        engine.open_day(LIFETIME, LIFETIME);
+
+        let (released, _) = empty_the_day(&mut engine, 1024);
+        assert_eq!(released, written);
+        assert!(engine.freed_blocks() > 0, "no day was freed");
+
+        assert_eq!(
+            engine.index.live_in_segment(day_zero),
+            0,
+            "a slot still addresses a day whose blocks have gone back"
+        );
+        for id in 1..=written {
+            assert!(
+                engine.lookup(TxId(id as u128)).is_none(),
+                "an expired hold was answered from a freed day"
+            );
+        }
+    }
+
     /// A day is not finished while any of its holds is still there, and a hold nothing releases keeps its
     /// day open for ever rather than being skipped. An earlier version restarted the walk at whatever had
     /// just expired, so a day still being walked when the next arrived was abandoned — and its holds were

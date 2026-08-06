@@ -18,10 +18,24 @@ help:
 # workload that aborts does so soonest.
 #
 # `workload=all` comes from the workload kinds themselves, so a seventh is covered by adding it.
+#
+# The `--expiry-days` run is here because no other line crosses a day: every workload above leaves the
+# engine on the wall clock, where a run of seconds never reaches a retention boundary and the sweep, the
+# per-day counts and the freeing of a day's blocks are all untouched. Six days against the default lifetime
+# of three, so the run reaches the expiry of holds it created itself.
+#
+# Its rate and its `--resolve-after` are what make it exercise the walk rather than only the freeing. Left
+# uncapped, the run resolves a day's holds within a tenth of a second and every day is already empty when it
+# expires — the sweep then frees each one without reading a block, and reports nothing. So the rate is held
+# down and the holds are given an age longer than the run, which leaves them alive to be found.
+#
+# Nothing here gates a latency target, and one reason is worth stating: a long run's tail is the dedup
+# stand-in's, not the ledger's — see `status.md`.
 verify:
 	cargo test --workspace --quiet
 	cargo build --release --workspace --all-targets
 	cargo run --release -p ledgerfio -- run --sweep workload=all --duration 1s
+	cargo run --release -p ledgerfio -- run --workload void-heavy --duration 2s --rate 100k --resolve-after 900000 --expiry-days 6
 	cargo run --release -p ledgerfio -- layout
 	cargo run --release -p ledgersim -- check --seeds 32
 	cargo run --release -p ledgersim -- capacity --duration-ms 200

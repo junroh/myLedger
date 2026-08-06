@@ -145,12 +145,35 @@ the split exists and that residency keeps IO off resolutions inside it.
   which is a question about operations rather than about the code.
 - **Consensus is an echo**, the dedup map has no expiry, and the log has no compaction. All three
   grow with a run, which the tools say out loud.
+- **A long run's worst tail belongs to the dedup stand-in, not to the ledger.** A ten-second
+  `void-heavy` run at 100k/s shows p99.9 between 1.7ms and 24ms across repeats, with single maxima up
+  to 114ms; a five-second run of the same thing never does. What grows with the run is the dedup map,
+  which has no expiry and so rehashes as it crosses each power of two — on the thread every request
+  passes through. Reserving four million entries in it turns eight repeats of p99.9 1.7–24ms into
+  1.7–4.3ms and removes every maximum above 11ms, which is what establishes the cause. The reservation
+  was a diagnostic and was reverted: the real engine expires by rotating generations sized from a
+  declared window, and pre-sizing a stand-in to an arbitrary number would hide a growth nobody has
+  bounded rather than bound it. What is left is knowing which component a tail belongs to, and that no
+  latency gate on a long run is measuring this ledger. Reproduce with
+  `ledgerfio run --workload void-heavy --duration 10s --rate 100k --resolve-after 900000 --repeat 8`.
+- **The sweep falling far enough behind can reuse a day's segment, and only the seal stops it.** A
+  segment's number is its day modulo 63, so day *D*'s segment comes round again at day *D + 63*. If the
+  sweep is more than `63 - lifetime` days behind, that day arrives before *D* was ever emptied, and the
+  two days share both a segment count and a block range. The result is late, not early: the count never
+  reaches zero, so the day is never freed and the store stops shrinking — and the walk reads block
+  numbers that belong to another day, whose records fail the index's address check and offer no void.
+  Verified by driving the engine there by hand. Unreachable on a real node because the index is sized
+  for `lifetime` days of survivors and seals a few days behind, long before sixty; `validate` refuses a
+  lifetime that needs more segments than exist, but nothing refuses a sweep this far behind. So the
+  bound is real and undeclared, which is rule 20's shape — recorded rather than fixed, because the fix
+  is a question about what a node should do when expiry has stopped working at all.
 
 ### Where the documents and the code have diverged
 
-Two places where the design says one thing and this code does another. Kept as a section of its own
-because neither is a gap to fill in passing — each was a substitution, and a substitution that nobody
-writes down is read as an implementation of the thing it replaced.
+Two places where the design names a mechanism this code does not have. Kept as a section of its own
+because neither is a gap to fill in passing — each was a deliberate substitution, and a substitution that
+nobody writes down is read as an implementation of the thing it replaced. Both now have their reason and
+neither is outstanding work.
 
 - **The timing wheel is one counter per day, not four levels.** The design detects expiry with a
   hierarchical wheel (~2GB, day / hour / minute / second, only the imminent day loaded in detail). Built
@@ -158,12 +181,21 @@ writes down is read as an implementation of the thing it replaced.
   computed deadline and nothing can express a per-hold one. The design's own lazy-load note is why this
   is not a shortfall — a wheel holding the holds would be 38GB, so it was never meant to hold them.
   Design notes §14.
-- **There is no `min_live_seg_id`.** Design §3.1 and §4.6 give the index an epoch: a slot addressing a
-  segment older than the oldest live one is dead, so a lookup answers Dead with no IO and an insert reuses
-  the slot without a kick cascade. Here a slot is only ever cleared by the resolution that removes it, so
-  an expired day's slots stay occupied until its voids are all judged. Building the wheel closes the first
-  entry and leaves this one: they are separate mechanisms that the single index walk was standing in for
-  at once.
+- **There is no `min_live_seg_id`, and it is verified that there needs to be none.** Design §3.1 and
+  §4.6 give the index an epoch, and there they need one: `apply_expire` unlinks a segment on a *time*
+  condition, so slots addressing it survive the unlink and two jobs have to cope — a lookup answers Dead
+  by comparing the segment against the epoch, and an insert treats such a slot as empty so a 90%-full
+  table does not kick the dead around.
+
+  Here the free condition is different in kind, and that is the whole of it: `free_segment` has exactly
+  one caller, inside the branch where `live_in_segment` is zero. The dead slots are gone *before* the
+  blocks are, so a lookup finds no slot rather than a stale one and an insert sees a genuinely empty
+  slot. Both jobs have nothing to act on. It is absent because the ordering makes it unnecessary, not
+  because it was skipped, and `a_freed_day_leaves_no_slot_behind_so_the_index_needs_no_epoch` is what
+  says so — change the free condition back to a time and that test fails.
+
+  So this is no longer a divergence, and it stays in this section only because the design names the
+  mechanism: the epoch is not missing, it has nothing to do.
 
 Four earlier entries are closed: the in-chain fallback read is now exercised by the `linked`
 workload (half its chains create a hold and resolve it inside the chain), the stub orderer's
