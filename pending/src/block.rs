@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use ledger_base::ports::HoldData;
+use ledger_base::ports::{ApplyIndex, HoldData};
 use ledger_base::{AccountId, Amount, BudgetGroup, FxHashMap, Prng, TxId};
 use ledger_stubkit::Server;
 
@@ -253,6 +253,11 @@ impl BlockRange {
 struct Filling {
     bytes: Vec<u8>,
     filled: usize,
+    /// The log position of the batch whose effect put the first record here. Only meaningful while the block
+    /// is in the writeback buffer, which is the one place it is read: the oldest buffered block's position is
+    /// where a snapshot's coverage has to stop, because everything from that batch onwards has not reached a
+    /// block yet. Recycled buffers reset it with `filled`.
+    began_at: ApplyIndex,
 }
 
 impl Filling {
@@ -260,11 +265,19 @@ impl Filling {
         Self {
             bytes: vec![0; BLOCK_BYTES],
             filled: 0,
+            began_at: ApplyIndex::default(),
         }
     }
 
     fn full(&self) -> bool {
         self.filled == RECORDS_PER_BLOCK
+    }
+
+    fn put_at(&mut self, key: TxId, hold: &HoldData, at: ApplyIndex) -> usize {
+        if self.filled == 0 {
+            self.began_at = at;
+        }
+        self.put(key, hold)
     }
 
     fn put(&mut self, key: TxId, hold: &HoldData) -> usize {
@@ -474,7 +487,7 @@ impl RecordLog {
 
     /// Writes the record into the buffer and answers where it went. The address is provisional until
     /// the block is compacted.
-    pub fn append(&mut self, key: TxId, hold: &HoldData) -> BlockAddr {
+    pub fn append(&mut self, key: TxId, hold: &HoldData, at: ApplyIndex) -> BlockAddr {
         if self.buffer.back().is_some_and(Filling::full) {
             self.buffer.push_back(Filling::new());
         }
@@ -483,7 +496,7 @@ impl RecordLog {
             .buffer
             .back_mut()
             .expect("a block to fill")
-            .put(key, hold);
+            .put_at(key, hold, at);
         self.appended += 1;
         BlockAddr::buffered(ordinal, index as u8)
     }
@@ -511,6 +524,23 @@ impl RecordLog {
         self.freed += freed as u64;
         self.days[segment as usize] = BlockRange::default();
         freed
+    }
+
+    /// The last log position everything up to which has reached a block, given the position of the batch
+    /// being applied now.
+    ///
+    /// It is the oldest buffered block's own position minus one, because that block holds the first record
+    /// that has *not* been sealed — so a snapshot claiming to cover its batch would be claiming a record it
+    /// does not carry. With nothing buffered, everything applied has been sealed and the answer is the
+    /// caller's own position.
+    ///
+    /// Position zero means it covers nothing, which is a legitimate answer rather than a missing one: a
+    /// snapshot of an engine that has applied nothing is what a follower starting from empty receives.
+    pub fn sealed_through(&self, applied_through: ApplyIndex) -> ApplyIndex {
+        match self.buffer.front().filter(|block| block.filled > 0) {
+            Some(oldest) => ApplyIndex(oldest.began_at.raw().saturating_sub(1)),
+            None => applied_through,
+        }
     }
 
     /// Whether this address names a record on a block the store has. False for a record in the writeback
@@ -856,7 +886,13 @@ mod tests {
         let mut log = RecordLog::default();
         let count = RECORDS_PER_BLOCK * 3 + 2;
         let addrs: Vec<BlockAddr> = (0..count)
-            .map(|index| log.append(TxId(index as u128 + 1), &hold(index as Amount + 1)))
+            .map(|index| {
+                log.append(
+                    TxId(index as u128 + 1),
+                    &hold(index as Amount + 1),
+                    ApplyIndex(index as u64 + 1),
+                )
+            })
             .collect();
         let (buffered, ..) = log.blocks();
         assert!(buffered >= 4, "three filled blocks and one being filled");

@@ -1,8 +1,8 @@
 use std::collections::VecDeque;
 
 use ledger_base::ports::{
-    OverlayState, PendingCommand, PendingEffect, PendingFence, PendingLookup, PendingNotice,
-    PendingPort, PendingReply,
+    ApplyIndex, OverlayState, PendingCommand, PendingEffect, PendingFence, PendingLookup,
+    PendingNotice, PendingPort, PendingReply,
 };
 use ledger_base::{Amount, Footprint, Peak, TxId};
 
@@ -12,7 +12,9 @@ use ledger_base::{Amount, Footprint, Peak, TxId};
 /// the sequencer has already resolved.
 pub struct PendingChannel<P: PendingPort> {
     port: P,
-    writes: VecDeque<PendingEffect>,
+    /// Committed decisions the engine has not taken yet, each with the log position of its batch: a
+    /// deferred write must not lose the position it belongs to.
+    writes: VecDeque<(PendingEffect, ApplyIndex)>,
     limit: usize,
     peak: Peak,
     /// Committed decisions handed over. A lookup dispatched now is behind every one of them — the queue
@@ -47,9 +49,14 @@ impl<P: PendingPort> PendingChannel<P> {
         self.port.send(PendingCommand::Fence(fence)).is_ok()
     }
 
-    pub fn write(&mut self, effect: PendingEffect) {
-        if !self.writes.is_empty() || self.port.send(PendingCommand::Apply(effect)).is_err() {
-            self.writes.push_back(effect);
+    pub fn write(&mut self, effect: PendingEffect, at: ApplyIndex) {
+        if !self.writes.is_empty()
+            || self
+                .port
+                .send(PendingCommand::Apply { effect, at })
+                .is_err()
+        {
+            self.writes.push_back((effect, at));
             self.peak.saw(self.writes.len());
             return;
         }
@@ -76,7 +83,12 @@ impl<P: PendingPort> PendingChannel<P> {
     pub fn flush(&mut self) -> bool {
         let mut progress = false;
         while let Some(write) = self.writes.front() {
-            if self.port.send(PendingCommand::Apply(*write)).is_err() {
+            let (effect, at) = *write;
+            if self
+                .port
+                .send(PendingCommand::Apply { effect, at })
+                .is_err()
+            {
                 break;
             }
             self.writes.pop_front();

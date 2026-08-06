@@ -169,11 +169,16 @@ table's because a bucket's position in it *is* its position in the table. Four t
 every carried hold the same, a hold still in the writeback buffer is deliberately not carried, a differently
 sized table refuses the stream, and junk or an unknown version is refused rather than interpreted.
 
-Three things are not, each named where it is missing: the **coverage index**, which waits on replay because a
-position with no replay to use it is a number with nothing behind it; the **stable read**, so nothing may
-apply while a snapshot is in flight — the writer borrows the engine, which says it in the type without making
-it true under a worker; and the **group totals' own boundary**, which needs a frontier to straddle and so
-waits on coverage too.
+**Coverage is built too**, and it turned out checkable without replay. A commit's log position now reaches
+the engine on the command that carries its effect, each buffered block remembers the position it began at,
+and coverage is the oldest one's minus one — everything up to it has reached a block. The test asserts the
+claim directly: coverage lags what has been applied by exactly what the buffer holds, it advances as the
+buffer flushes, and no hold from after it is carried.
+
+Two things are not, each named where it is missing: the **stable read**, so nothing may apply while a
+snapshot is in flight — the writer borrows the engine, which says it in the type without making it true under
+a worker; and the **group totals' own boundary**, where a group straddling coverage should carry only its
+sealed members and working that out needs the membership the engine does not index.
 
 Nothing writes one anywhere yet, and **design notes §15 is the design for the rest** — reasoning with no code
 behind it, which is why it says so at the top.

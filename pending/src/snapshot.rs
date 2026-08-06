@@ -13,12 +13,13 @@
 //! in one buffer or write it in one go. Every record in the format is thirty-two bytes wide, so a chunk
 //! boundary can fall anywhere a multiple of thirty-two does and neither side has to carry a partial item.
 //!
+//! **Coverage** is the log position everything up to which has reached a block. It is in the header, and it
+//! is not the position of the last effect applied: the writeback buffer holds records from batches after it,
+//! whose slots this leaves out, so replay starts *after* coverage and creates them again. A snapshot that
+//! claimed the later position would be claiming records it does not carry.
+//!
 //! What is **not** here yet, and why:
 //!
-//! - **The coverage index.** A snapshot has to say which log position its state reflects, or replay does
-//!   not know where to start. That number is the flush frontier's, and no component records the log position
-//!   of anything yet — the seam is open (`ApplyIndex`) and deliberately not plumbed. It arrives with replay,
-//!   because a coverage index with no replay to use it would be a number with nothing behind it.
 //! - **A stable read.** Walking the index while the engine keeps writing gives a smeared view, and a kick
 //!   cascade can move an entry between buckets so it appears twice or nowhere — §15 has the two failures.
 //!   Copying the buckets about to change is the answer, and it belongs with pacing.
@@ -26,6 +27,7 @@
 //!   is sealed, and working that out needs the membership the engine does not index. Without coverage there
 //!   is no frontier to straddle, so the whole map goes for now and the asymmetry is noted rather than hidden.
 
+use ledger_base::ports::ApplyIndex;
 use ledger_base::{Amount, BudgetGroup, FxHashMap};
 
 use crate::block::RecordLog;
@@ -45,7 +47,7 @@ const MAGIC: u64 = 0x5041_5f53_4e41_5031;
 /// Bumped when the layout of any record changes. A reader that does not know a version refuses the stream
 /// rather than interpreting it, because the alternative is a table restored from bytes that meant something
 /// else.
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 
 /// Why a stream could not be read. Every one of them is a refusal rather than a repair: a snapshot that
 /// does not describe this table is not a snapshot to make the best of.
@@ -70,6 +72,7 @@ pub struct SnapshotWriter<'a> {
     index: &'a HoldTable,
     records: &'a RecordLog,
     groups: Vec<(BudgetGroup, BudgetState)>,
+    coverage: ApplyIndex,
     /// Records already written, header included, so a chunk resumes rather than restarting.
     at: u64,
 }
@@ -79,6 +82,7 @@ impl<'a> SnapshotWriter<'a> {
         index: &'a HoldTable,
         records: &'a RecordLog,
         budgets: &FxHashMap<BudgetGroup, BudgetState>,
+        coverage: ApplyIndex,
     ) -> Self {
         // Sorted, so two writers over the same state produce the same bytes. A map's iteration order is not
         // a promise, and a snapshot that differed between nodes for no reason would be one nothing could
@@ -90,6 +94,7 @@ impl<'a> SnapshotWriter<'a> {
             index,
             records,
             groups,
+            coverage,
             at: 0,
         }
     }
@@ -125,7 +130,8 @@ impl<'a> SnapshotWriter<'a> {
                 into[0..8].copy_from_slice(&MAGIC.to_le_bytes());
                 into[8..12].copy_from_slice(&VERSION.to_le_bytes());
                 into[12..20].copy_from_slice(&buckets.to_le_bytes());
-                into[20..28].copy_from_slice(&(self.groups.len() as u64).to_le_bytes());
+                into[20..24].copy_from_slice(&(self.groups.len() as u32).to_le_bytes());
+                into[24..32].copy_from_slice(&self.coverage.raw().to_le_bytes());
                 Some(())
             }
             at if at <= buckets => {
@@ -158,6 +164,7 @@ impl<'a> SnapshotWriter<'a> {
 pub struct SnapshotReader {
     buckets: u64,
     groups_expected: u64,
+    coverage: ApplyIndex,
     /// Records taken so far, header included.
     at: u64,
     groups: FxHashMap<BudgetGroup, BudgetState>,
@@ -168,6 +175,7 @@ impl SnapshotReader {
         Self {
             buckets: 0,
             groups_expected: 0,
+            coverage: ApplyIndex::default(),
             at: 0,
             groups: FxHashMap::default(),
         }
@@ -201,7 +209,8 @@ impl SnapshotReader {
                     return Err(NotASnapshot::Version(version));
                 }
                 self.buckets = u64_at(12);
-                self.groups_expected = u64_at(20);
+                self.groups_expected = u32_at(20) as u64;
+                self.coverage = ApplyIndex(u64_at(24));
                 let ours = index.bucket_count() as u64;
                 if self.buckets != ours {
                     return Err(NotASnapshot::Buckets {
@@ -240,6 +249,12 @@ impl SnapshotReader {
         self.at == 1 + self.buckets + self.groups_expected
     }
 
+    /// The log position this snapshot's state reflects: replay starts after it. Meaningful once the header
+    /// has arrived, which is the first record.
+    pub fn coverage(&self) -> ApplyIndex {
+        self.coverage
+    }
+
     /// The group totals, once the stream is complete.
     pub fn into_groups(self) -> FxHashMap<BudgetGroup, BudgetState> {
         self.groups
@@ -254,7 +269,7 @@ impl Default for SnapshotReader {
 
 #[cfg(test)]
 mod tests {
-    use ledger_base::ports::PendingEffect;
+    use ledger_base::ports::{ApplyIndex, PendingEffect};
     use ledger_base::{AccountId, BudgetGroup, TxId};
 
     use std::cell::RefCell;
@@ -355,7 +370,7 @@ mod tests {
         let holds = RECORDS_PER_BLOCK * 3;
         for id in 1..=holds {
             engine
-                .write(create(id as u128, group))
+                .write(create(id as u128, group), ApplyIndex(id as u64))
                 .expect("the index took the hold");
         }
 
@@ -399,7 +414,7 @@ mod tests {
     fn a_hold_still_in_the_buffer_is_not_carried() {
         let (mut engine, mut restored) = pair(1 << 12, 64);
         engine
-            .write(create(1, BudgetGroup::ABSENT))
+            .write(create(1, BudgetGroup::ABSENT), ApplyIndex(1))
             .expect("the index took the hold");
         assert!(
             engine.lookup(TxId(1)).is_some(),
@@ -415,6 +430,82 @@ mod tests {
         assert!(restored.counts_agree());
     }
 
+    /// Coverage stops short of what has been applied by exactly what the writeback buffer is holding, and
+    /// it advances as the buffer flushes.
+    ///
+    /// This is the claim the whole boundary rests on, and it is checkable without replay: everything up to
+    /// coverage has reached a block, so a snapshot that carries only sealed slots carries everything that
+    /// batch wrote. Claiming the later position — the last effect applied — would claim records still in the
+    /// buffer, whose slots this deliberately leaves out.
+    #[test]
+    fn coverage_stops_where_the_buffer_begins_and_moves_as_it_flushes() {
+        // A window of four blocks, so the buffer holds several and coverage lags visibly.
+        let (mut engine, _) = pair(1 << 12, 4);
+        assert_eq!(
+            engine.coverage(),
+            ApplyIndex(0),
+            "an engine that has applied nothing claimed to cover something"
+        );
+
+        // One block's worth, all in the buffer: nothing is sealed, so nothing can be covered.
+        for id in 1..=RECORDS_PER_BLOCK {
+            engine
+                .write(
+                    create(id as u128, BudgetGroup::ABSENT),
+                    ApplyIndex(id as u64),
+                )
+                .expect("the index took the hold");
+        }
+        assert_eq!(
+            engine.coverage(),
+            ApplyIndex(0),
+            "coverage moved past a batch whose records are still in the buffer"
+        );
+
+        // Past the window, so the oldest blocks are compacted out and coverage follows them.
+        let holds = RECORDS_PER_BLOCK * 8;
+        for id in (RECORDS_PER_BLOCK + 1)..=holds {
+            engine
+                .write(
+                    create(id as u128, BudgetGroup::ABSENT),
+                    ApplyIndex(id as u64),
+                )
+                .expect("the index took the hold");
+        }
+        let covered = engine.coverage();
+        assert!(
+            covered.raw() > 0,
+            "the buffer flushed and coverage stayed at nothing"
+        );
+        assert!(
+            covered.raw() < holds as u64,
+            "coverage reached the last batch applied, which is still in the buffer"
+        );
+
+        // And the claim itself: every hold at or below coverage is carried, every one above it is not.
+        let mut restored =
+            PendingEngine::sized(1 << 12, 4, 1024, Box::new(MemBlockStore::default()));
+        let mut writer = engine.snapshot();
+        let mut reader = SnapshotReader::new();
+        let mut chunk = vec![0u8; CHUNK];
+        loop {
+            let written = writer.next_chunk(&mut chunk);
+            if written == 0 {
+                break;
+            }
+            reader
+                .take_chunk(&chunk[..written], restored.index_mut())
+                .expect("a stream this table can take");
+        }
+        assert_eq!(reader.coverage(), covered, "the header lost the position");
+        for id in (covered.raw() + 1)..=holds as u64 {
+            assert!(
+                restored.lookup(TxId(id as u128)).is_none(),
+                "a hold from after coverage was carried, so replay would create it twice"
+            );
+        }
+    }
+
     /// A snapshot only restores into a table of the same size, and a mismatch is refused rather than
     /// interpreted. A bucket's position in the stream *is* its position in the table — a slot holds a
     /// fingerprint and not a key, so nothing can be placed again — which makes the bucket count part of what
@@ -423,7 +514,7 @@ mod tests {
     fn a_table_of_a_different_size_refuses_the_stream() {
         let mut engine = PendingEngine::sized(64, 1, 64, Box::new(MemBlockStore::default()));
         engine
-            .write(create(1, BudgetGroup::ABSENT))
+            .write(create(1, BudgetGroup::ABSENT), ApplyIndex(1))
             .expect("the index took the hold");
 
         let mut wrong = PendingEngine::sized(1 << 14, 1, 64, Box::new(MemBlockStore::default()));

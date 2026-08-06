@@ -628,21 +628,27 @@ impl PendingPort for MemoryPending {
         // The count is this side's half of "has the engine caught up": it numbers the applies handed
         // over, the engine numbers the same ones as it applies them, and a removal's marker is stamped
         // with its own number so it can be dropped when the engine reaches it.
-        if matches!(command, PendingCommand::Apply(_)) {
+        if matches!(command, PendingCommand::Apply { .. }) {
             self.applies_sent += 1;
         }
         match command {
-            PendingCommand::Apply(PendingEffect::Create { tx_id, amount, .. }) => {
-                self.overlay.created(tx_id, amount)
-            }
-            PendingCommand::Apply(PendingEffect::Reduce {
-                pending_ref,
-                remaining,
+            PendingCommand::Apply {
+                effect: PendingEffect::Create { tx_id, amount, .. },
                 ..
-            }) => self.overlay.note_remaining(pending_ref, remaining),
-            PendingCommand::Apply(PendingEffect::Remove { pending_ref, .. }) => {
-                self.overlay.forget(pending_ref, self.applies_sent)
-            }
+            } => self.overlay.created(tx_id, amount),
+            PendingCommand::Apply {
+                effect:
+                    PendingEffect::Reduce {
+                        pending_ref,
+                        remaining,
+                        ..
+                    },
+                ..
+            } => self.overlay.note_remaining(pending_ref, remaining),
+            PendingCommand::Apply {
+                effect: PendingEffect::Remove { pending_ref, .. },
+                ..
+            } => self.overlay.forget(pending_ref, self.applies_sent),
             _ => {}
         }
         Ok(())
@@ -923,8 +929,8 @@ impl PendingWorker {
                     self.orderer.expect(fence.lane, fence.seq);
                     self.orderer.fill(fence.lane, fence.seq, ready_at, result);
                 }
-                PendingCommand::Apply(effect) => {
-                    if let Err(not_stored) = self.store.write(effect) {
+                PendingCommand::Apply { effect, at } => {
+                    if let Err(not_stored) = self.store.write(effect, at) {
                         self.owe(PendingNotice::HoldNotStored {
                             hold: not_stored.hold,
                         });
@@ -1088,6 +1094,7 @@ mod tests {
 mod worker_tests {
     use super::*;
     use crate::block::RECORDS_PER_BLOCK;
+    use ledger_base::ports::ApplyIndex;
     use ledger_base::ports::PendingEffect;
     use ledger_base::{AccountId, TransferKind};
 
@@ -1108,14 +1115,17 @@ mod worker_tests {
     }
 
     fn create(tx_id: TxId) -> PendingCommand {
-        PendingCommand::Apply(PendingEffect::Create {
-            tx_id,
-            debit_account: AccountId(1),
-            credit_account: AccountId(2),
-            amount: 10,
-            ledger: 1,
-            budget: BudgetGroup::ABSENT,
-        })
+        PendingCommand::Apply {
+            at: ApplyIndex(tx_id.raw() as u64),
+            effect: PendingEffect::Create {
+                tx_id,
+                debit_account: AccountId(1),
+                credit_account: AccountId(2),
+                amount: 10,
+                ledger: 1,
+                budget: BudgetGroup::ABSENT,
+            },
+        }
     }
 
     /// A day that runs out reaches the port as notices. Driven through the real worker thread, because the

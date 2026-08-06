@@ -1,4 +1,5 @@
 use crate::ids::{AccountId, Amount, BudgetGroup, Seq, TxId};
+use crate::ports::raft::ApplyIndex;
 use crate::ports::Correlation;
 use crate::transfer::Transfer;
 
@@ -91,7 +92,19 @@ pub struct PendingReply {
 pub enum PendingCommand {
     Lookup(PendingLookup),
     Fence(PendingFence),
-    Apply(PendingEffect),
+    /// A committed decision, and the log position of the batch it came from.
+    ///
+    /// The position rides on the effect rather than arriving as a marker of its own because the queue has a
+    /// backlog behind it: a marker would have to keep its place in a mixed queue, and one that overtook the
+    /// effects it was meant to follow would say the engine had applied more than it had. Eight bytes on a
+    /// command that already carries a whole decision is the cheaper answer.
+    ///
+    /// The engine needs it for one thing — see `ApplyIndex`. A snapshot has to say which log position its
+    /// state reflects, and the engine cannot know that from a count of its own applies.
+    Apply {
+        effect: PendingEffect,
+        at: ApplyIndex,
+    },
 }
 
 /// What the engine says without being asked.

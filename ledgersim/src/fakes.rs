@@ -394,9 +394,9 @@ impl PendingFake {
                 // A write occupies the engine like anything else. The store is updated now rather than at
                 // completion: the inbox is in order, so a later lookup of the same hold is processed
                 // after it either way, and the engine's queue is what the write actually costs.
-                PendingCommand::Apply(effect) => {
+                PendingCommand::Apply { effect, at } => {
                     state.engine_time();
-                    if let Err(not_stored) = state.store.write(effect) {
+                    if let Err(not_stored) = state.store.write(effect, at) {
                         state.notices.push_back(PendingNotice::HoldNotStored {
                             hold: not_stored.hold,
                         });
@@ -492,7 +492,7 @@ impl PendingState {
 
     /// The overlay follows what the store is told, exactly as the real engine does.
     fn note(&mut self, command: PendingCommand) {
-        let PendingCommand::Apply(effect) = command else {
+        let PendingCommand::Apply { effect, .. } = command else {
             return;
         };
         match effect {

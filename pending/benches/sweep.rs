@@ -15,7 +15,7 @@
 use std::hint::black_box;
 use std::time::{Duration, Instant};
 
-use ledger_base::ports::PendingEffect;
+use ledger_base::ports::{ApplyIndex, PendingEffect};
 use ledger_base::{AccountId, BudgetGroup, Transfer, TxId};
 use ledger_benchkit::{BenchOptions, Samples, STRIDE};
 use ledger_pending::{MemBlockStore, PendingEngine, RECORDS_PER_BLOCK};
@@ -70,7 +70,7 @@ fn expiring_day(holds: u64) -> PendingEngine {
     engine.open_day(0, LIFETIME_DAYS);
     for at in 0..holds {
         engine
-            .write(create(key(at)))
+            .write(create(key(at)), ApplyIndex(at + 1))
             .expect("the index took the hold");
     }
     // The day the buffer is drained into is still day zero, so a roll to the next day seals the last block
@@ -159,7 +159,7 @@ fn survivor_density(options: &BenchOptions) {
             // blocks are written once — so the walk still reads it and the index still says it is dead.
             for at in 0..HOLDS {
                 if !at.is_multiple_of(spacing) {
-                    let _ = engine.write(remove(key(at)));
+                    let _ = engine.write(remove(key(at)), ApplyIndex(at + 1));
                 }
             }
             let (finished, round) = empty_one_day_timed(&mut engine, 2, &mut voids);
@@ -240,7 +240,7 @@ fn empty_one_day_timed(
         }
         for void in voids.iter() {
             engine
-                .write(remove(void.pending_ref))
+                .write(remove(void.pending_ref), ApplyIndex(day.rounds + 1))
                 .expect("a void removes rather than inserts");
         }
         if !engine.sweeping() {

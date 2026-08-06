@@ -1,4 +1,6 @@
-use ledger_base::ports::{AccountPort, IdempotencyPort, PendingEffect, PendingPort, RaftPort};
+use ledger_base::ports::{
+    AccountPort, ApplyIndex, IdempotencyPort, PendingEffect, PendingPort, RaftPort,
+};
 use ledger_base::Clock;
 
 use super::Reactor;
@@ -62,7 +64,7 @@ where
                     // would leave a node claiming a position it never reached. Nothing durable yet — see
                     // `ApplyIndex` for what a snapshot has to do with it.
                     self.applied_through = commit.index;
-                    self.commit_batch(&commit.effects, &batch.slots)
+                    self.commit_batch(&commit.effects, &batch.slots, commit.index)
                 }
                 RaftOutcome::Failed => {
                     self.record(
@@ -98,7 +100,7 @@ where
         self.metrics.commit_wait_max_nanos = self.metrics.commit_wait_max_nanos.max(waited);
     }
 
-    pub(super) fn commit_batch(&mut self, effects: &[Effect], slots: &[SlotId]) {
+    pub(super) fn commit_batch(&mut self, effects: &[Effect], slots: &[SlotId], at: ApplyIndex) {
         for (effect, &slot) in effects.iter().zip(slots) {
             if let Err(err) = self.accounts.apply(effect) {
                 // Consensus committed this effect, so the ledger owes it: not applying it means the
@@ -126,7 +128,7 @@ where
                     PendingEffect::Reduce { .. } => self.metrics.pending_reduces += 1,
                     PendingEffect::Remove { .. } => self.metrics.pending_removes += 1,
                 }
-                self.pending.write(write);
+                self.pending.write(write, at);
             }
             self.metrics.committed += 1;
             self.finish(slot, AckOutcome::Committed);

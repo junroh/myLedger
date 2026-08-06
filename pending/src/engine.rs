@@ -1,4 +1,4 @@
-use ledger_base::ports::{HoldData, PendingEffect};
+use ledger_base::ports::{ApplyIndex, HoldData, PendingEffect};
 use ledger_base::{Amount, BudgetGroup, FxHashMap, MapGauge, Transfer, TransferFlags, TxId};
 
 use crate::block::{BlockAddr, BlockStore, LogTraffic, MemBlockStore, RecordLog, SEGMENTS};
@@ -50,6 +50,10 @@ pub struct PendingEngine {
     /// committed decisions in order. Background work is the right place to pay, so it pays there.
     outstanding: Vec<(BlockAddr, Transfer)>,
     overflowed: u64,
+    /// The log position of the last batch whose effects reached this engine. Not the same thing as the
+    /// count below: that says how many, this says *where*, and only the second is a position a snapshot can
+    /// resume from. See `ApplyIndex`.
+    applied_through: ApplyIndex,
     /// Committed decisions applied, counted so an answer can say which of them it reflects. The
     /// sequencer knows how many it had sent when it asked, and an answer from before one of them is a
     /// component that has reordered its own queue — which is the check that replaces the lane's order
@@ -259,8 +263,12 @@ impl PendingEngine {
     /// `Err` is the one thing a write can fail at: an index that cannot take a new hold. Only a
     /// `Create` inserts — a `Reduce` repoints an existing slot and a `Remove` frees one — so it is the
     /// only variant that can report it.
-    pub fn write(&mut self, effect: PendingEffect) -> Result<(), NotStored> {
+    pub fn write(&mut self, effect: PendingEffect, at: ApplyIndex) -> Result<(), NotStored> {
         self.applied += 1;
+        // Recorded before the effect, so a block sealed while this one is being written is stamped with the
+        // position *before* it rather than after. Coverage errs early, which costs replay a little and
+        // cannot lose anything; erring late would claim a record was sealed that is not.
+        self.applied_through = at;
         match effect {
             PendingEffect::Create {
                 tx_id,
@@ -443,7 +451,7 @@ impl PendingEngine {
     /// False when the index could not take it. The counter and the caller's answer are set by this one
     /// call, so the number a report prints and the news the sequencer acts on cannot disagree.
     fn put(&mut self, key: TxId, hold: HoldData, fresh: bool) -> bool {
-        let addr = self.records.append(key, &hold);
+        let addr = self.records.append(key, &hold, self.applied_through);
         let Self { index, records, .. } = self;
         if fresh {
             if index.insert_new(key, addr).is_err() {
@@ -690,11 +698,21 @@ impl PendingEngine {
         self.behind().map(|(day, _)| (day % SEGMENTS) as u8)
     }
 
+    /// The log position a snapshot of this engine would cover: everything up to it has reached a block, so
+    /// replay starts after it and rebuilds what the writeback buffer still holds.
+    ///
+    /// Zero means it covers nothing, which is what an engine that has applied nothing reflects — and a
+    /// legitimate snapshot rather than a missing one, since a follower starting from empty receives exactly
+    /// that.
+    pub fn coverage(&self) -> ApplyIndex {
+        self.records.sealed_through(self.applied_through)
+    }
+
     /// A writer over this engine's state. Borrows it, so nothing is copied to be written — and so a caller
     /// cannot apply anything while a snapshot is in flight, which is the stable read the design asks for and
     /// the only form of it that exists yet (design notes §15).
     pub fn snapshot(&self) -> SnapshotWriter<'_> {
-        SnapshotWriter::new(&self.index, &self.records, &self.budgets)
+        SnapshotWriter::new(&self.index, &self.records, &self.budgets, self.coverage())
     }
 
     /// Puts a snapshot's group totals back, once its stream is complete. The index restores itself as the
@@ -764,15 +782,24 @@ impl PendingEngine {
 /// would be a test about nothing. One place, because all four test modules need it.
 #[cfg(test)]
 mod test_support {
-    use super::{PendingEffect, PendingEngine};
+    use super::{ApplyIndex, PendingEffect, PendingEngine};
 
     pub trait Stored {
+        /// Applies an effect at the next position, which is all a test that does not care about positions
+        /// needs: one more than the last, so the sequence is monotonic the way a log is.
         fn stored(&mut self, effect: PendingEffect);
+        /// Applies it at a position the test chose, for the tests that are about positions.
+        fn stored_at(&mut self, effect: PendingEffect, at: ApplyIndex);
     }
 
     impl Stored for PendingEngine {
         fn stored(&mut self, effect: PendingEffect) {
-            self.write(effect).expect("the index took the hold");
+            let at = ApplyIndex(self.applied() + 1);
+            self.stored_at(effect, at);
+        }
+
+        fn stored_at(&mut self, effect: PendingEffect, at: ApplyIndex) {
+            self.write(effect, at).expect("the index took the hold");
         }
     }
 }
@@ -892,8 +919,10 @@ mod tests {
         let mut engine = PendingEngine::sized(8, 64, 64, Box::new(MemBlockStore::default()));
         let mut refused = None;
         for index in 0..256u128 {
-            if let Err(not_stored) = engine.write(create(TxId(index + 1), 10, BudgetGroup::ABSENT))
-            {
+            if let Err(not_stored) = engine.write(
+                create(TxId(index + 1), 10, BudgetGroup::ABSENT),
+                ApplyIndex(index as u64 + 1),
+            ) {
                 refused = Some(not_stored.hold);
                 break;
             }
