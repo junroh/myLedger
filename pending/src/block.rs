@@ -1,7 +1,8 @@
 use std::collections::VecDeque;
+use std::ops::{Deref, DerefMut};
 
 use ledger_base::ports::{ApplyIndex, HoldData};
-use ledger_base::{AccountId, Amount, BudgetGroup, FxHashMap, Prng, TxId};
+use ledger_base::{AccountId, Amount, BudgetGroup, FxHashMap, LineFit, Prng, TxId};
 use ledger_stubkit::Server;
 
 /// A block is what one read fetches, and the size the speed contract is written against: one hold
@@ -17,6 +18,51 @@ pub const RECORD_BYTES: usize = 80;
 /// This record is packed rather than padded, so more fit than either — and the intra-block index is
 /// six bits wide for the same reason it is there: sixty-four is the ceiling the format allows.
 pub const RECORDS_PER_BLOCK: usize = BLOCK_BYTES / RECORD_BYTES;
+
+/// One block's bytes, aligned to the block size.
+///
+/// The alignment is not the cache line's and not a throughput choice. Direct IO is how a real store has
+/// to read and write — the residency window is already this engine's cache, so the page cache would be a
+/// second copy of it — and it requires the buffer address, the offset and the length all aligned to the
+/// device's own block. Offsets and lengths are whole blocks by construction; a `Vec<u8>` is aligned to
+/// one byte, and an unaligned buffer costs a bounce copy per IO on a path that has none (rule 10). So the
+/// alignment arrives with the buffer rather than with the backend that will need it.
+///
+/// Expressed here rather than through `cache_aligned!` because that macro funnels the *target's* line
+/// size, which varies per build and is why it has to be written in one place. This alignment is
+/// `BLOCK_BYTES` and cannot vary with the target; the assertion below is what keeps the literal
+/// `repr(align(..))` demands from drifting away from it.
+#[repr(align(4096))]
+pub struct Block([u8; BLOCK_BYTES]);
+
+const _: () = assert!(
+    core::mem::align_of::<Block>() == BLOCK_BYTES,
+    "a block's alignment is the block size, which is what direct IO requires"
+);
+
+ledger_base::layout_claim!(BLOCK_LAYOUT: Block, size = BLOCK_BYTES, LineFit::WholeLines);
+
+impl Block {
+    /// Boxed rather than returned by value: blocks live in a `VecDeque` that moves its elements, and
+    /// four kilobytes is not something to move.
+    pub fn zeroed() -> Box<Self> {
+        Box::new(Self([0; BLOCK_BYTES]))
+    }
+}
+
+impl Deref for Block {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl DerefMut for Block {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        &mut self.0
+    }
+}
 
 const INDEX_BITS: u32 = 6;
 /// Thirty-five, not thirty-six: the index slot spends its forty-eighth bit on saying whether a
@@ -251,7 +297,7 @@ impl BlockRange {
 
 /// One block's worth of records, and how much of it is used.
 struct Filling {
-    bytes: Vec<u8>,
+    bytes: Box<Block>,
     filled: usize,
     /// The log position of the batch whose effect put the first record here. Only meaningful while the block
     /// is in the writeback buffer, which is the one place it is read: the oldest buffered block's position is
@@ -263,7 +309,7 @@ struct Filling {
 impl Filling {
     fn new() -> Self {
         Self {
-            bytes: vec![0; BLOCK_BYTES],
+            bytes: Block::zeroed(),
             filled: 0,
             began_at: ApplyIndex::default(),
         }
@@ -419,7 +465,7 @@ pub struct RecordLog {
     days: [BlockRange; SEGMENT_VALUES],
     next_block: u64,
     /// Read into, so a lookup allocates nothing.
-    scratch: Vec<u8>,
+    scratch: Box<Block>,
     /// Reads asked of the store and not yet answered, by handle, because a block carries several
     /// records and only the address says which one was wanted.
     fetching: FxHashMap<u64, BlockAddr>,
@@ -470,7 +516,7 @@ impl RecordLog {
             segment: 0,
             days: [BlockRange::default(); SEGMENT_VALUES],
             next_block: 0,
-            scratch: vec![0; BLOCK_BYTES],
+            scratch: Block::zeroed(),
             fetching: FxHashMap::default(),
             appended: 0,
             died_in_buffer: 0,

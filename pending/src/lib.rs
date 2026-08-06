@@ -31,7 +31,7 @@ pub use overlay::HoldOverlay;
 pub use snapshot::{NotASnapshot, SnapshotReader, SnapshotWriter, RECORD as SNAPSHOT_RECORD};
 
 /// The layout claims this crate owns, printed by `ledgerfio layout` beside everyone else's.
-pub const HOT_TYPES: &[ledger_base::TypeLayout] = &[index::BUCKET_LAYOUT];
+pub const HOT_TYPES: &[ledger_base::TypeLayout] = &[index::BUCKET_LAYOUT, block::BLOCK_LAYOUT];
 
 const _: () = assert!(
     ledger_base::layouts_are_sound(HOT_TYPES),
