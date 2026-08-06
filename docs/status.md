@@ -395,15 +395,15 @@ unanswered, and **when that default stops being safe**. The source design's own 
   seconds is measuring this ledger rather than the stand-in. It becomes a correctness-adjacent question
   when a node has to run for a day.
 
-- **Can `ledgerfio` price a store read at all?**
-  *Default:* it cannot, and it does not say so. `--store-read` and `--store-iops` exist and are wired, but
-  `engine reads store=0` in every configuration tried — `--resolve-after 900000`, `--overlay-limit 10000`,
-  `--residency 1` included. Nothing falls out of a 24-hour residency window in a five-second run, so there is
-  nothing for a store read to fetch. `ledgersim check` does reach the path (87,494 store reads over
-  sixty-four seeds), so this is about the tool that can put a latency on it, not about the path.
-  *Stops being safe:* it already is not, for anyone reading a report. A run that sets `--store-read` and shows
-  a tail is showing something else, and `SE-OQ-6` cannot be approached from a tool that never issues the read
-  being priced. What is missing is either a residency window a short run can empty or a way to make one.
+- **What queue depth should the store model hold, and who says so?**
+  *Default:* a constant, 128, written into `ledgerfio`'s runner rather than into a flag. It is enough until a
+  read is slow: at 40,000 store reads a second — which `--resolve-after 100000 --residency 1` produces — the
+  design's own `≤5ms` worst case needs about two hundred outstanding, so the run refuses reads at 128 and what
+  the report shows is the depth rather than the latency.
+  *Stops being safe:* it already is not, for the one measurement `SE-OQ-6` is about. A `--store-read 5000` run
+  today reports p50 212ms, and that number is a queue too short as much as a device too slow — the two are not
+  separable from outside. It is a flag rather than a decision, and it is here because the value it should
+  default to is the decision.
 
 - **What throttle paces the snapshot's write?**
   *Default:* none — nothing writes one anywhere, so nothing paces it. The unit is settled (a declared number
@@ -485,14 +485,16 @@ An entry that vanishes reads as a question nobody ever asked.
 - **What sizes the expiry throttle's slice?** The day does. The requirement is met three orders over and the
   binding constraint is a single round, which is bounded by declaration rather than by density.
 - **How often should the engine make its blocks durable?** Every worker round, and there is nothing to trade.
-  Measured: at 1M tx/s a 500µs `sync` costs 2–9% of throughput and the knee is around 2ms; at the design's own
-  rate — 1,736 arrivals a second, so about thirty-four blocks sealed — a 500µs `fsync` is 1.7% of one thread,
-  against a real NVMe's 50–500µs. Group commit is why it is cheap: one sync covers every block the round
-  sealed, so a slower device is covered by fewer syncs and the curve bends instead of falling.
-  **What the same measurement found instead is a requirement on the *write*.** A block write is per block and
-  nothing amortises it: at 1M tx/s this workload seals eighteen thousand blocks a second, so 100µs of write is
-  1.8s of thread per second and throughput halves. A 4KB `O_DIRECT` write is 10–20µs, so it fits with less
-  headroom than the read path has. Design notes §16 has both curves and the command.
+  The answer at the design's own rate is arithmetic rather than a curve: 150M arrivals a day is 1,736/s, which
+  seals about thirty-four blocks a second, so a 500µs `fsync` is 1.7% of one thread against a real NVMe's
+  50–500µs. Two orders of headroom, and a deferred sync would buy that back at the price of coverage.
+  What a curve adds is where it *stops* being free, and the transferable form of it is a budget rather than a
+  rate: **one thread divided by the block seal rate.** Measured at 1M tx/s, where the seal rate is 19,444
+  blocks a second and so the budget is 51µs, `--store-write 50` costs 29% of throughput and `--store-write
+  100` costs 56% — the budget is the knee. A sync is four times cheaper per microsecond at the same point,
+  because group commit means one sync covers every block a round sealed and a slower device gets fewer of
+  them. Design notes §16 has both curves, the read curve beside them, and why 1M is the rate they were taken
+  at.
 - **What was weighed and rejected in §3 and §7?** Nothing, in both. Neither was a decision: what is in the
   code is what was intended, and the implementation reached something else and was corrected. §7 merged a
   linked chain with a budget group, which the design has apart and always did. §3 kept arriving at other
@@ -510,10 +512,18 @@ An entry that vanishes reads as a question nobody ever asked.
 ## Where the numbers live
 
 No measured number is written into these documents as a fact to be trusted; each one names the
-command that reproduces it. The five that decide the most:
+command that reproduces it. The ones that decide the most:
 
 - `ledgerfio run --workload partial-settle --duration 10s` — where reads land across the two
   windows, and what compaction saves.
+- `ledgerfio run --workload hold-settle --resolve-after 100000 --residency 1 --overlay-limit 10000` — the
+  one combination that makes every read a store read, which is what puts a device's latency on the path it
+  is meant to price. Both flags are needed and neither alone does it; `--resolve-after 900000` lands no
+  resolution at all in a five-second run, which is how a note claiming this tool could not reach the read
+  path came to be written.
+- `ledgerfio run --workload partial-settle --rate 1m --sweep store-write=...` — what a device costs on the
+  paths that hold the thread. 1M/s is a ceiling-finding rate rather than a target, and the number that
+  transfers off it is a budget: one thread divided by the block seal rate.
 - `ledgerfio run --workload hold-settle --resolve-after 900000 --external-ratio 30` — what order
   exemption is worth, as lane depth.
 - `ledgersim check --seeds 64` — every invariant under fault injection, including the store path.

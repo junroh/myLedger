@@ -138,6 +138,12 @@ decides what the prediction is worth:
   exact store, which every other answer is measured against. Design notes §16 has the measured curves; the
   short of it is that a per-block write is roughly four times as expensive per microsecond as a sync, because
   one sync covers every block a round sealed and a write does not.
+- **Reaching a store read takes two flags at once, and neither alone does it.** A read happens only when a
+  resolution needs a record that is no longer in memory, so the residency window has to be short enough to
+  fall out of (`--residency 1`) *and* the hold has to be resolved after it does but still inside the run
+  (`--resolve-after 100000`). With both, `engine reads` shows every read going to the store; with
+  `--resolve-after 900000` a five-second run at 100k/s lands no resolution at all and the whole run is holds.
+  A number from `--store-read` on a run whose `engine reads store=` is zero is a number about nothing.
 - **The tail is what makes answers finish out of order**, and that is a cost of its own: an answer that
   is ready waits for an earlier one on its lane, so the wait is the queue depth times a latency, which no
   per-command bound covers. The run reports it as `order wait`, separately from the engine, because the

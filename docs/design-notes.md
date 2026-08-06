@@ -1828,43 +1828,53 @@ syncs too, and those are charged differently on purpose: a read occupies the *de
 the queue, harvested later, with the engine working meanwhile — while a write, a sync and an apply-path read
 occupy the *thread*, which on this component is the thread every lookup passes through.
 
-Reproduce with `ledgerfio run --workload partial-settle --rate 1m --resolve-after 900000 --sweep
-store-sync=...`. One megabyte-per-second of transfers rather than the usual hundred thousand, and that is not
-for show: at 100k/s the spread between repeats is 20–80ms at p99.9 — the idem stand-in's own tail, which
-`status.md` already records — and it swamps anything either flag does. At 1M/s the engine is the limit and the
-curve is clean.
+**Where 1M tx/s comes from, because it is not a target.** The design's rate is 150M arrivals a day, which is
+1,736/s — six hundred times lower. At `ledgerfio`'s usual 100k/s neither flag is visible, and not because it
+costs nothing: the spread between repeats at 100k/s is 20–80ms at p99.9, which is the idem stand-in's own tail
+(`status.md` records it), and it is larger than what is being looked for. 1M/s is where the engine rather than
+the client or the stand-in is the limit, so the curve is readable. It is a ceiling-finding rate, and a number
+read off it means nothing until it is expressed in something that transfers.
 
-| `--store-sync` | tx/s | | `--store-write` | tx/s |
+**What transfers is a budget: one thread divided by the block seal rate.** At 1M tx/s this workload seals
+19,444 blocks a second (`engine record blocks peak 97222` over five seconds), so the budget per write is 51µs.
+
+| `--store-write` | tx/s | | `--store-sync` | tx/s |
 |---|---|---|---|---|
 | 0 | 1.00M | | 0 | 1.00M |
-| 500µs | 0.91–0.98M | | 20µs | 1.00M |
-| 2ms | 0.74M | | 50µs | 0.71M |
-| 4ms | 0.51M | | 100µs | 0.44M |
+| 20µs | 1.00M | | 500µs | 0.91–0.98M |
+| 50µs | 0.71M | | 2ms | 0.74M |
+| 100µs | 0.44M | | 4ms | 0.51M |
 
-**A write is about four times as expensive per microsecond as a sync, and the reason is group commit.** One
-sync covers every block the round sealed, so as it gets slower it covers more — self-limiting, and the
-throughput curve bends rather than falling off. A write is per block and nothing amortises it: at 1M tx/s this
-workload seals about eighteen thousand blocks a second, so 100µs of write is 1.8 seconds of thread per second
-and the run is store-bound at 44%.
+The budget is the knee: 20µs is free, 50µs — the budget itself — costs 29%, 100µs costs 56%. **A sync is about
+four times cheaper per microsecond at the same point, and group commit is why.** One sync covers every block
+the round sealed, so a slower device is covered by fewer syncs and the curve bends instead of falling. A write
+is per block and nothing amortises it.
 
-That settles the sync cadence, and it settles it by there being nothing to trade. At the design's rate — 150M
-arrivals a day is 1,736/s, so about thirty-four blocks sealed a second — a 500µs `fsync` costs 1.7% of one
-thread, and a real NVMe `fsync` is 50–500µs. Syncing every round is affordable by two orders, and a deferred
-sync would buy that back at the price of coverage. The `status.md` entry moves to the closed list.
+At the design's own rate the budget is thirty milliseconds a write and neither flag matters. That is what
+settles the sync cadence, and it settles it by arithmetic rather than by the curve above: thirty-four blocks a
+second against an `fsync` of 50–500µs is 1.7% of a thread.
 
-What the same measurement puts in its place is a **requirement on the write**, which is not the same shape as
-the `≤5ms` read contract and was not visible before: at 1M tx/s a 4KB block write has to be under about 50µs,
-because eighteen thousand of them a second is the rate the buffer compacts at. A 4KB `O_DIRECT` write to NVMe
-is 10–20µs, so it fits — with less headroom than the read path has, and that is worth knowing before the
-device rather than after it. At the design's own rate it is thirty-four writes a second and the question
-does not arise.
+**The read is priced too, and the combination that reaches it is the whole trick.** A store read only happens
+when a resolution needs a record that is no longer in memory, so it takes two things at once: a residency
+window short enough to fall out of (`--residency 1`) and a hold resolved after it does but still inside the
+run (`--resolve-after 100000`). With both, every read is a store read — 199,933 of them, 100% — where
+`--resolve-after 900000` produces none at all, because at 100k/s over five seconds no resolution lands and the
+run is holds only (`engine told create=500032 reduce=0 remove=0`). The first version of this note said
+`ledgerfio` could not reach the read path, on the evidence of runs that used the second figure. It can.
 
-**What `ledgerfio` still cannot price is the read.** `engine reads store=0` in every configuration tried,
-including `--resolve-after 900000`, `--overlay-limit 10000` and `--residency 1`: nothing falls out of a
-24-hour residency window in a five-second run, so there is nothing for a store read to fetch. `ledgersim
-check` does reach it — 87,494 store reads across sixty-four seeds — so the path is exercised, just not by the
-tool that could put a latency on it. `--store-read` and `--store-iops` are therefore still priced against
-runs that never use them.
+| `--store-read` | tx/s | p50 | p99.9 |
+|---|---|---|---|
+| 0 | 100k | 1.4ms | 11ms |
+| 200µs | 100k | 1.5ms | 7.5ms |
+| 1ms | 84.6k | 1.5ms | 10ms |
+| 5ms | 60.7k | 212ms | 755ms |
+
+That last row is not the `≤5ms` contract failing. It is 40,000 store reads a second needing about two hundred
+outstanding, against a queue depth of 128 that `ledgerfio`'s runner writes as a constant — so the run refuses
+reads and what the number shows is the depth as much as the device. The two are not separable from outside,
+which is why the depth is in `status.md`'s decisions list rather than described here as a result. It is also a
+stress point rather than a design one: forcing every resolution to miss memory is what the two flags are for,
+and a 24-hour residency exists so that a deployment does not.
 
 ### Still unbuilt, and named so it is not read as done
 
