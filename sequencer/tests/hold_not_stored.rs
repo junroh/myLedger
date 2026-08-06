@@ -117,3 +117,47 @@ fn a_store_that_refuses_seals_the_apply_path_and_says_so_separately() {
         "a device fault was counted as an index that ran out, which sends an operator to the wrong place"
     );
 }
+
+/// A store that answers with bytes that changed seals the apply path as well, and that is the one of the
+/// three the checksum had to arrive for. A refusal was always visible; corruption was not a fault at all.
+///
+/// Double-entry does not catch it, which is why it cannot be left to the identities: a corrupted remainder
+/// moves both sides of the ledger by the same wrong amount, so both sums still balance and no invariant in
+/// the reactor has anything to notice.
+#[test]
+fn a_store_that_answers_with_changed_bytes_seals_the_apply_path() {
+    let mut harness = Harness::with_stubs(NoLatency::corrupting_store(), NoLatency::raft());
+    harness.fund(ALICE, FUNDING);
+
+    // Holds first, so blocks are sealed and left to the store; then resolutions, which are what read one
+    // back — a hold still in memory is answered without the store being asked at all.
+    let mut holds = Vec::new();
+    for _ in 0..512 {
+        let mut tx = harness.transfer(ALICE, BOB, 1);
+        tx.flags = TransferFlags::PENDING;
+        holds.push(tx.id);
+        harness.submit(tx);
+    }
+    // Only once compaction has carried survivors out of the writeback buffer: a hold still in it is
+    // answered without the store being asked, so the resolutions would read nothing.
+    harness.tick_until_written(408);
+    for hold in holds {
+        let mut tx = harness.transfer(ALICE, BOB, 1);
+        tx.flags = TransferFlags::POST_PENDING;
+        tx.pending_ref = hold;
+        harness.submit(tx);
+    }
+    harness.tick_until(
+        "the store never answered with a block that failed its checksum",
+        |r| r.metrics().store_failures > 0,
+    );
+
+    assert!(
+        harness.reactor.is_fail_stopped(),
+        "the store answered with bytes that changed and the node kept applying"
+    );
+    assert!(
+        harness.logged(LogKind::STORE_FAILED),
+        "the seal went unrecorded, so there is nothing to diagnose it with"
+    );
+}

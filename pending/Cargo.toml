@@ -16,6 +16,7 @@ name = "snapshot"
 harness = false
 
 [dependencies]
+crc32c = "0.6"
 ledger-base.workspace = true
 ledger-stubkit.workspace = true
 

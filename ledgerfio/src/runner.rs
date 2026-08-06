@@ -137,6 +137,7 @@ impl Runner {
                     iops: options.store_iops,
                     queue_depth: options.store_queue_depth,
                     fault_every: options.store_fault_every,
+                    corrupt_every: options.store_corrupt_every,
                 },
                 capacity: options.capacity,
                 index_budget_bytes: options.index_budget as usize,

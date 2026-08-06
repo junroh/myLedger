@@ -143,9 +143,12 @@ decides what the prediction is worth:
   engine keeps the command. At 40,000 store reads a second, 5ms reads need about two hundred outstanding — at
   128 the run reports p50 212ms and that number is the depth rather than the device, at 512 it is p99.9 9.7ms
   with throughput intact. A `--store-read` number is only about the device once the depth is not the limit.
-- **`--store-fault-every` makes the store refuse**, which is the only way to reach the seal a device fault
-  produces: `MemoryStore` cannot fail. The run says `SEALED` and `fail-stop=true`, and the count is separate
-  from a hold the index could not take.
+- **`--store-fault-every` makes the store refuse** and **`--store-corrupt-every` makes it answer wrongly**,
+  which are the only ways to reach the seals those produce: `MemoryStore` neither fails nor lies. The run says
+  `SEALED` with the two counts apart, and `fail-stop=true`. The second needs a run that actually reads the
+  store, so it needs the two flags in the next point as well. A device that *hangs* is the third way and there
+  is no knob for it, because nothing in the ledger detects a component that stops answering —
+  `status.md` has that as a decision rather than a gap to fill in passing.
 - **Reaching a store read takes two flags at once, and neither alone does it.** A read happens only when a
   resolution needs a record that is no longer in memory, so the residency window has to be short enough to
   fall out of (`--residency 1`) *and* the hold has to be resolved after it does but still inside the run

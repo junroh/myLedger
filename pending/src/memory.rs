@@ -308,6 +308,7 @@ struct TrafficGauge {
     days_of_slack: AtomicU64,
     swept_blocks: AtomicU64,
     store_faults: AtomicU64,
+    store_corruptions: AtomicU64,
 }
 
 impl TrafficGauge {
@@ -347,6 +348,8 @@ impl TrafficGauge {
             .store(traffic.swept_blocks, Ordering::Relaxed);
         self.store_faults
             .store(traffic.store_faults, Ordering::Relaxed);
+        self.store_corruptions
+            .store(traffic.store_corruptions, Ordering::Relaxed);
     }
 
     fn read(&self) -> LogTraffic {
@@ -371,6 +374,7 @@ impl TrafficGauge {
             days_of_slack: self.days_of_slack.load(Ordering::Relaxed),
             swept_blocks: self.swept_blocks.load(Ordering::Relaxed),
             store_faults: self.store_faults.load(Ordering::Relaxed),
+            store_corruptions: self.store_corruptions.load(Ordering::Relaxed),
         }
     }
 }

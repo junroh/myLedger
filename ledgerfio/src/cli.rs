@@ -92,6 +92,10 @@ pub struct Options {
     /// Make the store refuse every nth call, to prove the sequencer seals. A device fault rather than a
     /// latency, and the only reason it exists: a seal nothing can produce is a seal nothing has tested.
     pub store_fault_every: u32,
+    /// Make the store flip a bit in every nth block it answers a read with. The other way a device
+    /// misbehaves and the worse one, because it answers: without the block checksum this was not a fault at
+    /// all but a wrong answer nothing could see.
+    pub store_corrupt_every: u32,
     /// Holds the engine's overlay may keep before idle ones are evicted. Small enough and a resolution
     /// has to ask the engine, which is the only way a run reaches the fetch path at all.
     pub overlay_limit: usize,
@@ -155,6 +159,7 @@ impl Default for Options {
             store_iops: 0,
             store_queue_depth: 128,
             store_fault_every: 0,
+            store_corrupt_every: 0,
             overlay_limit: 1 << 20,
             idem_latency: LatencyRange::new(Duration::from_micros(1), Duration::from_micros(5)),
             violate_order_every: 0,
@@ -292,6 +297,7 @@ impl Cli {
             "store-iops" => options.store_iops = Self::count(value)?,
             "store-queue-depth" => options.store_queue_depth = Self::count(value)?.max(1) as usize,
             "store-fault-every" => options.store_fault_every = Self::count(value)? as u32,
+            "store-corrupt-every" => options.store_corrupt_every = Self::count(value)? as u32,
             "overlay-limit" => options.overlay_limit = Self::count(value)? as usize,
             "idem-latency" => options.idem_latency = Self::latency(value)?,
             "violate-order-every" => options.violate_order_every = Self::count(value)? as u32,

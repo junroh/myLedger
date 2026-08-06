@@ -42,7 +42,37 @@ const _: () = assert!(
 
 ledger_base::layout_claim!(BLOCK_LAYOUT: Block, size = BLOCK_BYTES, LineFit::WholeLines);
 
+/// Where a block's checksum sits: after the records, in the sixteen bytes fifty-one eighty-byte records
+/// leave over. **Integrity costs no space at all here**, which is why it is a whole-block checksum and not a
+/// per-record one — fifty-one four-byte stamps would not fit in sixteen bytes, and widening the record to
+/// carry its own would drop the block from fifty-one records to forty-eight and cost six percent of the
+/// store.
+const CHECKSUM_AT: usize = RECORDS_PER_BLOCK * RECORD_BYTES;
+
 impl Block {
+    /// Seals the block's bytes with a checksum over its records.
+    ///
+    /// CRC32C from a crate rather than the hasher already in `base`: `rustc-hash` is built for placing keys in
+    /// a table, and using it here because it is to hand would be picking the tool by availability. A CRC is
+    /// the one that *guarantees* what this needs — every one-bit and two-bit error and every burst up to
+    /// thirty-two bits detected, rather than a probability — and CRC32C is a hardware instruction on both
+    /// supported targets.
+    fn stamp(&mut self) {
+        let checksum = crc32c::crc32c(&self.0[..CHECKSUM_AT]);
+        self.0[CHECKSUM_AT..CHECKSUM_AT + 4].copy_from_slice(&checksum.to_le_bytes());
+    }
+
+    /// Whether these bytes are the ones that were written. False means silent corruption — a device that
+    /// answered rather than refused — and it is the one failure this store could not previously see at all.
+    fn intact(&self) -> bool {
+        let stamped = u32::from_le_bytes(
+            self.0[CHECKSUM_AT..CHECKSUM_AT + 4]
+                .try_into()
+                .expect("four bytes"),
+        );
+        stamped == crc32c::crc32c(&self.0[..CHECKSUM_AT])
+    }
+
     /// Boxed rather than returned by value: blocks live in a `VecDeque` that moves its elements, and
     /// four kilobytes is not something to move.
     pub fn zeroed() -> Box<Self> {
@@ -507,6 +537,10 @@ pub struct StoreModel {
     /// the reaction to a store that will not do as it is told is rule 19's seal, and a seal nothing can
     /// produce is a seal nothing has tested.
     pub fault_every: u32,
+    /// Flip a bit in every nth block the store answers a read with. The other way a device misbehaves, and
+    /// the worse one: it says yes. Before there was a checksum this was not a fault but a wrong answer, and
+    /// the whole point of the knob is that the wrong answer is now a seal.
+    pub corrupt_every: u32,
 }
 
 impl StoreModel {
@@ -527,6 +561,7 @@ impl StoreModel {
             && self.sync_tail_nanos == 0
             && self.iops == 0
             && self.fault_every == 0
+            && self.corrupt_every == 0
     }
 }
 
@@ -584,7 +619,9 @@ pub struct LatencyStore {
     /// Device time charged by synchronous calls and not yet handed to whoever has a clock.
     charged_nanos: u64,
     fault_every: u32,
+    corrupt_every: u32,
     calls: u64,
+    reads: u64,
 }
 
 impl LatencyStore {
@@ -610,8 +647,22 @@ impl LatencyStore {
             queue_depth,
             charged_nanos: 0,
             fault_every: model.fault_every,
+            corrupt_every: model.corrupt_every,
             calls: 0,
+            reads: 0,
         }
+    }
+
+    /// Flips one bit of a block this store has just answered a read with, if this is the read the fault
+    /// takes. One bit and in a record rather than in the checksum, because a stamp that fails to match its
+    /// own bytes is the easy case: the interesting one is bytes that changed and a stamp that did not.
+    fn corrupt(&mut self, block: &mut Block) {
+        self.reads += 1;
+        if self.corrupt_every == 0 || !self.reads.is_multiple_of(u64::from(self.corrupt_every)) {
+            return;
+        }
+        let at = (self.prng.next_u64() % CHECKSUM_AT as u64) as usize;
+        block[at] ^= 1 << (self.prng.next_u64() % 8);
     }
 
     fn charge(&mut self, cost: Cost) {
@@ -651,7 +702,9 @@ impl DurableStore for LatencyStore {
         if self.refuses() {
             return Err(StoreFault::Device);
         }
-        self.inner.read_at(segment, offset, into)
+        self.inner.read_at(segment, offset, into)?;
+        self.corrupt(into);
+        Ok(())
     }
 
     fn submit(&mut self, handle: u64, segment: u8, offset: u64, now: u64) -> bool {
@@ -669,7 +722,11 @@ impl DurableStore for LatencyStore {
         if self.refuses() {
             return Some(Err(StoreFault::Device));
         }
-        Some(self.inner.read_at(segment, offset, into).map(|()| handle))
+        if let Err(fault) = self.inner.read_at(segment, offset, into) {
+            return Some(Err(fault));
+        }
+        self.corrupt(into);
+        Some(Ok(handle))
     }
 
     fn inflight(&self) -> usize {
@@ -766,6 +823,10 @@ pub struct RecordLog {
     /// same decision in three places. Rule 19 is still what happens — nothing is answered from a faulted
     /// read, and the seal follows on the next round.
     faults: u64,
+    /// Blocks the store answered with whose checksum did not match. Counted apart from a refusal because it
+    /// is the opposite behaviour — a device that answered rather than one that said no — and because before
+    /// there was a checksum it was not a fault at all but a wrong answer.
+    corruptions: u64,
     fault_owed: bool,
     left_memory: u64,
     buffer_reads: u64,
@@ -817,6 +878,7 @@ impl RecordLog {
             flushed: 0,
             freed: 0,
             faults: 0,
+            corruptions: 0,
             fault_owed: false,
             left_memory: 0,
             buffer_reads: 0,
@@ -880,6 +942,18 @@ impl RecordLog {
     fn note_fault(&mut self) {
         self.faults += 1;
         self.fault_owed = true;
+    }
+
+    /// Whether what the store just read into the scratch buffer is what was written. Every path that reads a
+    /// block goes through this, and none of them decodes anything when it says no: a record built out of
+    /// bytes that changed under us is a wrong answer, which is worse than the seal that follows.
+    fn scratch_intact(&mut self) -> bool {
+        if self.scratch.intact() {
+            return true;
+        }
+        self.corruptions += 1;
+        self.fault_owed = true;
+        false
     }
 
     /// Whether a fault is owed to whoever can act on it, taken as it is read.
@@ -1009,6 +1083,11 @@ impl RecordLog {
             // day's count is what refuses to reach zero.
             return true;
         }
+        if !self.scratch_intact() {
+            // Offering a void built from bytes that changed would release money against a record nobody
+            // wrote. The day stays unfinished, which is the safe direction, and the seal stops the rest.
+            return true;
+        }
         self.store_reads += 1;
         for index in 0..RECORDS_PER_BLOCK {
             let addr = RecordAddr::new(segment, block, index as u8);
@@ -1128,6 +1207,9 @@ impl RecordLog {
             self.note_fault();
             return None;
         }
+        if !self.scratch_intact() {
+            return None;
+        }
         let at = addr.index() as usize * RECORD_BYTES;
         Some(decode(&self.scratch[at..at + RECORD_BYTES], addr))
     }
@@ -1157,6 +1239,9 @@ impl RecordLog {
             self.note_fault();
             return None;
         };
+        if !self.scratch_intact() {
+            return None;
+        }
         let addr = self.fetching.remove(&handle)?;
         self.store_reads += 1;
         let at = addr.index() as usize * RECORD_BYTES;
@@ -1181,6 +1266,7 @@ impl RecordLog {
             inflight_peak: self.inflight_peak,
             freed: self.freed,
             store_faults: self.faults,
+            store_corruptions: self.corruptions,
             ..LogTraffic::default()
         }
     }
@@ -1212,6 +1298,9 @@ impl RecordLog {
     /// two memory windows are independent, and this is the one place that says so. Residency is trimmed here
     /// rather than on a schedule because this is the only event that adds to it.
     fn seal_store_block(&mut self) {
+        // Stamped here and nowhere else: this is the one moment a block's bytes stop changing, which is what
+        // makes a whole-block checksum possible at all.
+        self.store_open.bytes.stamp();
         let addr = RecordAddr::new(self.segment, self.next_block, 0);
         // A segment's first block is what brings it into being, and a later one lands in a segment that
         // exists. This side knows which from the day's own count, so the store is told rather than asked —
@@ -1270,6 +1359,9 @@ pub struct LogTraffic {
     /// Times the store refused a call. Non-zero means the apply path has been sealed, or is about to be:
     /// every one of them is a record this node cannot read and the log says exists.
     pub store_faults: u64,
+    /// Blocks the store answered with whose checksum did not match — a device that lied rather than refused.
+    /// The same seal, and a separate number because the two say different things about the hardware.
+    pub store_corruptions: u64,
     pub buffer_reads: u64,
     /// Reads answered from a block that is on the store already and still in memory. The second window's
     /// whole return, and zero would mean it is not earning its size.
@@ -1320,6 +1412,46 @@ mod tests {
             budget_members: 2,
             budget_remaining: 44,
         }
+    }
+
+    /// A block the store answered with one bit changed is not decoded, and that is the whole of what the
+    /// checksum buys: before it, those bytes became a `HoldData` and the answer was wrong rather than
+    /// refused. Double-entry does not catch it — a corrupted remainder moves both sides by the same wrong
+    /// amount — so nothing downstream would ever have said so.
+    #[test]
+    fn a_block_that_came_back_changed_is_refused_rather_than_decoded() {
+        let model = StoreModel {
+            // Every read, so the test does not depend on how many the log happens to issue.
+            corrupt_every: 1,
+            queue_depth: 8,
+            ..StoreModel::default()
+        };
+        let mut log = RecordLog::new(model.build(7), 1, 0);
+        // Past the window with survivors carried on, so a block is sealed and residency keeps none of it:
+        // only the store has it, which is the one path a device can lie on.
+        let mut addrs = Vec::new();
+        for index in 0..RECORDS_PER_BLOCK * 3 {
+            log.append(TxId(index as u128 + 1), &hold(10), ApplyIndex(1));
+        }
+        for index in 0..RECORDS_PER_BLOCK * 2 {
+            addrs.push(log.keep(TxId(index as u128 + 1), &hold(10), ApplyIndex(1)));
+        }
+        let sealed = addrs[0];
+        assert!(
+            log.try_read(sealed).is_none(),
+            "the block is still in memory, so this would not have reached the store"
+        );
+        assert!(
+            log.read(sealed).is_none(),
+            "a block whose checksum did not match was decoded anyway"
+        );
+        assert!(log.take_fault(), "the corruption was not owed to anyone");
+        assert_eq!(log.traffic().store_corruptions, 1);
+        assert_eq!(
+            log.traffic().store_faults,
+            0,
+            "a device that answered wrongly was counted as one that refused"
+        );
     }
 
     /// Every field, both ways. A format that loses one field silently is a store that answers with

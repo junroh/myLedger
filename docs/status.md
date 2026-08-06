@@ -165,6 +165,10 @@ fail. `MemoryStore` backs it today and `LatencyStore` prices a device in front o
   arguing it.
 - **Written is not durable**, and coverage follows the later one. A block a sync has not covered is not
   carried by a snapshot, because a restart could not read it.
+- **A block carries a checksum**, in the sixteen bytes fifty-one records leave spare, so integrity costs no
+  space. It is the only thing that can see a device which *answers* wrongly rather than refusing: double-entry
+  cannot, because a corrupted remainder moves both sides by the same wrong amount. `--store-corrupt-every`
+  produces one and the reaction is the seal.
 - **A read can fail**, and both kinds do the same thing: `StoreFault::Missing` is this node's own record of
   where blocks are disagreeing with the store, `Device` is an `EIO` or an `ENOSPC`. Either seals the apply
   path through `PendingNotice::StoreFailed`, counted apart from `holds_not_stored` because one is a table
@@ -273,6 +277,15 @@ inside that.
   a question about operations rather than about the code, listed under *Decisions waiting on someone*.
 - **Consensus is an echo**, the idem map has no expiry, and the log has no compaction. All three
   grow with a run, which the tools say out loud.
+- **One `ledgerfio` configuration overloads intermittently, and it is the store-read one.**
+  `--resolve-after 100000 --residency 1 --overlay-limit 10000` — the combination that makes every read a store
+  read — refuses 28,000 to 77,000 requests as overload in roughly one run in five, at 100k/s over five
+  seconds. The other four are clean at 100k/s with nothing rejected. It is not the store's queue depth (both
+  128 and 512 do it) and it is not the block checksum (the same runs on the commit before it do it), so it is
+  the same stall that owns every long-run tail here: the idem map rehashing on the thread every request passes
+  through, with the overlay's eviction beside it. Recorded rather than chased because the cause is a stand-in
+  that is already listed below as unbounded — but a report from this configuration has to be read knowing it.
+
 - **A long run's worst tail belongs to the idem stand-in, not to the ledger.** A ten-second
   `void-heavy` run at 100k/s shows p99.9 between 1.7ms and 24ms across repeats, with single maxima up
   to 114ms; a five-second run of the same thing never does. What grows with the run is the idem map,
@@ -407,6 +420,18 @@ unanswered, and **when that default stops being safe**. The source design's own 
   *Stops being safe:* it already is not, for measurement — no latency gate on a run longer than a few
   seconds is measuring this ledger rather than the stand-in. It becomes a correctness-adjacent question
   when a node has to run for a day.
+
+- **What bounds a component's answer, and what happens when it misses that bound?**
+  *Default:* nothing, for any of the three. Contract 2 says a component answers within a bounded time and
+  there is **no detector for it anywhere** — the glossary's own entry points at `ledgerfio`'s latency knobs,
+  which are a plan's inputs. A store that hangs holds the engine's thread for ever; a submitted read that never
+  completes stalls one lane permanently. Neither is noticed, so neither is acted on.
+  *Stops being safe:* at the first component that stops answering rather than answering slowly — which is a
+  hung device, a wedged thread pool, or a network volume that has gone away. The reaction is the decision, not
+  the detection: a bound, and then whether missing it quarantines a lane or fail-stops the node. A hang is not
+  lane-local, which argues for the second. It is the same question for idem and for consensus, which is why it
+  is not part of the store's work — and why the store has no `--store-hang-every`, since a knob whose reaction
+  does not exist tests nothing.
 
 - **What queue depth should the store model hold, and who says so?**
   *Default:* a constant, 128, written into `ledgerfio`'s runner rather than into a flag. It is enough until a

@@ -527,9 +527,10 @@ impl RunReport {
         }
         if self.metrics.store_failures > 0 {
             println!(
-                "  SEALED        the store refused {} calls, so the node stopped applying: records the \
-                 log says exist cannot be read. --store-fault-every is what asks for this.",
-                self.metrics.store_failures
+                "  SEALED        the store refused {} calls and answered {} blocks whose checksum did not \
+                 match, so the node stopped applying: records the log says exist cannot be read. \
+                 --store-fault-every and --store-corrupt-every are what ask for this.",
+                self.pending_traffic.store_faults, self.pending_traffic.store_corruptions
             );
         }
         if self.metrics.holds_not_stored > 0 {

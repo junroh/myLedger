@@ -76,6 +76,24 @@ impl NoLatency {
         }
     }
 
+    /// A store that answers every read with a bit changed. The other half of `failing_store`: one refuses and
+    /// this one lies, and only the second was ever a wrong answer rather than a stop.
+    pub fn corrupting_store() -> MemoryPendingConfig {
+        MemoryPendingConfig {
+            store: StoreModel {
+                corrupt_every: 1,
+                // Off, or the refusal fires first and the test proves the other seal.
+                fault_every: 0,
+                ..Self::failing_store().store
+            },
+            // Nothing kept in the overlay, so a resolution has to ask the engine and the read reaches the
+            // store rather than being answered from what the sequencer already decided.
+            overlay_soft_limit: 0,
+            eviction_per_round: 1024,
+            ..Self::failing_store()
+        }
+    }
+
     /// The smallest declared maximum the engine will accept, which sizes its index at a couple of
     /// dozen slots. A test can then pass that maximum in a handful of holds instead of a load run —
     /// and passing it is the one thing the engine reports without being asked.

@@ -176,6 +176,9 @@ fn print_help() {
     println!(
         "  --store-fault-every <n>     (0) refuse every nth store call, so the seal is exercised"
     );
+    println!(
+        "  --store-corrupt-every <n>   (0) flip a bit in every nth block read: a device that answers wrongly"
+    );
     println!("  --overlay-limit <n>         (1M) ceiling on the sequencer's own hold decisions; in flight bounds it");
     println!("  --idem-latency <us>         (1:5) idem; every request pays it");
     println!("  --violate-order-every <n>   (0) return every nth lane reply out of order");

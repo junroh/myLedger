@@ -1901,6 +1901,57 @@ run. `a_store_that_refuses_seals_the_apply_path_and_says_so_separately` is the t
 its own trap — the short windows that make a test reach the store at all also size the index for two dozen
 holds, so `HoldNotStored` fired first and the test passed for the wrong reason.
 
+### The checksum, because corruption was not a fault at all
+
+A device has three ways to misbehave and this store could see one of them. It could refuse — that is a
+`StoreFault` and it seals. It could hang — nothing here detects that, see below. And it could **answer with
+bytes that changed**, which was not a failure path at all: `decode` turns any four kilobytes into records, so a
+flipped bit became a `HoldData` and the answer was wrong rather than refused.
+
+**Double-entry does not catch it, and that is the part worth being precise about**, because "the identities
+would notice" is the answer that feels right and is not. A corrupted remainder moves both sides of the ledger
+by the same wrong amount, so both sums still balance. Field by field:
+
+| bit flipped in | what notices |
+|---|---|
+| the key | the walk does: it compares the record's key against the one asked for, so the record is passed over and the answer is "not there" — wrong, but on the safe side |
+| `remaining`, too large | *sometimes*. An over-settle that drives that account's pending column below zero is `ColumnWentNegative` and seals; with another hold on the same account it takes from that one instead, silently |
+| `remaining`, too small | nothing. A settle that was entitled to happen is refused |
+| either account id | nothing, if the id exists. Money moves between the wrong two accounts and both identities still balance |
+| `budget_members`, `budget_remaining` | nothing. The coverage check decides on a total nobody wrote |
+
+So the seal that rule 19 asks for could not happen, because nothing detected the condition.
+
+**It costs no space.** Fifty-one eighty-byte records leave sixteen bytes of a four-kilobyte block unused, and
+a CRC32C is four of them. Per-record was weighed and does not fit: fifty-one stamps need two hundred and four
+bytes, and widening the record to eighty-four to carry its own would drop the block to forty-eight records and
+cost six percent of the store. So it is one checksum over the block's records, stamped at the one moment a
+block's bytes stop changing — the seal — and verified by the three paths that read one back.
+
+**A crate rather than the hasher already to hand.** `rustc-hash` is in `base` and would have been free, but it
+is built for placing keys in a table: picking it here because it is available is choosing a tool by
+availability. A CRC is the one that *guarantees* what this needs — every one-bit and two-bit error, and every
+burst up to thirty-two bits, detected rather than probable — and CRC32C is a hardware instruction on both
+supported targets. It is `pending`'s first external dependency, and it belongs there for the reason
+serialisation belongs to whoever has a wire: the block format is this crate's.
+
+`--store-corrupt-every` produces one, and it flips a bit in a record rather than in the stamp, because a stamp
+that fails to match its own bytes is the easy case. Two tests: the record log refuses to decode a block that
+came back changed and counts it apart from a refusal, and the reactor seals on it.
+
+### Hang is the third way, and nothing here detects it
+
+Not built, and the reason is larger than this store: **there is no detector for contract 2 anywhere in the
+ledger.** The glossary's own entry says as much — its code column is "the latency knobs in `ledgerfio`", which
+are a plan's inputs and not a check. Nothing in the sequencer or the components times anything out.
+
+Modelling one is two lines either way. On the synchronous side an unbounded charge holds the thread for ever;
+on the lookup side a `submit` that succeeds and a `poll` that never returns that handle stalls one lane
+permanently. Neither is built, because a knob whose reaction does not exist tests nothing (rule 4) — what is
+missing first is the reaction, and that is a decision: what bound, and whether missing it quarantines a lane or
+fail-stops the node. A hang is not lane-local, which argues for the second. And it is the same decision for
+idem and for consensus, so it does not belong inside the store's work. `status.md` has it.
+
 ### Still unbuilt, and named so it is not read as done
 
 - **Nothing reconciles at startup.** `reclaim` only frees a segment it has a block count for, and a
