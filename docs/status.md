@@ -152,6 +152,35 @@ test asserts the store was reached.
 
 ## Not built
 
+### The store has a block interface, not a disk one — and that is the next piece of work
+
+`BlockStore` is addressed the way the engine thinks (`write(addr, bytes)`, `read(addr, into)`,
+`free_segment`), and `MemBlockStore` is the whole of it. That was right while there was nothing below it, and
+it is the reason five of the design's storage questions cannot even be asked: what it does *not* have is
+anything a filesystem does. No file, no offset, no `fsync`, no notion of a write that has been accepted but
+not made durable, and no way for a read to fail.
+
+**So the shape of the change is not "add a disk" but "make the interface a disk's, and back it with memory
+today."** The same move `stubkit` exists for: a seam the real thing slots into without the engine above
+changing, and a stand-in that is honest about being one. Blocks are already the right unit — four kilobytes,
+written once, never rewritten, freed a whole segment at a time — so what has to arrive is the vocabulary
+underneath them.
+
+What it unblocks, which is most of why it is next:
+
+- **The speed contract.** `≤5ms worst case` is a claim about a device, and `StoreModel` prices one without
+  being one. `SE-OQ-6` cannot be answered from memory.
+- **`SE-OQ-4`**, the read backend — io_uring against a thread pool — is a choice between implementations of
+  exactly this interface, and there is nowhere to put either.
+- **Where a snapshot goes.** It is a byte stream today with no destination; a file is the destination, and the
+  question in the decisions list below is waiting on there being one.
+- **Durability at all.** Nothing here can yet distinguish "written" from "durable", which is the distinction
+  a checkpoint's coverage and a log's truncation both rest on.
+- **`SE-OQ-5`**, compression, is a property of what is written to a file rather than of a block in a map.
+
+Not started. The design's §3.4 and §4.7 are the inputs, and the decisions list has the three questions a
+snapshot's destination waits on.
+
 ### The negative answer the design asked for is refused
 
 Refused rather than deferred, which is why it sits here with a reason instead of on a list. The engine's
