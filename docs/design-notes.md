@@ -1985,6 +1985,31 @@ differs and it is worth knowing which way: reading a hole in a file gives zeroes
 checksum and is counted as corruption instead. Same seal, different cause, and both only after a write has
 already failed.
 
+### The modelled store had to hand the read down, and did not
+
+`LatencyStore` claimed in its own doc comment that its composition is a floor rather than a sum — whichever of
+the model and the store below is slower wins. For a synchronous read that was true. For the **submitted** read
+it was not: `submit` recorded a deadline and handed nothing down, and `poll` did a synchronous `read_at` when
+the deadline passed. Two stores that both read synchronously make that indistinguishable, which is why it sat
+there.
+
+It stops being indistinguishable the moment a backing has concurrency of its own. A thread pool or io_uring
+lives *inside* the backing — io_uring owns the descriptors and issues the reads itself, so it cannot be a
+decorator over a synchronous read — and the model would have bypassed the whole of it. The measurement a
+modelled latency exists for is "how many threads does this rate need", answered without a device, and it would
+have been the model measuring itself.
+
+So `submit` hands the read down and takes the store below's refusal as its own, and `poll` releases a
+completion when the store below has answered it **and** the model's time for it has passed. The later of the
+two, which is what the doc comment always said.
+
+**The bytes of an early completion have to be held**, and there is no way around it: the store below answers in
+its order and the model releases in its own. Bounded by the queue depth — half a megabyte at the default
+128 and eight at 2048 — which is a measurement tool's cost, stated rather than hidden, and the buffers are
+recycled so the steady state allocates nothing.
+`a_modelled_read_waits_for_the_later_of_the_two_times` checks both directions, the second by nesting two
+models: a free one over a slow one releases when the slow one does, which is the forwarding being exercised.
+
 ### Still unbuilt, and named so it is not read as done
 
 - **Nothing reconciles at startup**, but the worst of it is now refused rather than done. `reclaim` only

@@ -660,9 +660,18 @@ pub struct LatencyStore {
     write: Cost,
     sync: Cost,
     prng: Prng,
-    /// Submitted reads and when the device says each is done, oldest first by admission. Completions are
-    /// released by due time, which is not the order they were asked in.
+    /// Reads handed to the store below and not yet answered by it: handle, segment, offset, and when this
+    /// model says the device is done with them.
     inflight: Vec<(u64, u8, u64, u64)>,
+    /// Reads the store below *has* answered, waiting for this model's own time to pass: handle, due, bytes.
+    ///
+    /// The bytes have to be held, and there is no way around it: the store below answers in its order and
+    /// this model releases in its own, so a completion that arrives early has to be kept somewhere. Bounded
+    /// by `queue_depth` — half a megabyte at the default and eight at 2048 — which is a measurement tool's
+    /// cost and is stated rather than hidden.
+    completed: Vec<(u64, u64, Box<Block>)>,
+    /// Buffers of completions already released, so the steady state allocates nothing.
+    spare: Vec<Box<Block>>,
     queue_depth: usize,
     /// Device time charged by synchronous calls and not yet handed to whoever has a clock.
     charged_nanos: u64,
@@ -692,6 +701,8 @@ impl LatencyStore {
             },
             prng: Prng::new(seed),
             inflight: Vec::with_capacity(queue_depth),
+            completed: Vec::with_capacity(queue_depth),
+            spare: Vec::new(),
             queue_depth,
             charged_nanos: 0,
             fault_every: model.fault_every,
@@ -755,8 +766,23 @@ impl DurableStore for LatencyStore {
         Ok(())
     }
 
+    /// Handed down as well as timed, which it was not before.
+    ///
+    /// **The store below has to do the read, because whatever concurrency it has is the thing being
+    /// measured.** This used to record a deadline and then read synchronously when the deadline passed, which
+    /// was indistinguishable while every backing read synchronously anyway — and would have silently bypassed
+    /// a backing with a thread pool, so the one measurement a modelled latency exists for (how many threads a
+    /// rate needs, without a device) would have said nothing.
+    ///
+    /// The queue depth is this model's, and it counts what is held either side of the store below: refusing
+    /// here is what a device with a full queue does.
     fn submit(&mut self, handle: u64, segment: u8, offset: u64, now: u64) -> bool {
-        if self.inflight.len() >= self.queue_depth {
+        if self.inflight.len() + self.completed.len() >= self.queue_depth {
+            return false;
+        }
+        // The store below first: a deadline recorded for a read it would not take is a read this would
+        // release having never done it (rule 17).
+        if !self.inner.submit(handle, segment, offset, now) {
             return false;
         }
         let due = self.device.serve(now, &mut self.prng);
@@ -764,21 +790,53 @@ impl DurableStore for LatencyStore {
         true
     }
 
+    /// A completion leaves when the store below has answered it **and** this model's time for it has passed —
+    /// the later of the two, which is what makes the composition a floor rather than a sum. A device modelled
+    /// slower than the one underneath dominates; one modelled faster cannot be expressed, which is correct.
     fn poll(&mut self, now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
-        let at = self.inflight.iter().position(|(.., due)| *due <= now)?;
-        let (handle, segment, offset, _) = self.inflight.swap_remove(at);
+        // Everything the store below has finished, moved across with the time this model gave it.
+        loop {
+            let mut buffer = self.spare.pop().unwrap_or_else(Block::zeroed);
+            match self.inner.poll(now, &mut buffer) {
+                None => {
+                    self.spare.push(buffer);
+                    break;
+                }
+                Some(Err(fault)) => {
+                    self.spare.push(buffer);
+                    return Some(Err(fault));
+                }
+                Some(Ok(handle)) => {
+                    let Some(at) = self
+                        .inflight
+                        .iter()
+                        .position(|(asked, ..)| *asked == handle)
+                    else {
+                        // A completion for a read this did not submit. Nothing to time it against, so it is
+                        // handed straight up rather than held for a deadline that does not exist.
+                        into.copy_from_slice(&buffer);
+                        self.spare.push(buffer);
+                        return Some(Ok(handle));
+                    };
+                    let (.., due) = self.inflight.swap_remove(at);
+                    self.completed.push((handle, due, buffer));
+                }
+            }
+        }
+        let at = self.completed.iter().position(|(_, due, _)| *due <= now)?;
+        let (handle, _, buffer) = self.completed.swap_remove(at);
         if self.refuses() {
+            self.spare.push(buffer);
             return Some(Err(StoreFault::Device));
         }
-        if let Err(fault) = self.inner.read_at(segment, offset, into) {
-            return Some(Err(fault));
-        }
+        into.copy_from_slice(&buffer);
+        self.spare.push(buffer);
         self.corrupt(into);
         Some(Ok(handle))
     }
 
     fn inflight(&self) -> usize {
-        self.inflight.len()
+        self.inflight.len() + self.completed.len()
     }
 
     fn sync(&mut self) -> Result<(), StoreFault> {
@@ -1500,6 +1558,59 @@ mod tests {
             0,
             "a device that answered wrongly was counted as one that refused"
         );
+    }
+
+    /// A modelled read leaves at the later of the two times: when the store below has answered it, and when
+    /// this model says the device would have. Both directions, because only one of them was ever true.
+    ///
+    /// The second direction is the one that matters and the one that used to be missing: the model handed the
+    /// read down not at all and read synchronously instead, so a backing with any concurrency of its own — a
+    /// thread pool, io_uring — would have been bypassed, and the measurement a modelled latency exists for
+    /// would have been measuring the model against itself.
+    #[test]
+    fn a_modelled_read_waits_for_the_later_of_the_two_times() {
+        let slow_model = StoreModel {
+            read_base_nanos: 1_000,
+            queue_depth: 4,
+            ..StoreModel::default()
+        };
+        let mut modelled = LatencyStore::new(Box::new(MemoryStore::default()), slow_model, 1);
+        let block = Block::zeroed();
+        modelled
+            .open_with(0, 0, &block)
+            .expect("memory takes a block");
+        let mut into = Block::zeroed();
+
+        assert!(modelled.submit(7, 0, 0, 0));
+        assert!(
+            modelled.poll(0, &mut into).is_none(),
+            "the model released a read at once, so its own time did not gate anything"
+        );
+        assert_eq!(modelled.poll(1_000, &mut into), Some(Ok(7)));
+
+        // And the other way: a model that costs nothing over a store below that is slow releases when the
+        // store below does. Nested, because memory is the only backing here that answers instantly.
+        let inner = Box::new(LatencyStore::new(
+            Box::new(MemoryStore::default()),
+            slow_model,
+            2,
+        ));
+        let free = StoreModel {
+            queue_depth: 4,
+            // Not `default()`: every field zero is the exact store and would not be wrapped at all.
+            iops: 1_000_000_000,
+            ..StoreModel::default()
+        };
+        let mut stacked = LatencyStore::new(inner, free, 3);
+        stacked
+            .open_with(0, 0, &block)
+            .expect("memory takes a block");
+        assert!(stacked.submit(9, 0, 0, 0));
+        assert!(
+            stacked.poll(0, &mut into).is_none(),
+            "the outer model released a read the store below had not answered"
+        );
+        assert_eq!(stacked.poll(1_000, &mut into), Some(Ok(9)));
     }
 
     /// Every field, both ways. A format that loses one field silently is a store that answers with
