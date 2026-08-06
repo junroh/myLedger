@@ -2,7 +2,9 @@ mod apply;
 mod intake;
 mod judge;
 
-use ledger_base::ports::{AccountPort, IdempotencyPort, PendingNotice, PendingPort, RaftPort};
+use ledger_base::ports::{
+    AccountPort, ApplyIndex, IdempotencyPort, PendingNotice, PendingPort, RaftPort,
+};
 use ledger_base::{
     AccountId, AcctHandle, Ack, AckOutcome, Amount, Clock, Consumer, Effect, EffectKind, Footprint,
     LedgerError, LogSink, LogStream, Producer, Request, SystemClock, TxId,
@@ -92,6 +94,17 @@ pub struct Reactor<A: AccountPort, P: PendingPort, I: IdempotencyPort, R: RaftPo
     raft: R,
     safety: Safety,
     log: LogSink,
+    /// The log position this node's state reflects: the index of the last committed batch it applied.
+    ///
+    /// **This is the seam a snapshot needs and nothing else uses yet.** A snapshot has to record the index
+    /// its state reflects, and both the account view and the pending engine have to record the *same* one,
+    /// or recovery cannot tell which is further ahead and the earlier one's replay re-applies effects the
+    /// later one already has. The in-flight half of that invariant is already checked every tick
+    /// (`Broken::AccountViewDisagrees`, comparing counts); the durable half is what design notes §15 is
+    /// about. Deliberately not plumbed into either component: the engine sits behind a queue and cannot be
+    /// asked synchronously, and what shape the recording takes follows from what the snapshot turns out to
+    /// be. `status.md` has the two decisions it waits on.
+    applied_through: ApplyIndex,
     /// Kept so a pause is logged on the edge, not every tick.
     intake_paused: bool,
     /// Set on shutdown: nothing new is admitted, everything in flight finishes.
@@ -174,6 +187,7 @@ where
             raft,
             safety: Safety::new(config.safety),
             log,
+            applied_through: ApplyIndex::default(),
             intake_paused: false,
             intake_closed: false,
             metrics: Metrics::default(),
@@ -386,6 +400,12 @@ where
         // sweep, almost all of them after a seal.
         let room = self.expiry.has_room() && !self.safety.is_fail_stopped();
         self.pending.set_wants_expiry(room);
+    }
+
+    /// The log position this node's state reflects. Read by a test today and by a snapshot when there is
+    /// one; see the field.
+    pub fn applied_through(&self) -> ApplyIndex {
+        self.applied_through
     }
 
     pub fn backpressure(&self) -> Backpressure {

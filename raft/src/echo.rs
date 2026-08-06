@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use std::sync::Mutex;
 
-use ledger_base::ports::{RaftCommit, RaftOutcome, RaftPort, RaftProposal};
+use ledger_base::ports::{ApplyIndex, RaftCommit, RaftOutcome, RaftPort, RaftProposal};
 use ledger_base::Effect;
 use ledger_base::{channel, Consumer, Footprint, MapGauge, Prng, Producer, StagedProducer};
 use ledger_stubkit::{IdleBackoff, LatencyRange, WorkerThread};
@@ -77,6 +77,7 @@ impl EchoRaft {
                 fail_every: config.fail_every,
                 reorder_every: config.reorder_every,
                 proposals_seen: 0,
+                next_index: 0,
             }
             .run(shutdown)
         });
@@ -147,6 +148,10 @@ struct RaftWorker {
     fail_every: u64,
     reorder_every: u64,
     proposals_seen: u64,
+    /// The log position the next committed batch takes. A real log would have this durably; here it is a
+    /// counter, which is enough to give the sequencer a position to record and is the point of it existing
+    /// before consensus does — see `ApplyIndex`.
+    next_index: u64,
 }
 
 impl RaftWorker {
@@ -215,8 +220,15 @@ impl RaftWorker {
                         log.extend_from_slice(&proposal.effects);
                     }
                 }
+                // A committed batch takes the next position; a refused one takes none, because nothing
+                // was written. So the index counts what is in the log rather than what was proposed, which
+                // is what makes it gapless — the property recovery rests on.
+                if outcome == RaftOutcome::Committed {
+                    self.next_index += 1;
+                }
                 self.commits.send(RaftCommit {
                     batch_id: proposal.batch_id,
+                    index: ApplyIndex(self.next_index),
                     outcome,
                     effects: proposal.effects,
                 });

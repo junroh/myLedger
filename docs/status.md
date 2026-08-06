@@ -325,6 +325,14 @@ unanswered, and **when that default stops being safe**. The source design's own 
   *Stops being safe:* the moment an interval is chosen. Choosing before measuring adds a figure with
   nothing behind it, which is what this file exists to prevent. Related: `SE-OQ-1`.
 
+- **Who records the apply index on each side, and how is it restored?**
+  *Default:* nobody. The seam is open — `ApplyIndex` names it, a commit carries its batch's log position,
+  and the reactor records the last one it applied — but neither component keeps it and nothing restores it.
+  Two tests hold the seam open so it cannot rot.
+  *Stops being safe:* at the first snapshot of either component. The engine is behind a queue and cannot be
+  asked synchronously, so the shape of the recording follows from the snapshot's shape, which is why this is
+  a question rather than a half-written method.
+
 - **Is applying a committed effect twice safe on the *account* side?**
   *Default:* unknown. The pending engine's replay-idempotency is established (§15), and it has to hold for
   the account component too the moment both checkpoint at different points — recovery then replays from

@@ -9,7 +9,7 @@ pub use pending::{
     HoldData, HoldView, OverlayState, PendingCommand, PendingEffect, PendingFence, PendingLookup,
     PendingNotice, PendingOverlay, PendingPort, PendingReply,
 };
-pub use raft::{RaftCommit, RaftOutcome, RaftPort, RaftProposal};
+pub use raft::{ApplyIndex, RaftCommit, RaftOutcome, RaftPort, RaftProposal};
 
 /// Attached to a request so a reply needs no lookup. Only the sequencer reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

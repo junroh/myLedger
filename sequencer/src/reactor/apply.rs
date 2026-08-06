@@ -56,7 +56,14 @@ where
                 break;
             }
             match commit.outcome {
-                RaftOutcome::Committed => self.commit_batch(&commit.effects, &batch.slots),
+                RaftOutcome::Committed => {
+                    // The position this node's state now reflects. Recorded before the effects are applied
+                    // rather than after, because the two must not be able to disagree: a seal between them
+                    // would leave a node claiming a position it never reached. Nothing durable yet — see
+                    // `ApplyIndex` for what a snapshot has to do with it.
+                    self.applied_through = commit.index;
+                    self.commit_batch(&commit.effects, &batch.slots)
+                }
                 RaftOutcome::Failed => {
                     self.record(
                         LogKind::COMMIT_FAILED,

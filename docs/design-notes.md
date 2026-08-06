@@ -1642,7 +1642,32 @@ disk, a long interval puts the snapshot at a fraction of the log's own write rat
 at twice — another argument for the long interval. On its own disk that comparison disappears and the
 competition is with reads instead. The throttle is required in both.
 
-**`apply_index` is a cross-component invariant, not just a resume point.** The account component
+**`apply_index` is a cross-component invariant, not just a resume point, and it did not exist.**
+
+Three numbers looked like one and none of them was: the sequencer's committed count, `AccountPort::applied`,
+and the engine's own. All three are per-process counters that restart at zero, and `RaftCommit` carried a
+batch id rather than a position. So no component could have recorded where its state stood even if it had
+wanted to.
+
+The seam is now open and deliberately shallow. `ApplyIndex` names the concept, a commit carries the log
+position of its batch — advanced by committed batches only, so it is gapless, which is what makes
+"everything up to here" a well-formed sentence — and the reactor records the last one it applied and
+exposes it. Two tests hold it open (`sequencer/tests/apply_index.rs`): that a refused batch takes no
+position, and that the index and the account view do not drift.
+
+What is *not* built is the per-component half: recording it on each side and restoring it. That is left
+undone on purpose rather than forgotten — the pending engine sits behind a queue and cannot be asked
+synchronously, and the shape of the recording follows from what the snapshot turns out to be. Opening the
+seam before knowing that shape is a deliberate exception to rule 4, taken because a seam that is not there
+is one nobody remembers is missing.
+
+**And the account component's size is worth having written down**, since it decides whether its own
+snapshot can stop the world. At 400 million accounts it is 16GB of records at forty bytes plus about 8.8GB
+of index at the twenty-two bytes an entry a run reports — roughly 25GB, which is the same order as the
+pending index rather than a tenth of it. So the tempting asymmetry — pending is too big to copy, the account
+view is small enough — is not there, and both need the same copy-on-write treatment.
+
+**The rest of the cross-component argument.** The account component
 checkpoints too, and the design records the index in both so the two views can be compared. That check
 already exists in flight — the reactor compares `accounts.applied()` against its own committed count every
 tick, and a mismatch is `Broken::AccountViewDisagrees`, which seals. What does not exist is the check

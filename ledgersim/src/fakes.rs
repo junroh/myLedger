@@ -7,9 +7,9 @@ use std::collections::VecDeque;
 use std::rc::Rc;
 
 use ledger_base::ports::{
-    IdemAsk, IdemReply, IdemRequest, IdemVerdict, IdempotencyPort, OverlayState, PendingCommand,
-    PendingEffect, PendingNotice, PendingOverlay, PendingPort, PendingReply, RaftCommit,
-    RaftOutcome, RaftPort, RaftProposal,
+    ApplyIndex, IdemAsk, IdemReply, IdemRequest, IdemVerdict, IdempotencyPort, OverlayState,
+    PendingCommand, PendingEffect, PendingNotice, PendingOverlay, PendingPort, PendingReply,
+    RaftCommit, RaftOutcome, RaftPort, RaftProposal,
 };
 use ledger_base::{Amount, FxHashMap, Prng, Transfer, TxId, UNORDERED};
 use ledger_pending::{
@@ -693,6 +693,10 @@ struct RaftState {
     seen: u64,
     fail_every: u64,
     reorder_every: u64,
+    /// The log position the next committed batch takes — see `ApplyIndex`. Kept here as well as in the
+    /// stand-in because the seeds drive this one, and a position only the real component had would be a
+    /// position no fault injection ever exercised.
+    next_index: u64,
 }
 
 impl RaftFake {
@@ -707,6 +711,7 @@ impl RaftFake {
             seen: 0,
             fail_every: faults.fail_every,
             reorder_every: faults.reorder_every,
+            next_index: 0,
         })))
     }
 
@@ -727,8 +732,15 @@ impl RaftFake {
             .is_some_and(|(due, _, _)| *due <= now)
         {
             let (_, proposal, outcome) = state.inflight.pop_front().expect("a due proposal");
+            // Only a committed batch takes a position, the same way the stand-in does it: the index counts
+            // what is in the log, not what was proposed, which is what keeps it gapless.
+            if outcome == RaftOutcome::Committed {
+                state.next_index += 1;
+            }
+            let index = ApplyIndex(state.next_index);
             state.ready.push_back(RaftCommit {
                 batch_id: proposal.batch_id,
+                index,
                 outcome,
                 effects: proposal.effects,
             });
