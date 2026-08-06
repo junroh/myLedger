@@ -229,6 +229,15 @@ pub trait DurableStore {
     /// The next read finished by `now`, copied out. `None` while nothing is due.
     fn poll(&mut self, now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>>;
     fn inflight(&self) -> usize;
+    /// Everything written before this returns is durable when it does.
+    ///
+    /// **One call with no argument, and that is a property of a filesystem rather than a simplification.**
+    /// `fsync(fd)` makes a file's bytes durable, but a file that has just been created also needs its
+    /// directory synced or a crash can leave durable bytes in a file that does not exist. So durability is
+    /// a fact about the store at a moment, not a watermark per segment — which is the optimisation someone
+    /// would otherwise reach for. What is covered is the caller's to remember, because the caller is what
+    /// wrote it.
+    fn sync(&mut self) -> Result<(), StoreFault>;
     /// Stops a segment existing. The one way the store shrinks: blocks are written once and never
     /// rewritten, so space comes back a whole day at a time, and only once nothing in the index points
     /// into that day.
@@ -347,6 +356,13 @@ impl DurableStore for MemoryStore {
 
     fn inflight(&self) -> usize {
         self.submitted.len()
+    }
+
+    /// Nothing to do, and nothing dishonest about that: memory has no second layer to push bytes into. What
+    /// this store implements is the *barrier* — the caller learns what is covered by when it asked — and
+    /// that half is the half a test can exercise without a device.
+    fn sync(&mut self) -> Result<(), StoreFault> {
+        Ok(())
     }
 
     fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
@@ -530,6 +546,10 @@ impl DurableStore for LatencyStore {
         self.inflight.len()
     }
 
+    fn sync(&mut self) -> Result<(), StoreFault> {
+        self.inner.sync()
+    }
+
     /// Freeing costs the device nothing this model charges for: it is off any request's path, and a device
     /// that made it expensive would be one whose extents this store does not model.
     fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
@@ -582,6 +602,14 @@ pub struct RecordLog {
     /// numbers describe it — which is the property that makes this a pair of counters rather than a list.
     days: [BlockRange; SEGMENT_VALUES],
     next_block: u64,
+    /// The oldest block sealed since the last sync, and the log position it began at. `None` when everything
+    /// sealed is durable.
+    ///
+    /// One pair rather than a list, because seals are in block order and a sync covers all of them at once:
+    /// the oldest is the only one either answer needs. It is what separates *written* from *durable* on this
+    /// side of the seam, which is where the separation has to live — the store is asked for a barrier and
+    /// remembers nothing, because what a barrier covered is known only to whoever wrote it.
+    unsynced: Option<(u64, ApplyIndex)>,
     /// Read into, so a lookup allocates nothing.
     scratch: Box<Block>,
     /// Reads asked of the store and not yet answered, by handle, because a block carries several
@@ -634,6 +662,7 @@ impl RecordLog {
             segment: 0,
             days: [BlockRange::default(); SEGMENT_VALUES],
             next_block: 0,
+            unsynced: None,
             scratch: Block::zeroed(),
             fetching: FxHashMap::default(),
             appended: 0,
@@ -697,24 +726,51 @@ impl RecordLog {
         freed
     }
 
-    /// The last log position everything up to which has reached a block, given the position of the batch
-    /// being applied now.
+    /// Makes durable everything sealed since this was last asked, and answers whether there was anything to
+    /// do. The caller decides how often; the consequence of waiting is that coverage lags, never that
+    /// anything is lost, because what is not durable is still in the log.
+    pub fn sync(&mut self) -> bool {
+        if self.unsynced.is_none() {
+            return false;
+        }
+        // Nothing to react to yet, for the same reason a write has nothing: no store here can refuse. The
+        // reaction — a coverage that must stop advancing, and rule 19 if it keeps failing — arrives with a
+        // store that can fail at it.
+        if self.store.sync().is_ok() {
+            self.unsynced = None;
+        }
+        true
+    }
+
+    /// The last log position everything up to which has reached a **durable** block, given the position of
+    /// the batch being applied now.
     ///
-    /// It is the oldest buffered block's own position minus one, because that block holds the first record
-    /// that has *not* been sealed — so a snapshot claiming to cover its batch would be claiming a record it
-    /// does not carry. With nothing buffered, everything applied has been sealed and the answer is the
-    /// caller's own position.
+    /// Three things can be short of durable and they are checked oldest first: a block sealed and not yet
+    /// synced, the block being filled towards the store, and the oldest block in the writeback buffer. The
+    /// answer is the first one's own position minus one, because it holds the first record a crash would not
+    /// find — so a snapshot claiming to cover its batch would be claiming a record it does not carry. With
+    /// none of the three, everything applied is durable and the answer is the caller's own position.
+    ///
+    /// **Sealed used to be the test, and it was the wrong one the moment the store had a `sync`.** A block
+    /// handed to a store is written, not durable; the two are the same event only in memory. Erring here is
+    /// one-sided: stopping too early costs replay a little, and stopping too late claims a record that is
+    /// gone.
     ///
     /// Position zero means it covers nothing, which is a legitimate answer rather than a missing one: a
     /// snapshot of an engine that has applied nothing is what a follower starting from empty receives.
-    pub fn sealed_through(&self, applied_through: ApplyIndex) -> ApplyIndex {
-        // The block being filled comes first when it has anything in it, because its records are *out of the
-        // buffer and not on the store*. Reading only the buffer was a real defect: coverage claimed a
-        // hundred and fifty-three while the records of position a hundred and three sat in this block, so the
-        // snapshot left their slots out and replay started after them. The holds were simply gone.
+    pub fn durable_through(&self, applied_through: ApplyIndex) -> ApplyIndex {
+        // Oldest first, and the order is by construction rather than by comparison: a sealed-and-unsynced
+        // block was drained out of `store_open`, which is drained out of the buffer, so each one's stamp is
+        // at or before the next one's.
         //
-        // Its stamp comes from the buffered block compaction drained into it, which is a lower bound on its
-        // survivors' own positions — conservative in the safe direction.
+        // The block being filled has to be in this list at all, and that was a real defect: coverage claimed
+        // a hundred and fifty-three while the records of position a hundred and three sat in it, so the
+        // snapshot left their slots out and replay started after them. The holds were simply gone. Its stamp
+        // comes from the buffered block compaction drained into it, which is a lower bound on its survivors'
+        // own positions — conservative in the safe direction.
+        if let Some((_, began_at)) = self.unsynced {
+            return ApplyIndex(began_at.raw().saturating_sub(1));
+        }
         let unsealed = [
             &self.store_open,
             self.buffer.front().unwrap_or(&self.store_open),
@@ -727,14 +783,18 @@ impl RecordLog {
         }
     }
 
-    /// Whether this address names a record on a block the store has. False for a record in the writeback
-    /// buffer, and false for one in the block still being filled: that block has handed out addresses and
-    /// has not been written.
+    /// Whether this address names a record on a block a crash would still find. False for a record in the
+    /// writeback buffer, false for one in the block still being filled — that block has handed out addresses
+    /// and has not been written — and false for one on a block written but not yet synced.
     ///
     /// A snapshot asks it about every slot it keeps. An index entry naming a block nobody has is worse than a
-    /// hold the log can create again, so a slot pointing anywhere but a sealed block is written out empty.
-    pub fn is_sealed(&self, addr: RecordAddr) -> bool {
-        !addr.is_buffered() && addr.block() < self.next_block
+    /// hold the log can create again, so a slot pointing anywhere but a durable block is written out empty.
+    pub fn is_durable(&self, addr: RecordAddr) -> bool {
+        let durable_blocks = match self.unsynced {
+            Some((first, _)) => first,
+            None => self.next_block,
+        };
+        !addr.is_buffered() && addr.block() < durable_blocks
     }
 
     /// Blocks this day wrote, which is also how many freeing it hands back — the store cannot say, so this
@@ -967,9 +1027,9 @@ impl RecordLog {
         )
     }
 
-    /// The block is durable now, and it stays readable anyway: the two windows are independent, and this
-    /// is the one place that says so. Residency is trimmed here rather than on a schedule because this is
-    /// the only event that adds to it.
+    /// The block is written now — not durable, which is `sync`'s to say — and it stays readable anyway: the
+    /// two memory windows are independent, and this is the one place that says so. Residency is trimmed here
+    /// rather than on a schedule because this is the only event that adds to it.
     fn seal_store_block(&mut self) {
         let addr = RecordAddr::new(self.segment, self.next_block, 0);
         // A segment's first block is what brings it into being, and a later one lands in a segment that
@@ -987,6 +1047,11 @@ impl RecordLog {
         // about it either: the index already points at these records, so the reaction is rule 19's seal and
         // it arrives with a store that can actually fail.
         let _ = written;
+        // The oldest block a sync has not covered, and the position it began at. Only the first seal since a
+        // sync records it: later ones are newer, and it is the oldest that bounds both coverage and which
+        // slots a snapshot may keep.
+        self.unsynced
+            .get_or_insert((self.next_block, self.store_open.began_at));
         self.days[self.segment as usize].note(self.next_block);
         let fresh = self.spare.pop().unwrap_or_else(Filling::new);
         let sealed = std::mem::replace(&mut self.store_open, fresh);

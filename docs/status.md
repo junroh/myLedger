@@ -200,9 +200,16 @@ sized table refuses the stream, and junk or an unknown version is refused rather
 
 **Coverage is built too**, and it turned out checkable without replay. A commit's log position now reaches
 the engine on the command that carries its effect, each buffered block remembers the position it began at,
-and coverage is the oldest one's minus one — everything up to it has reached a block. The test asserts the
+and coverage is the oldest one's minus one — everything up to it is **durable**. The test asserts the
 claim directly: coverage lags what has been applied by exactly what the buffer holds, it advances as the
 buffer flushes, and no hold from after it is carried.
+
+**And durable is not the same as written**, which is the correction the store's new interface forced. A block
+handed to the store is written; a `sync` is what makes it durable, and only what a crash would still find may
+be carried. So coverage stops at the oldest block no sync has covered — ahead of the block being filled and
+the buffer behind it — and a second test says so: a restore taken before the sync answers none of the holds,
+one taken after answers them. The worker syncs at the end of its round, which covers every block that round
+sealed; whether that is the right cadence is a decision below, because pricing it needs a device.
 
 **Replay is built, and the whole chain is asserted**: a snapshot covering an earlier position, plus every
 effect after it, lands on the same answers as never having stopped. `PendingEngine::replay` is a mode of its
@@ -387,6 +394,16 @@ unanswered, and **when that default stops being safe**. The source design's own 
   *Stops being safe:* it already is not, for measurement — no latency gate on a run longer than a few
   seconds is measuring this ledger rather than the stand-in. It becomes a correctness-adjacent question
   when a node has to run for a day.
+
+- **How often should the engine make its blocks durable?**
+  *Default:* once at the end of every worker round, so one `sync` covers every block that round sealed. It
+  is the cadence that keeps coverage as far forward as it can be, and erring the other way is safe — what is
+  not durable is still in the log, so a lagging sync costs replay and never a hold.
+  *Stops being safe:* it does not stop being safe, it stops being free. On a real device an `fsync` blocks
+  the thread that also answers lookups, and this is the thread every lookup passes through. What a deferred
+  sync buys is that block of time; what it costs is coverage. Nobody has priced either, because
+  `MemoryStore::sync` does nothing — design notes §16's device model is what will, and until it exists a
+  number chosen here would be a guess of the kind that has been a digit out before.
 
 - **What throttle paces the snapshot's write?**
   *Default:* none — nothing writes one anywhere, so nothing paces it. The unit is settled (a declared number

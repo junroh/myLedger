@@ -780,11 +780,18 @@ impl PendingEngine {
         self.applied_through
     }
 
+    /// Makes durable what has been sealed, and answers whether there was anything to make durable. Whoever
+    /// runs the loop decides how often, the same way it decides when the day has moved: the engine keeps no
+    /// policy of its own, and the cost of asking rarely is a coverage that lags rather than anything lost.
+    pub fn sync(&mut self) -> bool {
+        self.records.sync()
+    }
+
     /// Zero means it covers nothing, which is what an engine that has applied nothing reflects — and a
     /// legitimate snapshot rather than a missing one, since a follower starting from empty receives exactly
     /// that.
     pub fn coverage(&self) -> ApplyIndex {
-        self.records.sealed_through(self.applied_through)
+        self.records.durable_through(self.applied_through)
     }
 
     /// A writer over this engine's state. Borrows it, so nothing is copied to be written — and so a caller

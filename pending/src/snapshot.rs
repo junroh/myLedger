@@ -174,7 +174,7 @@ impl SnapshotWriter {
                     // record is in the writeback buffer or in the block still being filled, so it will not be
                     // there on restore, and an index entry naming a block nobody has is worse than a hold the
                     // log can create again.
-                    let keep = *word != 0 && records.is_sealed(address_in(*word));
+                    let keep = *word != 0 && records.is_durable(address_in(*word));
                     let out = if keep { *word } else { 0 };
                     into[way * 8..way * 8 + 8].copy_from_slice(&out.to_le_bytes());
                 }
@@ -364,6 +364,10 @@ mod tests {
             self.0.borrow().inflight()
         }
 
+        fn sync(&mut self) -> Result<(), StoreFault> {
+            self.0.borrow_mut().sync()
+        }
+
         fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
             self.0.borrow_mut().remove(segment)
         }
@@ -425,6 +429,9 @@ mod tests {
                 .expect("the index took the hold");
         }
 
+        // What the worker's round ends with, and it has to happen for a slot to be carried at all: a block
+        // handed to the store is written, not durable, and a snapshot may only keep what a crash would find.
+        engine.sync();
         round_trip(&mut engine, &mut restored).expect("a snapshot of this engine");
 
         let mut carried = 0;
@@ -454,6 +461,58 @@ mod tests {
             restored.counts_agree(),
             "a restored table's per-segment counts do not add up to its entries"
         );
+    }
+
+    /// A block the store has taken is **written**, not durable, and a snapshot may carry only what a crash
+    /// would still find. So coverage stops at the oldest block no sync has covered and the slots on it are
+    /// written out empty; the sync is what moves both.
+    ///
+    /// Sealed used to be the whole test, and it was the right one only while the store was memory — `write`
+    /// returning meant the record existed. A store with an `fsync` makes those two different events, and a
+    /// snapshot that took the earlier one would name blocks a restart cannot read. Nothing is lost by
+    /// stopping early: what is not durable is still in the log, so it costs replay and not a hold.
+    #[test]
+    fn a_sealed_block_is_carried_only_once_a_sync_has_covered_it() {
+        // Three engines over one store, so the same blocks can be restored from twice: before the sync and
+        // after it.
+        let store = SharedStore::default();
+        let mut engine = PendingEngine::sized(1 << 12, 2, 1024, Box::new(store.clone()));
+        let mut before = PendingEngine::sized(1 << 12, 2, 1024, Box::new(store.clone()));
+        let mut after = PendingEngine::sized(1 << 12, 2, 1024, Box::new(store));
+
+        // A window of two blocks and six blocks' worth of holds, so several are sealed and none is durable.
+        let holds = RECORDS_PER_BLOCK * 6;
+        for id in 1..=holds {
+            engine
+                .write(
+                    create(id as u128, BudgetGroup::ABSENT),
+                    ApplyIndex(id as u64),
+                )
+                .expect("the index took the hold");
+        }
+
+        assert_eq!(
+            engine.coverage(),
+            ApplyIndex(0),
+            "coverage moved past a block that was written and not synced"
+        );
+        round_trip(&mut engine, &mut before).expect("a snapshot of this engine");
+        assert!(
+            (1..=holds).all(|id| before.lookup(TxId(id as u128)).is_none()),
+            "a slot was carried for a block a crash would not have found"
+        );
+
+        assert!(engine.sync(), "there were sealed blocks to make durable");
+        assert!(
+            engine.coverage().raw() > 0,
+            "everything sealed is durable and coverage still covers nothing"
+        );
+        round_trip(&mut engine, &mut after).expect("a snapshot of this engine");
+        assert!(
+            (1..=holds).any(|id| after.lookup(TxId(id as u128)).is_some()),
+            "the sync made blocks durable and the snapshot still carried no slot for them"
+        );
+        assert!(!engine.sync(), "a second sync had something to do");
     }
 
     /// A hold whose record has not reached a block is not carried, and that is the point rather than a gap.
@@ -523,6 +582,9 @@ mod tests {
                 )
                 .expect("the index took the hold");
         }
+        // What the worker's round ends with. Durability is a claim of its own and has a test of its own; here
+        // it only has to have happened, or coverage could not move at all.
+        engine.sync();
         let covered = engine.coverage();
         assert!(
             covered.raw() > 0,
@@ -612,6 +674,7 @@ mod tests {
             next += 1;
         }
 
+        engine.sync();
         let covered = engine.coverage();
         assert!(
             covered.raw() > 0 && covered.raw() < next,

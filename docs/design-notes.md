@@ -1498,16 +1498,18 @@ which leaves every hold's money reserved for good.
 
 ### The boundary, and why the buffer is not in it
 
-Coverage is the apply index of the **last sealed block**. Not "the last record to leave the buffer": a
-record in the block still being filled has a real address and is not on disk yet.
+Coverage is the apply index of the **last durable block**. Not "the last record to leave the buffer": a
+record in the block still being filled has a real address and is not on disk yet. And not the last *sealed*
+block either — that was the test here until the store's interface grew an `fsync`, at which point written
+and durable stopped being the same event and only one of them is what a crash agrees with (§16).
 
 Everything after that point is rebuilt by replaying the log, which is where the writeback window's hour
 finally gets a justification that can be checked without a device: **an hour is what recovery replays**,
 not what a checkpoint has to carry. The claim is arithmetic on the log's own size, and the log keeps
 whatever the snapshot interval needs (below).
 
-So the dump excludes every slot whose address is in the buffer segment or in the block being filled.
-Their holds were created after coverage, so replay creates them again.
+So the dump excludes every slot whose address is in the buffer segment, in the block being filled, or on a
+block no sync has covered. Their holds were created after coverage, so replay creates them again.
 
 ### Replay over already-applied state, which is what a smear needs
 
@@ -1790,6 +1792,34 @@ absolute offsets exist to avoid. Compression therefore belongs *inside* a block,
 block staying 4096 bytes. That also matches what compression is for here: the design's sixty-four records
 a block needs its 128-byte record halved, and the gain is records per read rather than bytes per write.
 
+### Written became durable, and coverage is what it changed
+
+`sync` is on the seam and takes no argument, for the reason above: on a filesystem durability is a fact
+about the store at a moment rather than a watermark per file. So **what a sync covered is remembered on this
+side of it**, by the one thing that knows — `RecordLog` keeps the oldest block sealed since the last sync
+and the log position it began at, one pair, because seals are in block order and a sync covers all of them.
+
+That pair is what coverage now stops at, ahead of the two that were already there: a sealed-and-unsynced
+block, then the block being filled towards the store, then the oldest block in the writeback buffer. The
+order needs no comparison — each is drained out of the next, so each one's stamp is at or before the one
+after it.
+
+**Erring here is one-sided, which is why a lagging sync is safe.** Coverage that stops too early costs
+replay a little; coverage that stops too late names a block a restart cannot read, and the holds on it are
+gone. What is not durable is still in the log, so the only price of syncing rarely is replay.
+
+The worker syncs at the end of its round, so one sync covers every block that round sealed — group commit,
+without needing a name for it. Whether that is the right cadence is a question this cannot answer: what a
+deferred sync buys is a device's `fsync` off the thread that answers lookups, and there is no device here to
+price it against. It is in `status.md`'s decisions list with that stated, and §16's device model is what
+will answer it.
+
+`MemoryStore::sync` does nothing and there is nothing dishonest in that: memory has no second layer to push
+bytes into. What it implements is the *barrier* — the caller learns what is covered from when it asked — and
+that is the half a test can exercise without a device.
+`a_sealed_block_is_carried_only_once_a_sync_has_covered_it` is that test: three engines over one store, and
+a restore taken before the sync answers none of the holds while one taken after answers them.
+
 ### Still unbuilt, and named so it is not read as done
 
 - **A fault a device can produce.** `StoreFault` has one variant, `Missing`, and it means this node's own
@@ -1800,5 +1830,3 @@ a block needs its 128-byte record halved, and the gain is records per read rathe
   restart begins with none — so a file left by the previous life would never be removed, and sixty-three
   days later the segment's reuse would write over the front of it. That is one call at the seam
   (`existing()`, a bitmap of segments present) and it is not built, because nothing restarts yet.
-- **Written is not yet distinguished from durable.** `sync` is not on the seam, so a snapshot's coverage
-  still stops at the last *sealed* block rather than the last durable one. That is the next piece.

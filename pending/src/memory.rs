@@ -514,7 +514,7 @@ impl MemoryPending {
             PendingWorker {
                 commands: command_rx,
                 results: StagedProducer::new(result_tx),
-                store: PendingEngine::sized(
+                engine: PendingEngine::sized(
                     config.capacity.slots(),
                     config.capacity.flush_blocks(),
                     config.capacity.resident_blocks(),
@@ -718,11 +718,14 @@ impl PendingOverlay for MemoryPending {
     }
 }
 
-/// The group as the store knows it lives with the store — see `engine.rs`.
+/// The group as the engine knows it lives with the engine — see `engine.rs`.
+///
+/// The field is `engine` and not `store`: `DurableStore` is the store now, one layer further down, and one
+/// word for two things is what rule 3 forbids.
 struct PendingWorker {
     commands: Consumer<PendingCommand>,
     results: StagedProducer<PendingReply>,
-    store: PendingEngine,
+    engine: PendingEngine,
     occupancy: Arc<Occupancy>,
     /// The engine's own end of the notice channel.
     notices: Producer<PendingNotice>,
@@ -765,7 +768,13 @@ impl PendingWorker {
                 | self.sweep_expiry()
                 | self.drain_commands()
                 | self.harvest()
-                | self.deliver();
+                | self.deliver()
+                // Last, so one sync covers every block this round sealed — group commit within a round. The
+                // policy is here because it is a policy: syncing less often costs coverage and nothing else,
+                // and what it buys back is a device's fsync off the thread that answers lookups. Nobody has
+                // measured that trade, because there is no device to measure it against
+                // (`status.md`'s decisions list).
+                | self.engine.sync();
             if progress {
                 self.publish();
             }
@@ -774,7 +783,7 @@ impl PendingWorker {
             // debug build and does nothing in a release one, where the consequence surfaces as
             // `days_behind` climbing and then as an index that cannot take an insert.
             debug_assert!(
-                self.store.counts_agree(),
+                self.engine.counts_agree(),
                 "the index's per-segment counts no longer add up to its entries"
             );
             backoff.record(progress);
@@ -816,9 +825,9 @@ impl PendingWorker {
     /// only to the day, so the cost is nothing and a jump forward is absorbed by `grace_days`.
     fn sweep_expiry(&mut self) -> bool {
         let day = self.days.today();
-        let opened = self.store.open_day(day, self.lifetime_days);
-        let reclaimed = self.store.reclaim() > 0;
-        if !self.store.sweeping() {
+        let opened = self.engine.open_day(day, self.lifetime_days);
+        let reclaimed = self.engine.reclaim() > 0;
+        if !self.engine.sweeping() {
             return opened || reclaimed;
         }
         // Owed notices are still waiting, so the sequencer has not kept up with the last slice; offering
@@ -835,7 +844,7 @@ impl PendingWorker {
         }
         self.expiring.clear();
         let mut found = std::mem::take(&mut self.expiring);
-        self.store
+        self.engine
             .propose_expiry(self.expiry_blocks_per_round, &mut found);
         for void in &found {
             self.owed
@@ -854,17 +863,17 @@ impl PendingWorker {
     /// about the walk it had just spent milliseconds on — the number would have been stale exactly when it
     /// was interesting.
     fn publish(&self) {
-        self.store.publish(
+        self.engine.publish(
             &self.occupancy.holds,
             &self.occupancy.budgets,
             &self.occupancy.blocks,
             &self.occupancy.buffer,
             &self.occupancy.resident,
         );
-        self.occupancy.traffic.publish(self.store.traffic());
+        self.occupancy.traffic.publish(self.engine.traffic());
         self.occupancy
             .applied
-            .store(self.store.applied(), Ordering::Relaxed);
+            .store(self.engine.applied(), Ordering::Relaxed);
         self.occupancy.order_wait.publish(self.orderer.order_wait());
     }
 
@@ -898,7 +907,7 @@ impl PendingWorker {
                     let now = self.now();
                     self.handles += 1;
                     let handle = self.handles;
-                    match self.store.begin_lookup(handle, lookup.pending_ref, now) {
+                    match self.engine.begin_lookup(handle, lookup.pending_ref, now) {
                         Started::Busy => {
                             self.deferred = Some(command);
                             return false;
@@ -930,7 +939,7 @@ impl PendingWorker {
                     self.orderer.fill(fence.lane, fence.seq, ready_at, result);
                 }
                 PendingCommand::Apply { effect, at } => {
-                    if let Err(not_stored) = self.store.write(effect, at) {
+                    if let Err(not_stored) = self.engine.write(effect, at) {
                         self.owe(PendingNotice::HoldNotStored {
                             hold: not_stored.hold,
                         });
@@ -954,7 +963,7 @@ impl PendingWorker {
 
     /// What this answer says the engine had applied. Truthful unless the fault is on.
     fn claimed_applies(&mut self) -> u64 {
-        let applied = self.store.applied();
+        let applied = self.engine.applied();
         self.answers += 1;
         let stale = self.stale_answer_every > 0
             && self
@@ -972,7 +981,7 @@ impl PendingWorker {
     fn harvest(&mut self) -> bool {
         let now = self.now();
         let mut progress = false;
-        while let Some((handle, found)) = self.store.harvest(now) {
+        while let Some((handle, found)) = self.engine.harvest(now) {
             let Some(lookup) = self.inflight.remove(&handle) else {
                 continue;
             };
