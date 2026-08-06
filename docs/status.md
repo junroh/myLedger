@@ -197,8 +197,9 @@ neither is outstanding work.
   hierarchical wheel (~2GB, day / hour / minute / second, only the imminent day loaded in detail). Built
   here is the day level and only that: sixty-four counts, because every hold in a day shares that day's
   computed deadline and nothing can express a per-hold one. The design's own lazy-load note is why this
-  is not a shortfall — a wheel holding the holds would be 38GB, so it was never meant to hold them.
-  Design notes §14.
+  is not a shortfall: its 2GB is the imminent day's *detail*, and even that is unnecessary here because the
+  walk is resumable — only the offered-and-unlanded slice has to be kept. Counts, block ranges and that slice
+  come to about eight kilobytes. Design notes §14 has the arithmetic and the two ways it was got wrong first.
 - **There is no High Water Mark on the day, and the design asks for one.** Design §5.3 defends the
   *judgment* of when a day has expired with three things: an infrastructure that slews rather than steps
   the clock, `CLOCK_MONOTONIC` for ticks, and an HWM so the day only ever advances. `DaySource::WallClock`

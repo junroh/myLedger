@@ -1156,15 +1156,19 @@ and exits 1.
 > reached by rewriting every record. A local wall clock deciding expiry also diverges between nodes.
 > **Weighed** — a per-segment lifetime (makes a deadline depend on which block a hold landed in); a
 > separate durable structure keyed by deadline (a second owner of what a hold is, with its own liveness,
-> compaction and recovery); the design's four-level timing wheel (38GB at the design's scale if it holds
-> the holds, against the 2GB it budgets — so it was never meant to hold them); searching the index for an
-> expiring segment's addresses (exact, but bounds the voids collected and not the slots walked: 2.2s a
-> pass at the design's size, on the thread that answers lookups).
+> compaction and recovery); searching the index for an expiring segment's addresses (exact, and it bounds
+> the voids collected rather than the slots walked: 2.2s a pass at the design's size, on the thread that
+> answers lookups); materialising the imminent day's detail, which is what the design's 2GB wheel budget
+> actually buys (1.2GB at the design's scale, and it buys only "no block reads on a retry" — worth nothing
+> against a resumable sequential walk); a per-void deadline needing the wheel's other three levels (nothing
+> can express one).
 > **Chose** — a deadline computed from the segment's own day, one wall-clock reading per day through an
-> injectable `DaySource`, the wheel reduced to one live count per day, and the survivors read out of that
-> day's own blocks a declared number at a time. One number — `grace_days` — buys away every source of
-> *early* deletion at once, and its price is linear and only ever space. The resolution it proposes is a
-> kind of its own, `VoidExpiry`, because it is nobody's request and three stages have to know that.
+> injectable `DaySource`, the wheel reduced to one live count per day plus the offered-and-unlanded slice,
+> and the survivors read out of that day's own blocks a declared number at a time. One number —
+> `grace_days` — buys away every source of *early* deletion at once, and its price is linear and only ever
+> space. The resolution it proposes is a kind of its own, `VoidExpiry`, because it is nobody's request and
+> three stages have to know that. Reclaiming a dead day's blocks is split from proposing its voids, because
+> only the second is the leader's.
 
 The thirty-two days is not an internal window. It is told to the customer — *your pending data is kept
 for at most thirty-two days, then deleted* — and a promise like that has two edges, only one of which is
@@ -1232,10 +1236,29 @@ It has to be **wall** time, not the monotonic clock the rest of the engine runs 
 clock restarts at zero, and a promise in calendar terms has to outlive a restart. Read to the day, so
 drift of minutes changes nothing.
 
-**There is no timing wheel, and what stands in its place is one counter per day.** The engine's design has
-a hierarchical wheel — day, hour, minute, second, with only the imminent day loaded in detail — and its own
-lazy-load note is the reason this is not that: a wheel holding the holds would be 38GB at the design's 4.8
-billion, against the 2GB it budgets, so the wheel was never meant to hold them. What it holds is counts.
+**There is no timing wheel, and what stands in its place is eight kilobytes.** The engine's design has a
+hierarchical wheel — day, hour, minute, second, with only the imminent day loaded in detail — and ~2GB
+budgeted for it. Getting that number's meaning right took two tries.
+
+It is not counts for every live hold: anything per-hold over 4.8 billion is tens of gigabytes and the design
+never meant that. It is the **imminent day's detail**, exactly as its lazy-load note says — one day's
+survivors, 150 million addresses, about 1.2GB. That is the 2GB.
+
+And even that is not needed here, because the walk is **resumable**. Materialising the day would buy one
+thing: no block read when a void has to be offered again. Retries are rare, and the walk that would replace
+them is sequential and costs 2.9 million blocks a day at the design's scale — thirty-four a second against a
+200k/s read budget. So only what has been offered and not landed has to be remembered, which is one slice:
+
+| | what it answers | size |
+|---|---|---|
+| `live_per_segment` | is this day done? may these blocks go back? where does a new leader start? | 256 B |
+| `days` block ranges | where did this day write? | ~1 KB |
+| `outstanding` | which of the voids I offered have not landed? | ~6.5 KB |
+
+All of it works because deadlines are day-granular and derived from the segment, so detection is free: a day
+runs out, and its blocks are where its survivors are. Per-hold deadlines firing at arbitrary times would
+need the other three levels — and nothing can express one, since `Transfer` is sixty-four bytes and full and
+a hold's `pending_ref` already means its budget group (rule 4). If that changes, this does not extend.
 
 Here that is `HoldTable::live_per_segment`: sixty-four numbers, one per value of the address's segment
 field, maintained by the one method that writes a slot. Expiry asks the index exactly one question — *is
@@ -1290,6 +1313,47 @@ to be checked was checked. Sixty-three counts cost nothing to read.
 
 **Proposing needs the leader's clock**, because which day has run out is a judgment and a proposal needs
 somewhere to go. That is the half a leadership gate belongs on, and the half whose cursor is volatile.
+
+### Two things weighed here that the code does not show
+
+**Pacing the retry.** Once a declined void is offered again, something has to say *when*, or a persistently
+full backlog turns the retry into a re-offer every round — measured at 780,000 declines in five seconds, with
+p99.9 three times what it was.
+
+A doubling backoff counted in rounds was the first idea and is the wrong unit: the worker spins under load
+and sleeps when idle, so the same count of rounds is microseconds in one case and seconds in the other, and a
+limit expressed that way is one nobody declared (rule 20 again, in miniature).
+
+Splitting the notice channel is the better long-term answer and is deliberately not taken yet. `ExpiryQueue`
+declines rather than blocking for exactly one reason, stated in its own doc: the apply-path seal travels the
+same wire, so the reactor has to keep reading whatever the backlog's state is. Give expiry a channel of its
+own and a full one *becomes* the backpressure, the queue never declines, and `expiry_dropped` stops being a
+concept. What is here instead is an advisory flag, because the sequencer already knows the answer and
+`Backpressure` is the shape this codebase already uses for telling someone. Revisit when declines matter
+again; today they are a few hundred in five seconds and every one of them is retried.
+
+**Where the retirement cost goes.** Knowing which offered voids have landed costs one index probe each,
+because it asks whether the index still points at the address — about thirty percent on top of the walk
+(19ns a void to 27ns at the largest size the bench covers). The alternative was to match each removal against
+the outstanding list as it is applied, which is cheaper in total and puts the cost on the path that applies
+committed decisions in order. Background work bounded per round is the right place to pay, so it pays there.
+
+### The segment wrap, and why the bound is declared rather than relied on
+
+A sweep more than `SEGMENTS - lifetime` days behind meets its own target as the day being written. Driving
+the engine there by hand showed the outcome is late rather than early — but only by accident, and the accident
+is worth recording because it is what made the bound worth declaring.
+
+Three things had to hold for it not to be a *wrong* answer. A day's blocks are remembered as a range —
+`(first, count)` — so a second day's blocks extend the count without moving `first`, and the walk then
+enumerates numbers between the two days that no block has; those reads miss and offer nothing. `free_segment`
+resets the range and advances the cursor in one step, so the range can never be reset while the cursor still
+points at that segment. And days cannot be skipped. Change any one — make the range a list, let `note` move
+`first`, allow a skip — and the walk reaches a day's *live* records and voids holds created today. That is
+early deletion, which is the one direction this whole mechanism exists to avoid.
+
+So the ceiling is declared from the one number it follows from, in `day_has_a_segment`, rather than left to
+whichever structure happens to misbehave first.
 
 ### What survives a leadership change, and what does not
 
