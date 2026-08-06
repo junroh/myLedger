@@ -1,7 +1,7 @@
 //! The ledger's own work goes behind the work someone is waiting for.
 //!
 //! An expiry void is an input the ledger sends itself: nobody asked for it, nothing is waiting on its ack,
-//! and one that is lost is offered again on the sweep's next walk. A client's request is none of those
+//! and one that is lost is offered again from the slice the engine keeps. A client's request is none of those
 //! things. So the two arrive on separate paths and are read in that order — clients first, and the voids on
 //! a budget of their own.
 //!

@@ -19,10 +19,9 @@ pub struct PendingEngine {
     survivors: Vec<(TxId, HoldData, BlockAddr)>,
     /// Lookups waiting on the store, with the rest of their candidate walk.
     fetches: FxHashMap<u64, Fetch>,
-    /// The day whose records are being written, and how far the expiry sweep has walked the index looking
-    /// for the day that has run out. The day itself is not stored anywhere: a segment's number *is* its
-    /// day modulo the segments available, and only a lifetime's worth is ever live, so it is recoverable
-    /// from the number alone.
+    /// The day whose records are being written. Not stored anywhere durable: a segment's number *is* its
+    /// day modulo the segments available, and only a lifetime's worth is ever live, so the day is
+    /// recoverable from the number alone.
     today: u64,
     /// Days a record may live, as the caller last declared it. Kept beside the day rather than passed to
     /// every call, because it is what decides whether the sweep's day has run out yet.
@@ -42,6 +41,12 @@ pub struct PendingEngine {
     /// day's live count moved — so a declined void that was the last of its day left the day unfinished for
     /// ever, and with it every later day: deletion is strictly ordered and one stuck hold stops all of it.
     /// Four comments claimed "the sweep offers it again" and none of them was true in that case.
+    ///
+    /// **What it costs, measured:** one extra index probe per void. Retiring an entry asks whether the index
+    /// still points at its address, so a round re-probes the slice it is holding — about thirty percent on
+    /// top of the walk at the largest size the bench covers (19ns a void to 27ns). The alternative was to
+    /// match a removal against this list as it is applied, and that puts the cost on the path that applies
+    /// committed decisions in order. Background work is the right place to pay, so it pays there.
     outstanding: Vec<(BlockAddr, Transfer)>,
     overflowed: u64,
     /// Committed decisions applied, counted so an answer can say which of them it reflects. The

@@ -226,6 +226,10 @@ fn empty_one_day_timed(
     };
     while day.rounds < 1_000_000 {
         voids.clear();
+        // Both halves, the way the worker runs them: reclaiming a dead day's blocks is every node's own
+        // housekeeping and proposing its voids is the leader's, so a loop that drove only the second would
+        // be timing a node that never gets its space back.
+        engine.reclaim();
         let started = Instant::now();
         engine.propose_expiry(black_box(blocks), voids);
         let elapsed = started.elapsed();
