@@ -1593,3 +1593,45 @@ same bytes read from disk instead. So the serialisation and its stable read are 
 mechanism, and whether it is also written down periodically is a policy question about cold start: a node
 that always fetches from a peer needs a healthy peer, and a cluster that loses power together needs a
 local copy or a log long enough to replay from nothing.
+
+### Against the design's §6, item by item
+
+The design's checkpoint section is a list of targets and three rules. Most of it survives; the
+disagreements all follow from the buffer being left out, and two of its rules were missing here.
+
+| design §6.2 target | here | why |
+|---|---|---|
+| Cuckoo index | ✅ carried, raw | the only thing that says what is alive |
+| bitmap + `min_live_seg_id` | — neither exists | no occupancy bitmap: an empty slot is the zero word. No epoch: a day's blocks go back only once the index has no entry in it, so there are never dead slots to reclaim |
+| hot buffer | ❌ not carried | it is not on disk, so the log has it. This is the disagreement everything else follows from |
+| timing wheel | ❌ derived | the wheel is one live count per day, and counting the slots gives it |
+| `group_index` | ✅ carried, as totals | the design's is a membership set; ours is a count and a sum, because coverage is checked by count and nothing enumerates members |
+| overlay excluded | ✅ agreed | leader-local and volatile |
+| `apply_index` recorded | ✅ carried | and see below — the design means more by it than replay's starting point |
+
+Three rules, and they hold:
+
+- **§6.1, the store is a derived view and replay is what prevents resurrection.** Agreed, and §15 is that
+  sentence taken to its conclusion. Worth noting the sharpening: replay prevents resurrection *only within
+  the retained log*, which is exactly why a snapshot has to exist once the log is cut.
+- **§6.4, truncation is bounded by coverage and never by time.** Agreed.
+- **§6.4, entries committed and not yet applied are outside coverage.** Satisfied by construction rather
+  than by a check: coverage here is the flush frontier, which lags the apply index by the writeback window,
+  so nothing unapplied can be inside it.
+
+Two of the design's rules were absent from the reasoning above and belong in it.
+
+**The snapshot shares a disk with the Raft log.** Disk 1 carries both (§2.2), and log commits are on the
+critical path while a snapshot is background work. So the write needs a rate limit and low-priority IO —
+the design says so, and §15's interval table quietly assumed the bandwidth was free. It is not free, it is
+*subordinate*: at a long interval the snapshot's share is a fraction of the log's own write rate, which is
+another argument for the long interval, and at ten minutes it is twice the log's and would be felt.
+
+**`apply_index` is a cross-component invariant, not just a resume point.** The account component
+checkpoints too, and the design records the index in both so the two views can be compared. That check
+already exists in flight — the reactor compares `accounts.applied()` against its own committed count every
+tick, and a mismatch is `Broken::AccountViewDisagrees`, which seals. What does not exist is the check
+surviving a restart: if the two components' snapshots are taken at different points, recovery has to
+replay from the earlier of them and the later component has to tolerate seeing effects it has already
+applied. That is the same idempotency argument as above, now needed on the account side as well, and
+nothing here has established it there.

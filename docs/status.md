@@ -325,6 +325,15 @@ unanswered, and **when that default stops being safe**. The source design's own 
   *Stops being safe:* the moment an interval is chosen. Choosing before measuring adds a figure with
   nothing behind it, which is what this file exists to prevent. Related: `SE-OQ-1`.
 
+- **Is applying a committed effect twice safe on the *account* side?**
+  *Default:* unknown. The pending engine's replay-idempotency is established (§15), and it has to hold for
+  the account component too the moment both checkpoint at different points — recovery then replays from
+  the earlier one and the later component sees effects it already applied. The reactor already compares
+  the two views' apply counts every tick and seals on a mismatch, so the invariant is live; what is not
+  established is that it survives a restart.
+  *Stops being safe:* the first time two components are snapshotted independently, which is the first
+  checkpoint of either.
+
 - **Where is a snapshot written, and is cold start local or from a peer?**
   *Default:* nowhere, so the question is open in both halves. §15 argues the serialisation is the whole
   mechanism and the disk cadence is a policy on top of it: a node that always fetches from a peer needs a
