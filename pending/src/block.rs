@@ -725,7 +725,7 @@ impl DurableStore for MemoryStore {
 }
 
 /// The one segment that is on no disk: an address in it is a record still in the writeback buffer,
-/// waiting to be flushed. Segments are days and thirty-four are ever live, so the top of the six-bit
+/// waiting to be carried on. Segments are days and thirty-four are ever live, so the top of the six-bit
 /// field is free for this — and making the two forms distinguishable is what lets the buffer hand out
 /// addresses before it knows where a record will end up.
 pub const BUFFER_SEGMENT: u8 = (SEGMENT_VALUES - 1) as u8;
@@ -773,10 +773,10 @@ impl BlockRange {
 
 /// One block's worth of records, and how much of it is used.
 /// A block that is closed and not yet on a device: its bytes will not change again, and where it goes is
-/// already decided. What sits between the two halves `seal_store_block` used to do in one call (§20).
+/// already decided. What sits between the two halves `seal_block` used to do in one call (§20).
 ///
 /// **It carries no bytes.** The block itself is already in residency, because closing is what puts it there
-/// — see `seal_store_block`. This is the note that it still has to be written.
+/// — see `seal_block`. This is the note that it still has to be written.
 #[derive(Clone, Copy)]
 struct Unwritten {
     block: u64,
@@ -1404,7 +1404,7 @@ impl DurableStore for LatencyStore {
     }
 }
 
-/// The records: a writeback buffer of recent blocks, the blocks flushed out of it that are still worth
+/// The records: a writeback buffer of recent blocks, the blocks carried out of it that are still worth
 /// keeping in memory, and behind both the store. Append-only throughout — a hold whose remainder changed
 /// is written again at a new address and the index is repointed, because a block that could be rewritten
 /// would cost a read before every write and would take with it the one property store addresses rest on:
@@ -1418,7 +1418,7 @@ impl DurableStore for LatencyStore {
 ///
 /// **Two windows, and they are not the same window.** Flushing is what bounds recovery: a record that has
 /// not reached the store exists only in memory and has to be in the checkpoint, so the buffer is short.
-/// Residency is what keeps IO off the resolutions that come soon after — a flushed block stays readable
+/// Residency is what keeps IO off the resolutions that come soon after — a block already carried on stays readable
 /// in memory long after its content is durable. Written and resident are independent states, and holding
 /// them apart is what lets the first window be an hour while the second is a day. Residency costs far
 /// less than a day of arrivals, because what is resident has already been compacted: the survivors.
@@ -1426,12 +1426,12 @@ pub struct RecordLog {
     store: Box<dyn DurableStore>,
     /// Recent blocks, oldest first; the last is the one being filled. Not on the store yet.
     buffer: VecDeque<Filling>,
-    /// Ordinal of `buffer.front()`, so an address stays unique after blocks are flushed away.
+    /// Ordinal of `buffer.front()`, so an address stays unique after blocks are carried away.
     oldest: u64,
     /// Blocks the buffer may hold before its oldest is compacted out — the flush window. A count, not a
     /// duration: the engine has no clock, so a window in time is this divided by a rate.
     flush_blocks: usize,
-    /// Survivors accumulate here so a store block is packed rather than one-per-flush. Written out
+    /// Survivors accumulate here so a store block is packed rather than one per compaction. Written out
     /// when full.
     store_open: Filling,
     /// Blocks already written to the store and kept in memory anyway, oldest first — the residency
@@ -1494,7 +1494,7 @@ pub struct RecordLog {
     fetching: FxHashMap<u64, RecordAddr>,
     appended: u64,
     died_in_buffer: u64,
-    flushed: u64,
+    carried_on: u64,
     /// Blocks handed back to the store, which is the only way it shrinks.
     freed: u64,
     /// Faults the store has reported, and whether one is still owed to whoever can act on it.
@@ -1562,7 +1562,7 @@ impl RecordLog {
             fetching: FxHashMap::default(),
             appended: 0,
             died_in_buffer: 0,
-            flushed: 0,
+            carried_on: 0,
             freed: 0,
             faults: 0,
             corruptions: 0,
@@ -1828,7 +1828,7 @@ impl RecordLog {
             return;
         }
         if self.store_open.filled > 0 {
-            self.seal_store_block();
+            self.seal_block();
         }
         self.segment = segment;
     }
@@ -1849,10 +1849,10 @@ impl RecordLog {
     /// would multiply the space a tenth of the records occupy.
     pub fn keep(&mut self, key: TxId, hold: &HoldData, from: ApplyIndex) -> RecordAddr {
         if self.store_open.full() {
-            self.seal_store_block();
+            self.seal_block();
         }
         let index = self.store_open.put_at(key, hold, from);
-        self.flushed += 1;
+        self.carried_on += 1;
         RecordAddr::new(self.segment, self.next_block, index as u8)
     }
 
@@ -1876,7 +1876,7 @@ impl RecordLog {
     }
 
     /// The record at an address if it is still in memory: the buffer, the store block being filled, or a
-    /// flushed block still inside the residency window. `None` means only the store has it.
+    /// block carried on and still inside the residency window. `None` means only the store has it.
     ///
     /// Three places rather than one because they are three different claims — not yet written, being
     /// written, written and kept — and a report that could not tell the second window from the first
@@ -1977,7 +1977,7 @@ impl RecordLog {
         LogTraffic {
             appended: self.appended,
             died_in_buffer: self.died_in_buffer,
-            flushed: self.flushed,
+            carried_on: self.carried_on,
             left_memory: self.left_memory,
             buffer_reads: self.buffer_reads,
             resident_reads: self.resident_reads,
@@ -2013,7 +2013,7 @@ impl RecordLog {
         )
     }
     /// **Closes the block. It does not write it**, and that split is why this exists apart from
-    /// `flush_writes` below (design notes §20).
+    /// `submit_writes` below (design notes §20).
     ///
     /// Closing is what a checksum needs — this is the one moment the bytes stop changing — and writing is
     /// what a device does. They were one call, which is why the write could not be moved anywhere: there was
@@ -2023,7 +2023,7 @@ impl RecordLog {
     /// **Coverage is deliberately unaffected.** `unsynced` is recorded here, at the close, so a block that is
     /// closed and not yet written is already outside what a snapshot may carry — which was true before and is
     /// now true for one more reason.
-    fn seal_store_block(&mut self) {
+    fn seal_block(&mut self) {
         // Stamped here and nowhere else: this is the one moment a block's bytes stop changing, which is what
         // makes a whole-block checksum possible at all.
         self.store_open.bytes.stamp();
@@ -2253,7 +2253,11 @@ impl RecordLog {
 pub struct LogTraffic {
     pub appended: u64,
     pub died_in_buffer: u64,
-    pub flushed: u64,
+    /// Survivors carried out of the writeback buffer into the block being packed. **Memory, not the
+    /// device**: it was called `flushed`, and `flush` in this crate means reaching a device — which is
+    /// what `flush_window_hours` means and what this never did. The load driver printed it as `carried
+    /// on` to work around the name; the name says it now.
+    pub carried_on: u64,
     /// Records that fell out of the residency window, so only the store has them now. A read of one of
     /// these is the IO the window exists to prevent.
     pub left_memory: u64,

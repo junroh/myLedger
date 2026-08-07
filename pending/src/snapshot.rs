@@ -657,7 +657,7 @@ mod tests {
         let covered = engine.coverage();
         assert!(
             covered.raw() > 0,
-            "the buffer flushed and coverage stayed at nothing"
+            "the buffer carried its blocks on and coverage stayed at nothing"
         );
         assert!(
             covered.raw() < holds as u64,

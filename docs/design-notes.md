@@ -2674,8 +2674,8 @@ touches apply. One queue cannot express two reactions, so it does not try to.
 
 | operation | reached from | how often |
 |---|---|---|
-| `open_with` / `append` | `seal_store_block` ← `keep` ← `compact` ← `put` ← **`apply_effect`** | every 51 survivors |
-| `open_with` / `append` | `seal_store_block` ← **`open_day`** ← `sweep_expiry`, in the worker's round | once a day, closing a partial block so one block never spans two days |
+| `open_with` / `append` | `seal_block` ← `keep` ← `compact` ← `put` ← **`apply_effect`** | every 51 survivors |
+| `open_with` / `append` | `seal_block` ← **`open_day`** ← `sweep_expiry`, in the worker's round | once a day, closing a partial block so one block never spans two days |
 | `fsync` | `RecordLog::sync` ← the worker's round | every round |
 | `unlink` | `free_segment` ← `reclaim` ← `sweep_expiry` | when a day empties |
 | `read_at` | **the expiry sweep**, `each_record_in_day` ← `propose_expiry` | `expiry_blocks_per_round` a round while a day is being emptied |
@@ -2696,20 +2696,22 @@ The apply-path cost is neither absent nor amortised, which is the worst shape fo
 
 | word | means | what the code does today |
 |---|---|---|
-| **flush** | reaches the device | `flush_window_hours` means this. The `flushed` counter does **not** — it counts a survivor leaving the buffer for the block being packed, which is memory. The load driver already prints it as `carried on`, a label working around a name |
-| **seal** | a block is closed: no more records go in, its bytes stop changing, and a whole-block checksum becomes possible | `seal_store_block` closes **and** writes, in one call |
+| **flush** | reaches the device | `flush_window_hours` means this, and now it is the only thing that does. The counter that meant something else is `carried_on` — a survivor leaving the buffer for the block being packed, which is memory — and the load driver had been printing it under that name to work around the old one |
+| **seal** | a block is closed: no more records go in, its bytes stop changing, and a whole-block checksum becomes possible | `seal_block` does exactly that; writing is `submit_writes` |
 | **compaction** | dropping what the index no longer points at, on the way out of the buffer | `compact()`, and this one is right |
 
-`seal_store_block` merging two events is not a naming complaint. **It is why the write cannot move without
-touching everything**: there is no seam between "this block is closed" and "this block is on the device", so
-nothing can hold the first and submit the second.
+`seal_store_block` merging two events was not a naming complaint. **It was why the write could not move
+without touching everything**: there was no seam between "this block is closed" and "this block is on the
+device", so nothing could hold the first and submit the second. Splitting it is what made the lane
+possible, and the name lost its middle word with the job.
 
-Renaming waits for the work rather than going first. `flushed` will count a different event once a drain
-exists, and renaming a counter twice is worse than carrying a written-down divergence for one piece of work.
+The renaming waited for the work rather than going first, which was the right order: `flushed` counts a
+different event now that the drain exists, and renaming a counter twice is worse than carrying a
+written-down divergence for one piece of work.
 
 ### Handing a block over costs nothing, and the first version of this section said otherwise
 
-A sealed block is already kept in memory: `seal_store_block` pushes it straight into residency, which is a
+A sealed block is already kept in memory: `seal_block` pushes it straight into residency, which is a
 day wide. So the bytes a write needs are bytes the engine was going to hold anyway, and the block is
 immutable from the moment it is sealed — its own comment says so, because that is what makes a whole-block
 checksum possible. An `Arc<Block>` shared between residency and the queue costs one clone and no copy, which
@@ -2764,7 +2766,7 @@ a store that cannot keep up, which is the thing it exists to make visible.
 
 ### Closing a block and writing it are two calls now, and the read path had to learn about the gap
 
-`seal_store_block` did both: it stamped the checksum — the one moment a block's bytes stop changing — and it
+`seal_block` did both: it stamped the checksum — the one moment a block's bytes stop changing — and it
 issued the `pwrite`. **That merge is why the write could not be moved anywhere**, because there was no seam
 to hold the first half and hand off the second.
 

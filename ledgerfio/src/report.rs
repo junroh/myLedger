@@ -473,7 +473,7 @@ impl RunReport {
             mb(traffic.appended as usize * ledger_pending::RECORD_BYTES),
             traffic.died_in_buffer,
             share(traffic.died_in_buffer, traffic.appended),
-            traffic.flushed,
+            traffic.carried_on,
             traffic.left_memory
         );
         // Where each read was answered from, which is what says whether either window is earning its

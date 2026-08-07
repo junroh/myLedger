@@ -390,7 +390,7 @@ pub struct MemoryPending {
 struct TrafficGauge {
     appended: AtomicU64,
     died_in_buffer: AtomicU64,
-    flushed: AtomicU64,
+    carried_on: AtomicU64,
     freed: AtomicU64,
     left_memory: AtomicU64,
     buffer_reads: AtomicU64,
@@ -415,7 +415,7 @@ impl TrafficGauge {
         self.appended.store(traffic.appended, Ordering::Relaxed);
         self.died_in_buffer
             .store(traffic.died_in_buffer, Ordering::Relaxed);
-        self.flushed.store(traffic.flushed, Ordering::Relaxed);
+        self.carried_on.store(traffic.carried_on, Ordering::Relaxed);
         self.freed.store(traffic.freed, Ordering::Relaxed);
         self.left_memory
             .store(traffic.left_memory, Ordering::Relaxed);
@@ -453,7 +453,7 @@ impl TrafficGauge {
         LogTraffic {
             appended: self.appended.load(Ordering::Relaxed),
             died_in_buffer: self.died_in_buffer.load(Ordering::Relaxed),
-            flushed: self.flushed.load(Ordering::Relaxed),
+            carried_on: self.carried_on.load(Ordering::Relaxed),
             freed: self.freed.load(Ordering::Relaxed),
             left_memory: self.left_memory.load(Ordering::Relaxed),
             buffer_reads: self.buffer_reads.load(Ordering::Relaxed),
@@ -1507,7 +1507,7 @@ mod worker_tests {
         // the day may not move until the writes have landed, or the records belong to the next day and this
         // test would be waiting for an expiry two days out.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while engine.traffic().flushed < RECORDS_PER_BLOCK as u64 {
+        while engine.traffic().carried_on < RECORDS_PER_BLOCK as u64 {
             assert!(
                 Instant::now() < deadline,
                 "the engine never wrote the holds"

@@ -58,7 +58,7 @@ fn remove(pending_ref: TxId) -> PendingEffect {
     }
 }
 
-/// An engine holding `holds` holds, all of them flushed into day zero's blocks and all of them still alive,
+/// An engine holding `holds` holds, all of them carried on into day zero's blocks and all of them still alive,
 /// with the calendar moved on far enough that day zero has run out.
 ///
 /// The flush window is one block, so every record leaves the buffer and reaches a segment: a window that
@@ -114,7 +114,7 @@ fn walk_cost(options: &BenchOptions) {
             assert!(day.freed, "the day never emptied");
             // Everything but the block still being filled: the writeback buffer always holds its newest
             // block, and a record in there addresses the buffer rather than a day — so it belongs to
-            // whichever day it is eventually flushed into, not to this one. The rest have to be found.
+            // whichever day it is eventually carried on into, not to this one. The rest have to be found.
             assert!(
                 day.voids >= holds - RECORDS_PER_BLOCK as u64,
                 "the walk missed live holds: {} of {holds}",

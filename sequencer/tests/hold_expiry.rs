@@ -36,8 +36,8 @@ fn holds_written_on_day_zero() -> Harness {
     }
     harness.drain_acks(HOLDS, "the holds were never committed");
     // The holds are committed; the records are written a moment later, on the engine's thread. The day may
-    // not move until they are, or they belong to the next day — see `tick_until_written`.
-    harness.tick_until_written(WRITTEN as u64);
+    // not move until they are, or they belong to the next day — see `tick_until_carried_on`.
+    harness.tick_until_carried_on(WRITTEN as u64);
     harness
 }
 

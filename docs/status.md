@@ -497,7 +497,7 @@ neither is outstanding work.
   five-second run reports 984 stalls against 214,138 blocks drained, and removing the ceiling changes
   throughput by nothing.
 
-- **Closing a block and writing it are two calls now.** `seal_store_block` stamps the checksum and hands
+- **Closing a block and writing it are two calls now.** `seal_block` stamps the checksum and hands
   the block to `pending_writes`; `submit_writes` offers them in order and `collect_writes` takes the
   answers, and only on the answer does the block enter residency. The merge of the two was what made the write immovable — no seam to hold the first half and
   hand off the second — and the lane is what replaces the flush. Two readers had to learn about the gap: a
@@ -582,13 +582,18 @@ neither is outstanding work.
 
   What it costs to leave: §19's throttle is a number chosen against this arrangement, so it moves when the
   arrangement does — §20 lists the four other numbers in the same position.
-- **`flush` means two things in this crate and `seal` does two jobs.** `flush_window_hours` means reaching
-  the device, which is right; the `flushed` counter means a survivor leaving the buffer for `store_open`,
-  which is memory — and the load driver already prints it as `carried on`, a label working around a name.
-  `seal_store_block` closes a block *and* writes it in one call, and that merge is why the write cannot be
-  moved without touching everything: there is no seam between "closed" and "on the device". Renaming waits
-  for §20's work rather than going first, because `flushed` will count a different event once a drain exists
-  and renaming a counter twice is worse than carrying this down here for one piece of work.
+- ~~**`flush` means two things in this crate and `seal` does two jobs.**~~ Both are fixed, and they waited
+  for §20's work on purpose: `flushed` would have counted a different event once the drain existed, and
+  renaming a counter twice is worse than carrying the divergence for one piece of work.
+
+  `flush` now means one thing — reaching the device — which is what `flush_window_hours` always meant. The
+  counter that meant something else is `carried_on`: survivors leaving the writeback buffer for the block
+  being packed, which is memory. The load driver had been printing it as `carried on` to work around the
+  name, and the harness's `tick_until_written` was waiting on it under a third name again; both say what
+  they mean now.
+
+  `seal` means a block being closed, and `seal_block` does that and nothing else — the write left it when
+  closing and writing became two calls.
 - **The design has one memory tier and the code has two.** Design §4.3 is a *hot buffer*: one structure that
   answers reads and holds what write-back has not written, sized `peak × writeback` — 200k/s for a quarter of
   an hour, about 24GB, with backpressure at 12GB. The code splits it into the **writeback buffer** (the flush

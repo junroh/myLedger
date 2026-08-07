@@ -226,7 +226,7 @@ fn print_help() {
         "  --survivor-share <50%>      (50%) still unresolved when retention ends: sizes the index"
     );
     println!(
-        "  --flush-survivors <50%>     (50%) still unresolved when their block is flushed: sizes"
+        "  --flush-survivors <50%>     (50%) still unresolved when their block is carried_on: sizes"
     );
     println!(
         "                              residency, and `died in buffer` measures the same thing"

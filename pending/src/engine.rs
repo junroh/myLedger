@@ -620,7 +620,7 @@ impl PendingEngine {
     ///
     /// A segment is the day a record was **written**, not the day its hold was created: a record gets its
     /// address when the writeback buffer compacts it out, up to a flush window later. That only ever
-    /// delays expiry — a hold created at 23:59 and flushed after midnight is deleted with the next day's
+    /// delays expiry — a hold created at 23:59 and carried on after midnight is deleted with the next day's
     /// segment — and delay is the safe direction. The flush window is an hour against a grace of a day, so
     /// this rounding is inside the slack that is already paid for.
     ///
@@ -1282,7 +1282,7 @@ mod apply_tests {
 
     /// The two windows are independent, and this is the property that says so: a record written to the
     /// store is still answered from memory, and it stops being answered from memory only when residency
-    /// ends — not when it was written. Collapsing the two would make every flushed record an IO, which is
+    /// ends — not when it was written. Collapsing the two would make every record carried on an IO, which is
     /// the whole cost this exists to avoid.
     #[test]
     fn a_written_record_is_still_answered_from_memory_until_residency_ends() {
@@ -1297,7 +1297,7 @@ mod apply_tests {
             engine.stored(create(TxId(1_000 + index as u128), 10));
         }
 
-        let carried = engine.traffic().flushed;
+        let carried = engine.traffic().carried_on;
         assert!(
             carried > 0,
             "nothing was carried on, so the flush window never closed"
@@ -1384,7 +1384,10 @@ mod buffer_tests {
             traffic.died_in_buffer >= holds as u64,
             "records were carried on that were dead"
         );
-        assert_eq!(traffic.flushed, 0, "a dead record was written to the store");
+        assert_eq!(
+            traffic.carried_on, 0,
+            "a dead record was written to the store"
+        );
         assert_eq!(
             traffic.store_reads, 0,
             "nothing should have been read from the store yet"
@@ -1409,7 +1412,7 @@ mod buffer_tests {
             .expect("the survivor is still there");
         assert_eq!(after.remaining, 500, "the survivor came back changed");
         assert!(
-            engine.traffic().flushed > 0,
+            engine.traffic().carried_on > 0,
             "nothing was carried on at all"
         );
 

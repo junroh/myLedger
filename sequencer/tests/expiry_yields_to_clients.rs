@@ -47,7 +47,7 @@ fn expiring_with(capacity: Capacity) -> Harness {
         let ack = harness.run(tx);
         assert_eq!(ack.outcome, AckOutcome::Committed, "{ack:?}");
     }
-    harness.tick_until_written(WRITTEN);
+    harness.tick_until_carried_on(WRITTEN);
     harness.open_day(LIFETIME);
     harness
 }

@@ -283,10 +283,14 @@ impl<C: Clock> Harness<C> {
     /// happens on the engine's own thread. So a test that moves the day before the writes have landed puts
     /// those records in the *next* day and then waits for an expiry that is a day further out than it
     /// thinks. Establishing the precondition is the test's job, not the engine's.
-    pub fn tick_until_written(&mut self, records: u64) {
-        self.tick_until("the engine never wrote the records out", |reactor| {
-            reactor.pending().traffic().flushed >= records
-        });
+    /// Until survivors have been carried out of the writeback buffer into the block being packed — which
+    /// is **memory**, not the device. The name used to say written and the counter used to say flushed;
+    /// both meant this, and neither said it.
+    pub fn tick_until_carried_on(&mut self, records: u64) {
+        self.tick_until(
+            "the engine never carried the records out of its buffer",
+            |reactor| reactor.pending().traffic().carried_on >= records,
+        );
     }
 
     /// Until a record is on the store and **nowhere else**, which is a different state from written: a
