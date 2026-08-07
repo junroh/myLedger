@@ -687,8 +687,8 @@ neither is outstanding work.
   chain; §4.8 adds a `group_index` with `is_group_member` and `group_intact` to enumerate a group's members
   while it is undecided. Neither is built, and neither is needed here for the same shape of reason as the
   epoch below: a different mechanism removed the need. The sequencer checks a resolution's coverage by
-  **count** — every record carries `budget_members` and `budget_remaining`, and the engine aggregates them —
-  so nothing ever has to enumerate who the members are, and a structure for walking to them answers a
+  **count** — the engine keeps each live group's member count and remainder in one map and fills them into
+  every answer (`with_group`), so nothing ever has to enumerate who the members are, and a structure for walking to them answers a
   question no one asks. What would bring them back is the general case §7 already names: a budget group
   spanning submissions, which needs a client-supplied durable id and full-coverage checking against a
   membership rather than against a count.
