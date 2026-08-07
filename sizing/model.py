@@ -58,12 +58,91 @@ def index_slots_for(holds, load_target=0.90):
     return buckets * 4
 
 
+class Lifetimes:
+    """How long holds live, as a curve rather than a mean — which is what makes three of this model's
+    inputs stop being inputs.
+
+    Given "half are voided within the hour", three questions answer themselves:
+
+    - **What reaches the disk.** A record whose hold resolved before its block was flushed is dropped by
+      compaction and never written. So the written share is `1 - resolved_by(flush_window)`, and in a
+      measured run that is the `died in buffer 98%` line rather than anything about retention.
+    - **What a resolution costs.** A resolution inside the residency window is answered from memory; one
+      after it reads the device. The device read rate is the resolutions that fall in the gap between
+      the two windows, which is a subtraction on this curve.
+    - **How many holds are live at once.** Little's law wants a mean life, and the mean of a lifetime is
+      the area above its curve. Asking for the mean directly invites a number nobody derived, and one
+      that is wrong by orders of magnitude when the distribution has a tail — which this one does, by
+      construction: retention exists because some holds never resolve.
+
+    Points are `(hours, cumulative share resolved by then)`, and the shape between them is taken as
+    linear. That is a declaration about a business, so it is stated rather than fitted: nobody here has
+    the data, and a fitted curve would look like evidence.
+    """
+
+    def __init__(self, points):
+        self.points = sorted(points)
+        if not self.points:
+            raise ValueError("a lifetime curve needs at least one point")
+        hours = [hour for hour, _ in self.points]
+        shares = [share for _, share in self.points]
+        if any(hour <= 0 for hour in hours):
+            raise ValueError("a point at or before zero hours says nothing")
+        if shares != sorted(shares) or not 0 <= shares[0] or shares[-1] > 1:
+            raise ValueError("the resolved share must rise and stay within 0..1")
+
+    def resolved_by(self, hours):
+        """The share resolved by `hours`. Flat after the last point: what the curve does not say, it
+        does not guess, and the flat tail is what becomes the survivors."""
+        if hours <= 0:
+            return 0.0
+        previous_hour, previous_share = 0.0, 0.0
+        for hour, share in self.points:
+            if hours <= hour:
+                span = hour - previous_hour
+                within = (hours - previous_hour) / span if span else 1.0
+                return previous_share + within * (share - previous_share)
+            previous_hour, previous_share = hour, share
+        return previous_share
+
+    def mean_life_hours(self, cap_hours):
+        """The area above the curve up to `cap_hours` — a hold still live at the cap is counted as
+        living exactly that long, because that is when expiry takes it."""
+        total, previous_hour, previous_share = 0.0, 0.0, 0.0
+        for hour, share in self.points:
+            hour = min(hour, cap_hours)
+            if hour <= previous_hour:
+                continue
+            span = hour - previous_hour
+            # Trapezoid on the live share, which falls from 1 - previous_share to 1 - share.
+            total += span * ((1 - previous_share) + (1 - share)) / 2
+            previous_hour, previous_share = hour, share
+            if hour >= cap_hours:
+                return total
+        return total + (cap_hours - previous_hour) * (1 - previous_share)
+
+
 class Demand:
     """What a deployment brings. Every field is something a business knows or can be asked for.
 
     The three rates are not one rate. A peak decides what must be held in flight, the busiest hour
     decides the windows an hour wide, and the day decides retention — and a deployment whose peak is
     eighty times its mean is sized eighty times wrong by whichever one it picks.
+
+    The five shape inputs, and which structure each one moves:
+
+    - `hold_share` — of every transaction, the share that **creates a hold**. A plain transfer creates
+      none, and neither does the settle that resolves one. Holds are what the index counts, so this
+      scales the index, the blocks and the disk together.
+    - `records_per_hold` — records one hold appends over its whole life: **one, plus one per partial
+      settle**, because append-only means a changed remainder is a new version rather than an edit.
+      Resolving in full appends nothing. Scales the blocks and the disk, not the index.
+    - `lifetimes` — the [`Lifetimes`] curve, and it replaced two inputs that were guesses. How long a
+      hold lives and what share survives to retention are the same fact read at two points, so asking
+      for them separately let them disagree.
+    - `commit_latency_seconds` — submit to commit. Times the peak rate it is requests in flight, which
+      is what the slot pool has to cover. Nothing else uses it — and it is an *input* here rather than
+      an answer, because latency is `ledgersim`'s question, not this file's.
     """
 
     def __init__(
@@ -73,10 +152,9 @@ class Demand:
         busiest_hour_tx,
         daily_tx,
         accounts,
-        records_per_tx=1.0,
+        lifetimes,
         hold_share=1.0,
-        short_life_seconds=1.0,
-        survivor_share=0.5,
+        records_per_hold=1.0,
         commit_latency_seconds=0.010,
     ):
         self.peak_rate = peak_rate
@@ -84,10 +162,9 @@ class Demand:
         self.busiest_hour_tx = busiest_hour_tx
         self.daily_tx = daily_tx
         self.accounts = accounts
-        self.records_per_tx = records_per_tx
+        self.lifetimes = lifetimes
         self.hold_share = hold_share
-        self.short_life_seconds = short_life_seconds
-        self.survivor_share = survivor_share
+        self.records_per_hold = records_per_hold
         self.commit_latency_seconds = commit_latency_seconds
 
     def sanity(self):
@@ -216,75 +293,131 @@ class Sizing:
     def holds_created_per_second(self):
         return self.demand.peak_rate * self.demand.hold_share
 
-    @property
-    def mean_hold_life_seconds(self):
-        """Dominated by the survivors, and that is the point of splitting the two.
+    # --- the three shares, all read off one curve at three different points ---
 
-        A hold that resolves in a second and one that runs out its retention differ by five orders of
-        magnitude, so a single mean nobody derived hides which one is being sized for.
-        """
-        survivor = self.policy.lifetime_days * SECONDS_PER_DAY
-        return (
-            1 - self.demand.survivor_share
-        ) * self.demand.short_life_seconds + self.demand.survivor_share * survivor
+    @property
+    def resolved_by_flush(self):
+        """Share resolved before their block is flushed, so compaction drops the record and it never
+        reaches the store. A measured run calls this `died in buffer`."""
+        return self.demand.lifetimes.resolved_by(self.policy.flush_window_hours)
+
+    @property
+    def resolved_by_residency(self):
+        """Share resolved while their record is still in memory, so the resolution costs no device
+        read. This is what the residency window buys, and it is why residency is an **answer** here
+        rather than an input somebody picked."""
+        return self.demand.lifetimes.resolved_by(self.policy.residency_hours)
+
+    @property
+    def resolved_by_retention(self):
+        """Share a client resolves at all. The rest are voided by expiry."""
+        return self.demand.lifetimes.resolved_by(self.policy.retention_days * 24)
+
+    @property
+    def survivor_share(self):
+        return 1 - self.resolved_by_retention
+
+    @property
+    def written_share(self):
+        return 1 - self.resolved_by_flush
+
+    # --- holds ---
+
+    @property
+    def mean_hold_life_hours(self):
+        """The area above the lifetime curve, capped at retention -- expiry takes what is left."""
+        return self.demand.lifetimes.mean_life_hours(self.policy.retention_days * 24)
 
     @property
     def live_holds(self):
-        """Little's law, in **two terms driven by two different rates**, which is the correction that
-        matters most here.
+        """Little's law over the **daily** rate, because the mean life is measured in hours and no peak
+        lasts hours. What the peak adds on top is the requests in flight, which is a separate line.
 
-        The short-lived holds are outstanding only while the peak lasts, so they follow the peak rate.
-        The survivors accumulate for their whole lifetime, which is days -- and nothing sustains a peak
-        for days, so they follow the daily volume. One term at the peak rate over the survivors' mean
-        life gives 38 billion holds where the answer is 450 million: an eighty-six-fold error, and the
-        index is the structure that cannot grow.
+        Sized at the day rather than the peak on purpose: one term at the peak rate over a mean life of
+        days gives billions where the answer is millions, and the index cannot grow.
         """
-        return math.ceil(self.short_lived_holds + self.surviving_holds)
-
-    @property
-    def short_lived_holds(self):
-        outstanding = self.holds_created_per_second * self.demand.short_life_seconds
-        return outstanding * (1 - self.demand.survivor_share)
-
-    @property
-    def surviving_holds(self):
-        holds_per_day = self.demand.daily_tx * self.demand.hold_share
-        return holds_per_day * self.demand.survivor_share * self.policy.lifetime_days
+        holds_per_hour = self.holds_per_day / 24
+        return math.ceil(holds_per_hour * self.mean_hold_life_hours)
 
     @property
     def requests_in_flight(self):
         return math.ceil(self.demand.peak_rate * self.demand.commit_latency_seconds)
 
     @property
+    def holds_per_day(self):
+        return self.demand.daily_tx * self.demand.hold_share
+
+    @property
     def records_per_day(self):
-        return self.demand.daily_tx * self.demand.records_per_tx
+        """Records come from holds, never from transactions directly, and that is why the two inputs
+        are `hold_share` and `records_per_hold` rather than one `records_per_tx`.
+
+        A transaction that resolves a hold in full appends nothing -- the removal is not a record. What
+        appends is the hold itself and each *partial* settle, since append-only means a changed
+        remainder is a new version at a new address.
+        """
+        return self.holds_per_day * self.demand.records_per_hold
 
     @property
     def unwritten_records(self):
-        """What the flush window holds, and the window is an hour wide — so this follows the busiest
-        hour, not the peak second and not the daily mean."""
-        hour_records = self.demand.busiest_hour_tx * self.demand.records_per_tx
+        """What the flush window holds. An hour-wide window, so it follows the busiest hour rather than
+        the peak second or the daily mean -- and nothing is subtracted, because a record dies in this
+        buffer rather than before reaching it."""
+        hour_records = (
+            self.demand.busiest_hour_tx
+            * self.demand.hold_share
+            * self.demand.records_per_hold
+        )
         return math.ceil(hour_records * self.policy.flush_window_hours)
 
     @property
     def resident_records(self):
-        """Survivors only -- residency holds what was written and compacted, not everything appended.
-
-        Driven by the **day**, not by the busiest hour repeated twenty-four times: the window is a day
-        wide, and no day is twenty-four busiest hours.
-        """
+        """Written records inside the residency window. **Written**, not surviving to retention: what
+        residency keeps is what compaction let through, which is a different and much larger share."""
         return math.ceil(
             self.records_per_day
-            * self.demand.survivor_share
+            * self.written_share
             * (self.policy.residency_hours / 24)
         )
 
     @property
     def stored_records(self):
-        """What the segment files hold: a day's survivors for every day still inside the lifetime."""
+        """What the segment files hold: every day's written records for as long as the day is kept.
+
+        Driven by `written_share`, not by the survivors -- the earlier version of this used the share
+        alive at *retention*, which is the wrong subtraction by the whole width of the residency
+        window. In a measured run 98% of records die in the buffer with an hour-wide flush window, and
+        that is this number's real lever.
+        """
         return math.ceil(
-            self.records_per_day * self.demand.survivor_share * self.policy.lifetime_days
+            self.records_per_day * self.written_share * self.policy.lifetime_days
         )
+
+    # --- the device, which the curve is what makes computable ---
+
+    @property
+    def resolution_reads_per_second(self):
+        """Resolutions that land in the gap between the two windows: after the record left memory, and
+        before expiry would have taken the hold. Each one is a device read.
+
+        This is the answer residency is chosen for. Widening residency moves the subtraction and buys
+        reads at a price in blocks, which `residency_curve` prints as the trade it is.
+        """
+        holds_per_second = self.holds_per_day / SECONDS_PER_DAY
+        in_gap = max(0.0, self.resolved_by_retention - self.resolved_by_residency)
+        return holds_per_second * in_gap
+
+    @property
+    def sweep_reads_per_second(self):
+        """The expiry sweep reading a day's blocks to find what to void. Small beside the resolutions
+        and it is worth showing anyway: it was blamed for ninety thousand reads that turned out to be
+        the re-offers', which is a mistake this line makes harder to repeat."""
+        survivors_per_day = self.holds_per_day * self.survivor_share
+        return self.blocks_for(survivors_per_day * self.demand.records_per_hold) / SECONDS_PER_DAY
+
+    @property
+    def device_reads_per_second(self):
+        return self.resolution_reads_per_second + self.sweep_reads_per_second
 
     def blocks_for(self, records):
         return math.ceil(records / self.units["records_per_block"])
@@ -408,13 +541,13 @@ class Sizing:
                 "pending resident blocks",
                 self.blocks_for(self.resident_records),
                 "derived",
-                "survivors inside the residency window: a latency bound",
+                "written records inside the residency window -- what compaction let through, not the survivors",
             ),
             self._line(
                 "pending stored blocks",
                 self.blocks_for(self.stored_records),
                 "derived",
-                "every day's survivors still inside retention + grace -- this is the disk figure",
+                "every day's written records for as long as the day is kept -- this is the disk figure",
             ),
             self._line(
                 "volume read cache",
@@ -533,6 +666,28 @@ def report(sizing):
             f"  {line.kind}: {line.why}{flag}"
         )
     out.append("")
+    out.append("what the lifetime curve says, read at the three windows that matter")
+    out.append(
+        f"  resolved within the flush window ({sizing.policy.flush_window_hours}h): "
+        f"{sizing.resolved_by_flush:.0%} -- these never reach the disk"
+    )
+    out.append(
+        f"  resolved within residency ({sizing.policy.residency_hours}h): "
+        f"{sizing.resolved_by_residency:.0%} -- these cost no device read"
+    )
+    out.append(
+        f"  resolved by retention ({sizing.policy.retention_days}d): "
+        f"{sizing.resolved_by_retention:.0%}, so expiry voids {sizing.survivor_share:.0%}"
+    )
+    out.append(f"  mean hold life {sizing.mean_hold_life_hours:.1f}h")
+    out.append("")
+    out.append("device reads a second, at the peak")
+    out.append(
+        f"  resolutions past residency  {sizing.resolution_reads_per_second:>12,.0f}/s"
+    )
+    out.append(f"  the expiry sweep            {sizing.sweep_reads_per_second:>12,.0f}/s")
+    out.append(f"  total                       {sizing.device_reads_per_second:>12,.0f}/s")
+    out.append("")
     out.append("memory by component")
     for owner, total in sizing.memory_by_component:
         share = total / sizing.memory_bytes * 100 if sizing.memory_bytes else 0
@@ -550,6 +705,46 @@ def report(sizing):
     return "\n".join(out)
 
 
+def residency_curve(demand, policy, hours, dials=None, units=None):
+    """The trade residency actually is: blocks of memory against device reads a second.
+
+    Printed as a curve rather than solved for, because what a read is worth is a property of the device
+    and of the tail somebody is trying to hold -- neither of which is in this file. Design notes §10 is
+    the same refusal one level down.
+    """
+    rows = []
+    for residency in hours:
+        moved = Policy(
+            retention_days=policy.retention_days,
+            grace_days=policy.grace_days,
+            flush_window_hours=policy.flush_window_hours,
+            residency_hours=residency,
+            idem_window_hours=policy.idem_window_hours,
+            snapshot_every_effects=policy.snapshot_every_effects,
+        )
+        one = Sizing(demand, moved, dials, units)
+        blocks = dict(one.lines_by_name)["pending resident blocks"]
+        rows.append(
+            {
+                "hours": residency,
+                "hit_share": one.resolved_by_residency,
+                "blocks": blocks.count,
+                "memory_bytes": blocks.bytes,
+                "reads_per_second": one.resolution_reads_per_second,
+            }
+        )
+    return rows
+
+
+def print_residency_curve(rows):
+    print(f"{'residency':>10}{'answered from memory':>22}{'blocks':>14}{'GB':>8}{'device reads/s':>16}")
+    for row in rows:
+        print(
+            f"{row['hours']:>9}h{row['hit_share']:>21.0%}{row['blocks']:>14,}"
+            f"{gigabytes(row['memory_bytes']):>8.2f}{row['reads_per_second']:>16,.0f}"
+        )
+
+
 def check_bucket_rule(units=None):
     """That this file's staircase is still the one the code publishes.
 
@@ -565,21 +760,37 @@ def check_bucket_rule(units=None):
         )
 
 
+#: Half voided inside the hour, most within the day, and a tail that never resolves -- which is what
+#: retention exists for. Stated, not fitted: nobody here has the data, and a fitted curve would look
+#: like evidence.
+EXAMPLE_LIFETIMES = Lifetimes([(1, 0.50), (4, 0.70), (24, 0.88), (24 * 7, 0.96)])
+
+#: 300k/s peaking for a minute against 300M a day: peak and mean eighty-six times apart, which is the
+#: shape that makes picking one of them wrong by that factor.
+EXAMPLE_DEMAND = Demand(
+    peak_rate=300_000,
+    peak_seconds=60,
+    busiest_hour_tx=30_000_000,
+    daily_tx=300_000_000,
+    accounts=10_000_000,
+    lifetimes=EXAMPLE_LIFETIMES,
+)
+
+#: Thirty days, because that is the decision this is here to make visible rather than default away.
+EXAMPLE_POLICY = Policy(retention_days=30, grace_days=1)
+
+
 if __name__ == "__main__":
     check_bucket_rule()
-    # 300k/s peaking for ten minutes, 300M a day: the shape that started this, where peak and mean are
-    # eighty-six times apart and picking either one alone is wrong by that factor.
     print(
         report(
             Sizing(
-                Demand(
-                    peak_rate=300_000,
-                    peak_seconds=60,
-                    busiest_hour_tx=30_000_000,
-                    daily_tx=300_000_000,
-                    accounts=10_000_000,
-                ),
-                Policy(),
+                EXAMPLE_DEMAND,
+                EXAMPLE_POLICY,
             )
         )
+    )
+    print()
+    print_residency_curve(
+        residency_curve(EXAMPLE_DEMAND, EXAMPLE_POLICY, [1, 2, 4, 8, 24, 72, 168])
     )
