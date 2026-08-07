@@ -1,11 +1,7 @@
 mod harness;
 
-use std::time::Duration;
-
 use ledger_base::{AckOutcome, LedgerError};
-use ledger_raft::EchoRaftConfig;
 use ledger_sequencer::{Capacity, PauseCause, ReactorConfig};
-use ledger_stubkit::LatencyRange;
 
 use harness::*;
 
@@ -24,24 +20,28 @@ fn a_full_slot_pool_refuses_new_requests() {
             ..ReactorConfig::default()
         },
         NoLatency::pending(),
-        EchoRaftConfig {
-            round_trip: LatencyRange::fixed(Duration::from_millis(20)),
-            ..NoLatency::raft()
-        },
+        NoLatency::raft(),
     );
+    // **Consensus is held, not slowed.** A slot is occupied until its batch commits, so the pool fills
+    // only while commits are outstanding — which was a twenty-millisecond round trip and is now a state.
+    let commits = harness.reactor.raft().commits();
+    commits.hold();
 
     let requests = slots * 4;
     for _ in 0..requests {
         let tx = harness.transfer(EXTERNAL, ALICE, 10);
         harness.submit(tx);
     }
+    harness.tick_until("the slot pool never filled", |reactor| {
+        reactor.metrics().slot_exhaustion > 0
+    });
+    commits.release();
     let acks = harness.drain_acks(requests, "acks stalled");
 
     let refused = acks
         .iter()
         .filter(|ack| ack.outcome == AckOutcome::Rejected(LedgerError::Overloaded))
         .count();
-    assert!(refused > 0, "the slot pool never filled: {acks:?}");
     assert_eq!(harness.reactor.metrics().slot_exhaustion as usize, refused);
 
     let after = harness.transfer(EXTERNAL, ALICE, 10);

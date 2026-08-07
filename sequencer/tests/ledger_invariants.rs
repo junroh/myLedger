@@ -1,12 +1,9 @@
 mod harness;
 
-use std::time::Duration;
-
 use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{AckOutcome, TransferFlags};
 use ledger_raft::EchoRaftConfig;
-use ledger_stubkit::LatencyRange;
 
 use harness::*;
 
@@ -128,36 +125,31 @@ fn fund_until_committed(harness: &mut Harness, account: ledger_base::AccountId, 
 /// nothing rather than ack the wrong requests, and whatever it applied before must still add up.
 #[test]
 fn a_commit_that_answers_the_wrong_batch_applies_nothing() {
-    // A round trip long enough that every batch is still outstanding when the next is proposed,
-    // which is what lets consensus answer them in the wrong order.
     let mut harness = Harness::with_stubs(
         NoLatency::pending(),
         EchoRaftConfig {
             reorder_every: 2,
-            round_trip: LatencyRange::fixed(Duration::from_millis(50)),
             ..NoLatency::raft()
         },
     );
     fund_until_committed(&mut harness, ALICE, FUNDING * 100);
+    // **Every batch has to be outstanding when the next is proposed**, or there is no pair for the fault
+    // to swap. That was a fifty-millisecond round trip; held, it is a state, and the loop below no longer
+    // races a seal that a slow machine could bring forward.
+    let commits = harness.reactor.raft().commits();
+    commits.hold();
 
-    // One request at a time, each proposed on its own, so several batches are in flight together.
-    //
-    // **The seal ends this loop, and it has to be allowed to.** Once the mispaired commit is noticed
-    // nothing more is proposed, so a loop that insisted on six batches would wait for a seventh that can
-    // never come — which is what it did, once in about a thousand concurrent runs: the reorder was
-    // noticed at the fifth batch rather than after the sixth, and the count is a property of how the
-    // fifty-millisecond round trips lined up rather than of anything this test is about.
+    // One request at a time, each proposed on its own, so several batches are in flight together. With
+    // the commits held nothing can be applied yet, so nothing can seal part way through the loop.
     let batches = 6;
     for batch in 1..=batches {
-        if harness.reactor.is_fail_stopped() {
-            break;
-        }
         let tx = harness.transfer(ALICE, BOB, 10);
         harness.submit(tx);
         harness.tick_until("a request was never proposed", |reactor| {
-            reactor.metrics().proposed_batches > batch || reactor.is_fail_stopped()
+            reactor.metrics().proposed_batches > batch
         });
     }
+    commits.release();
     harness.tick_until("the reordering was never noticed", |reactor| {
         reactor.is_fail_stopped()
     });

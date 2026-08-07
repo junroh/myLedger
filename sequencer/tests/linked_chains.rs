@@ -1,12 +1,8 @@
 mod harness;
 
-use std::time::Duration;
-
 use harness::*;
 use ledger_base::{AckOutcome, LedgerError, TransferFlags};
-use ledger_raft::EchoRaftConfig;
 use ledger_sequencer::LogKind;
-use ledger_stubkit::LatencyRange;
 
 /// Inside a chain a later leg may spend what an earlier leg brings in, which the speculative
 /// overlay alone would refuse.
@@ -90,14 +86,12 @@ fn a_chain_resolves_a_hold_it_created_itself() {
 /// from another submission is refused rather than judged against a hold that may never exist.
 #[test]
 fn a_hold_still_in_flight_cannot_be_resolved_by_another_submission() {
-    let mut harness = Harness::with_stubs(
-        NoLatency::pending(),
-        EchoRaftConfig {
-            round_trip: LatencyRange::fixed(Duration::from_millis(5)),
-            ..NoLatency::raft()
-        },
-    );
+    let mut harness = Harness::with_stubs(NoLatency::pending(), NoLatency::raft());
     harness.fund(ALICE, FUNDING);
+    // The hold's batch has to still be in flight when the settle is judged, and that is a state rather
+    // than a five-millisecond round trip: consensus is held until the settle has been answered.
+    let commits = harness.reactor.raft().commits();
+    commits.hold();
 
     let mut hold = harness.transfer(ALICE, BOB, 300);
     hold.flags = TransferFlags::PENDING;
@@ -107,7 +101,12 @@ fn a_hold_still_in_flight_cannot_be_resolved_by_another_submission() {
     harness.submit(hold);
     harness.submit(settle);
 
-    let acks = harness.drain_acks(2, "acks stalled");
+    // The settle is refused at judge time and needs no commit, so its ack comes back while consensus is
+    // still holding the hold's.
+    let refused = harness.drain_acks(1, "the settle was never answered");
+    commits.release();
+    let mut acks = refused;
+    acks.extend(harness.drain_acks(1, "the hold never committed"));
     let outcome = |id| {
         acks.iter()
             .find(|ack| ack.tx_id == id)

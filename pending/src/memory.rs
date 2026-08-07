@@ -1420,15 +1420,38 @@ mod worker_tests {
             );
         }
 
-        // Nothing has run out yet, and nothing may be released before it has.
+        // **Nothing has run out yet, and nothing may be released before it has** — which is the edge that
+        // matters, since deleting early refuses a resolution that was still entitled to arrive.
+        //
+        // Proving a negative needs a bound, and it must not be a duration: two hundred milliseconds of
+        // asking was the bound here, and on a busy machine that is a handful of loops rather than a
+        // handful of rounds — it would have passed without checking anything. The bound is rounds now.
+        // The sweep runs at the top of every round, so a hold this day had expired would be offered in
+        // the first one; two records appended after the day changed prove two rounds have run, and the
+        // second is what carries a notice the first could have owed.
         day.store(1, Ordering::Relaxed);
-        let deadline = Instant::now() + Duration::from_millis(200);
-        while Instant::now() < deadline {
-            assert!(
-                engine.notices().is_none(),
-                "a hold was offered before its lifetime ran out"
-            );
+        for id in 1..=2u128 {
+            let mut command = create(TxId(holds as u128 + id));
+            while engine.send(command).is_err() {
+                command = create(TxId(holds as u128 + id));
+            }
+            let want = holds as u64 + id as u64;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while engine.traffic().appended < want {
+                assert!(
+                    Instant::now() < deadline,
+                    "the engine never took the command that proves a round ran"
+                );
+                assert!(
+                    engine.notices().is_none(),
+                    "a hold was offered before its lifetime ran out"
+                );
+            }
         }
+        assert!(
+            engine.notices().is_none(),
+            "a hold was offered before its lifetime ran out"
+        );
 
         day.store(2, Ordering::Relaxed);
         let mut offered = 0;

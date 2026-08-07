@@ -187,7 +187,24 @@ be *written* and then expected a read to reach the device — but a written bloc
 on a busy machine all 512 lookups were answered from memory. It waits for a record to have left memory,
 which is the state it meant.
 
-Measured after: every test binary in the workspace running at once, sixty rounds, 1,500 executions, clean.
+**And then the four that were safe went too, because the argument for them was the fragile part.** A raft
+round trip in `backpressure`, `lane_ordering`, `linked_chains` and `ledger_invariants` was defensible —
+the state each waited on can only be moved by the reactor, which is the test thread — but that is a
+sentence about how the pieces happen to fit, and the gate makes it unnecessary. Commits are held instead,
+and no test configures a duration to arrange anything now.
+
+One more was found in the same sweep and it was **failing open rather than failing loudly**: a unit test
+asserted that no hold was offered early by asking for two hundred milliseconds. On a busy machine that is
+a handful of loops rather than a handful of rounds, so it would have passed without checking. The bound is
+rounds now — two records appended after the day changed prove two rounds ran, and the sweep runs at the
+top of every one.
+
+**What is left in a test is a deadline and an injected clock, and nothing else.** A deadline is a failure
+bound: reaching it is the test failing, never the test deciding. `ManualClock` is what the linger test
+uses, and it is the shape the rest now follow.
+
+Measured after: every test binary in the workspace running at once, forty rounds, 1,000 executions, clean;
+the previous round of fixes measured 1,500 the same way.
 
 Both tools can now reach the read path for honest reasons: `--resolve-after` gives a hold an age, so
 a resolution reads a record at a declared age rather than one written moments ago. `check` draws

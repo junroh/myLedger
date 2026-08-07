@@ -1,12 +1,8 @@
 mod harness;
 
-use std::time::Duration;
-
 use ledger_base::{AckOutcome, LedgerError, TransferFlags};
 use ledger_pending::MemoryPendingConfig;
-use ledger_raft::EchoRaftConfig;
 use ledger_sequencer::{ReactorConfig, SafetyPolicy};
-use ledger_stubkit::LatencyRange;
 
 use harness::*;
 
@@ -168,13 +164,12 @@ fn an_answer_from_before_a_decision_the_engine_was_given_quarantines_the_lane() 
 /// the pipeline is empty.
 #[test]
 fn clearing_fail_stop_waits_for_consensus() {
-    let mut harness = Harness::with_stubs(
-        NoLatency::pending(),
-        EchoRaftConfig {
-            round_trip: LatencyRange::fixed(Duration::from_millis(20)),
-            ..NoLatency::raft()
-        },
-    );
+    let mut harness = Harness::with_stubs(NoLatency::pending(), NoLatency::raft());
+    // Consensus is held rather than slowed: "still owes an answer" is the state this test is about, and a
+    // round trip long enough to hope for it is not the same thing.
+    let commits = harness.reactor.raft().commits();
+    commits.hold();
+
     let tx = harness.transfer(EXTERNAL, ALICE, 100);
     harness.submit(tx);
     harness.tick_until("nothing was proposed", |reactor| {
@@ -186,6 +181,7 @@ fn clearing_fail_stop_waits_for_consensus() {
         Err(LedgerError::QuarantineDraining)
     );
 
+    commits.release();
     harness.drain_acks(1, "the batch never committed");
     harness.tick_until("never drained", |reactor| reactor.is_quiescent());
     assert_eq!(harness.reactor.clear_fail_stop(), Ok(()));
