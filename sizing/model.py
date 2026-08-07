@@ -122,14 +122,84 @@ class Lifetimes:
         return total + (cap_hours - previous_hour) * (1 - previous_share)
 
 
+class Load:
+    """How much traffic the **busiest window of a given width** carries. A curve, for the same reason
+    lifetimes are one: every window in this ledger has a different width, and one number cannot answer
+    for all of them.
+
+    A day is not flat, so neither of the two obvious shortcuts works, and both were in this file:
+
+    - Multiplying the busiest *hour* by the window's width assumes that many equally busy hours in a
+      row. Over-sizes a four-hour flush window by whatever the day's shape is worth.
+    - Dividing the *day* by twenty-four assumes a flat day. Under-sizes a two-hour residency window by
+      the same factor, in the other direction.
+
+    Points are `(hours, transactions in the busiest window that wide)`. The width of the first point is
+    what the peak rate is read from — a peak is just the busiest very short window.
+
+    Two things are checked, because both are ways of stating a day that cannot exist: a wider window
+    cannot carry less, and it cannot carry a *higher average rate* than a narrower one.
+    """
+
+    def __init__(self, points):
+        self.points = sorted(points)
+        if len(self.points) < 2:
+            raise ValueError("a load curve needs a short window and a long one")
+        previous_hours, previous_tx = 0.0, 0.0
+        for hours, tx in self.points:
+            if hours <= 0:
+                raise ValueError("a window of no width carries nothing")
+            if tx < previous_tx:
+                raise ValueError(f"the busiest {hours}h carries less than the busiest {previous_hours}h")
+            if previous_hours and tx / hours > previous_tx / previous_hours * 1.0000001:
+                raise ValueError(
+                    f"the busiest {hours}h averages a higher rate than the busiest {previous_hours}h, "
+                    "which no day does"
+                )
+            previous_hours, previous_tx = hours, tx
+
+    def busiest(self, hours):
+        """Transactions in the busiest window `hours` wide. Below the first point the rate is taken as
+        flat -- the peak rate is the most this says about a window shorter than it was given."""
+        if hours <= 0:
+            return 0.0
+        first_hours, first_tx = self.points[0]
+        if hours <= first_hours:
+            return first_tx * (hours / first_hours)
+        previous_hours, previous_tx = first_hours, first_tx
+        for point_hours, point_tx in self.points[1:]:
+            if hours <= point_hours:
+                span = point_hours - previous_hours
+                within = (hours - previous_hours) / span if span else 1.0
+                return previous_tx + within * (point_tx - previous_tx)
+            previous_hours, previous_tx = point_hours, point_tx
+        # Past the last point the day repeats: nothing here knows about a weekly shape.
+        return previous_tx * (hours / previous_hours)
+
+    @property
+    def peak_rate(self):
+        """Transactions a second in the shortest window given, which is what a peak is."""
+        hours, tx = self.points[0]
+        return tx / (hours * 3_600)
+
+    @property
+    def daily(self):
+        return self.busiest(24)
+
+
 class Demand:
     """What a deployment brings. Every field is something a business knows or can be asked for.
 
-    The three rates are not one rate. A peak decides what must be held in flight, the busiest hour
-    decides the windows an hour wide, and the day decides retention — and a deployment whose peak is
-    eighty times its mean is sized eighty times wrong by whichever one it picks.
+    Two curves and three scalars. The curves are here because the two things a deployment is asked
+    about — *how much traffic* and *how long holds live* — are both read at several points by this
+    model, and a point each let those readings disagree.
 
-    The five shape inputs, and which structure each one moves:
+    The inputs, and which structure each one moves:
+
+    - `load` — the [`Load`] curve. It replaced four numbers (a peak, how long the peak lasts, the
+      busiest hour and the day), which were four readings of it. Every window-shaped structure asks it
+      at that window's own width, so changing a window changes the count it is sized by — which is the
+      thing four fixed numbers could not express.
 
     - `hold_share` — of every transaction, the share that **creates a hold**. A plain transfer creates
       none, and neither does the settle that resolves one. Holds are what the index counts, so this
@@ -147,35 +217,48 @@ class Demand:
 
     def __init__(
         self,
-        peak_rate,
-        peak_seconds,
-        busiest_hour_tx,
-        daily_tx,
-        accounts,
+        load,
         lifetimes,
+        accounts,
         hold_share=1.0,
         records_per_hold=1.0,
         commit_latency_seconds=0.010,
     ):
-        self.peak_rate = peak_rate
-        self.peak_seconds = peak_seconds
-        self.busiest_hour_tx = busiest_hour_tx
-        self.daily_tx = daily_tx
-        self.accounts = accounts
+        self.load = load
         self.lifetimes = lifetimes
+        self.accounts = accounts
         self.hold_share = hold_share
         self.records_per_hold = records_per_hold
         self.commit_latency_seconds = commit_latency_seconds
 
+    @property
+    def peak_rate(self):
+        return self.load.peak_rate
+
+    @property
+    def daily_tx(self):
+        return self.load.daily
+
+    def holds_in_busiest(self, hours):
+        """Holds created in the busiest window that wide -- which is what every window-shaped
+        structure is sized by, at its own width."""
+        return self.load.busiest(hours) * self.hold_share
+
+    def records_in_busiest(self, hours):
+        return self.holds_in_busiest(hours) * self.records_per_hold
+
     def sanity(self):
-        """Contradictions worth refusing before they become a confident wrong answer."""
+        """Contradictions worth refusing before they become a confident wrong answer.
+
+        Most of what used to be checked here is now impossible to state: `Load` refuses a curve whose
+        wider windows carry less, or average a higher rate, than its narrower ones. What is left is the
+        one thing a single curve can still get wrong.
+        """
         problems = []
-        if self.busiest_hour_tx > self.daily_tx:
-            problems.append("the busiest hour holds more than the day")
-        if self.peak_rate * self.peak_seconds > self.busiest_hour_tx:
-            problems.append("the peak alone exceeds the busiest hour")
-        if self.busiest_hour_tx < self.daily_tx / 24:
-            problems.append("the busiest hour is below the daily mean, so it is not the busiest")
+        if self.hold_share > 1 or self.hold_share < 0:
+            problems.append("the share of transactions creating a hold is not a share")
+        if self.records_per_hold < 1:
+            problems.append("a hold appends at least the record that creates it")
         return problems
 
 
@@ -360,24 +443,23 @@ class Sizing:
 
     @property
     def unwritten_records(self):
-        """What the flush window holds. An hour-wide window, so it follows the busiest hour rather than
-        the peak second or the daily mean -- and nothing is subtracted, because a record dies in this
-        buffer rather than before reaching it."""
-        hour_records = (
-            self.demand.busiest_hour_tx
-            * self.demand.hold_share
-            * self.demand.records_per_hold
-        )
-        return math.ceil(hour_records * self.policy.flush_window_hours)
+        """What the flush window holds: the records of the busiest window **that wide**.
+
+        Nothing is subtracted -- a record dies *in* this buffer rather than before reaching it, so the
+        whole window's arrivals are here whatever share of them will survive.
+        """
+        return math.ceil(self.demand.records_in_busiest(self.policy.flush_window_hours))
 
     @property
     def resident_records(self):
-        """Written records inside the residency window. **Written**, not surviving to retention: what
-        residency keeps is what compaction let through, which is a different and much larger share."""
+        """Written records inside the residency window, asked of the load curve at **that** width.
+
+        Dividing a day by twenty-four to get a two-hour window was the mistake in the other direction
+        from the flush buffer's: it assumes a flat day and under-sizes exactly where the window is
+        narrow enough for the day's shape to matter.
+        """
         return math.ceil(
-            self.records_per_day
-            * self.written_share
-            * (self.policy.residency_hours / 24)
+            self.demand.records_in_busiest(self.policy.residency_hours) * self.written_share
         )
 
     @property
@@ -419,8 +501,16 @@ class Sizing:
     def device_reads_per_second(self):
         return self.resolution_reads_per_second + self.sweep_reads_per_second
 
+    @property
+    def records_per_block(self):
+        """Derived from the record size rather than read off the dump, so an override of it reaches the
+        disk figure. Identical to the published number when nothing is overridden -- and the reason to
+        derive it anyway is that `pending record` is the one unit cost somebody would want to try
+        shrinking, and an override that silently changed nothing would be worse than no override."""
+        return self.units["block_bytes"] // self.unit_bytes("pending record")
+
     def blocks_for(self, records):
-        return math.ceil(records / self.units["records_per_block"])
+        return math.ceil(records / self.records_per_block)
 
     def unit_bytes(self, name):
         return self.overrides.get(name, self.costs[name]["bytes"])
@@ -507,11 +597,9 @@ class Sizing:
             ),
             self._line(
                 "idem keys",
-                buckets_for(
-                    math.ceil(demand.busiest_hour_tx * policy.idem_window_hours)
-                ),
+                buckets_for(math.ceil(demand.load.busiest(policy.idem_window_hours))),
                 "derived",
-                "the busiest hour's transactions -- the window is an hour, and nothing enforces it yet",
+                "the busiest window this wide -- change the window and this follows; nothing enforces it yet",
             ),
             self._line(
                 "pending index",
@@ -535,7 +623,7 @@ class Sizing:
                 "pending writeback buffer",
                 self.blocks_for(self.unwritten_records),
                 "derived",
-                "the flush window's records: a recovery bound, so it follows the busiest hour",
+                "the busiest window this wide -- a recovery bound, and nothing is subtracted: a record dies here",
             ),
             self._line(
                 "pending resident blocks",
@@ -697,7 +785,7 @@ def report(sizing):
     out.append(
         f"disk {gigabytes(sizing.disk_bytes):.2f} GB in segment files "
         f"({sizing.stored_records:,} records at {sizing.unit_bytes('pending record')}B, "
-        f"{sizing.units['records_per_block']} to a {sizing.units['block_bytes']}B block)"
+        f"{sizing.records_per_block} to a {sizing.units['block_bytes']}B block)"
     )
     out.append(f"live holds {sizing.live_holds:,}, requests in flight {sizing.requests_in_flight:,}")
     for breach in sizing.breaches:
@@ -714,15 +802,7 @@ def residency_curve(demand, policy, hours, dials=None, units=None):
     """
     rows = []
     for residency in hours:
-        moved = Policy(
-            retention_days=policy.retention_days,
-            grace_days=policy.grace_days,
-            flush_window_hours=policy.flush_window_hours,
-            residency_hours=residency,
-            idem_window_hours=policy.idem_window_hours,
-            snapshot_every_effects=policy.snapshot_every_effects,
-        )
-        one = Sizing(demand, moved, dials, units)
+        one = Sizing(demand, _with_windows(policy, residency_hours=residency), dials, units)
         blocks = dict(one.lines_by_name)["pending resident blocks"]
         rows.append(
             {
@@ -742,6 +822,54 @@ def print_residency_curve(rows):
         print(
             f"{row['hours']:>9}h{row['hit_share']:>21.0%}{row['blocks']:>14,}"
             f"{gigabytes(row['memory_bytes']):>8.2f}{row['reads_per_second']:>16,.0f}"
+        )
+
+
+def _with_windows(policy, **changed):
+    fields = dict(
+        retention_days=policy.retention_days,
+        grace_days=policy.grace_days,
+        flush_window_hours=policy.flush_window_hours,
+        residency_hours=policy.residency_hours,
+        idem_window_hours=policy.idem_window_hours,
+        snapshot_every_effects=policy.snapshot_every_effects,
+    )
+    fields.update(changed)
+    return Policy(**fields)
+
+
+def flush_window_curve(demand, policy, hours, dials=None, units=None):
+    """What widening the flush window buys, which is not what a reader expects.
+
+    A wider window is more memory *and less disk*, because a record whose hold resolves before the
+    block is flushed is dropped by compaction and never written. Half these holds resolve within the
+    hour, so an hour-wide window already discards half the records; four hours discards seventy
+    percent. It costs recovery time -- the window is how much a restart replays -- which is a bound
+    nothing here prices.
+    """
+    rows = []
+    for window in hours:
+        one = Sizing(demand, _with_windows(policy, flush_window_hours=window), dials, units)
+        buffer = dict(one.lines_by_name)["pending writeback buffer"]
+        rows.append(
+            {
+                "hours": window,
+                "written_share": one.written_share,
+                "buffer_bytes": buffer.bytes,
+                "disk_bytes": one.disk_bytes,
+                "memory_bytes": one.memory_bytes,
+            }
+        )
+    return rows
+
+
+def print_flush_window_curve(rows):
+    print(f"{'flush window':>13}{'reaches disk':>14}{'buffer GB':>12}{'memory GB':>12}{'disk GB':>10}")
+    for row in rows:
+        print(
+            f"{row['hours']:>12}h{row['written_share']:>14.0%}"
+            f"{gigabytes(row['buffer_bytes']):>12.2f}{gigabytes(row['memory_bytes']):>12.2f}"
+            f"{gigabytes(row['disk_bytes']):>10.1f}"
         )
 
 
@@ -765,15 +893,25 @@ def check_bucket_rule(units=None):
 #: like evidence.
 EXAMPLE_LIFETIMES = Lifetimes([(1, 0.50), (4, 0.70), (24, 0.88), (24 * 7, 0.96)])
 
-#: 300k/s peaking for a minute against 300M a day: peak and mean eighty-six times apart, which is the
-#: shape that makes picking one of them wrong by that factor.
+#: A day with a shape. 200k/s at the peak, and by the hour that peak is long over -- the busiest hour
+#: carries a tenth of the day, the busiest four hours a third. Every window-shaped structure reads this
+#: at its own width, so changing a window changes what it is sized by.
+EXAMPLE_LOAD = Load(
+    [
+        (1 / 60, 200_000 * 60),  # the busiest minute, at the peak rate
+        (1, 30_000_000),  # the busiest hour: a tenth of the day
+        (4, 90_000_000),  # the busiest four: a third
+        (24, 300_000_000),  # the day
+    ]
+)
+
 EXAMPLE_DEMAND = Demand(
-    peak_rate=300_000,
-    peak_seconds=60,
-    busiest_hour_tx=30_000_000,
-    daily_tx=300_000_000,
-    accounts=10_000_000,
+    load=EXAMPLE_LOAD,
     lifetimes=EXAMPLE_LIFETIMES,
+    accounts=100_000_000,
+    hold_share=0.90,
+    records_per_hold=1.2,
+    commit_latency_seconds=0.010,
 )
 
 #: Thirty days, because that is the decision this is here to make visible rather than default away.
@@ -793,4 +931,8 @@ if __name__ == "__main__":
     print()
     print_residency_curve(
         residency_curve(EXAMPLE_DEMAND, EXAMPLE_POLICY, [1, 2, 4, 8, 24, 72, 168])
+    )
+    print()
+    print_flush_window_curve(
+        flush_window_curve(EXAMPLE_DEMAND, EXAMPLE_POLICY, [0.25, 1, 4, 12, 24])
     )
