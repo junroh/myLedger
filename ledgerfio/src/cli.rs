@@ -91,6 +91,10 @@ pub struct Options {
     /// more outstanding than this, the store refuses reads and the run reports the depth rather than the
     /// device. 40,000 reads a second at 5ms needs about two hundred.
     pub store_queue_depth: usize,
+    /// Writes and barriers the volume's lane will hold at once. Its own number because the arithmetic is
+    /// its own: a read side wants Little's law on the read rate, a write side wants the block seal rate
+    /// against one ordered thread.
+    pub store_write_depth: usize,
     /// Make the store refuse every nth call, to prove the sequencer seals. A device fault rather than a
     /// latency, and the only reason it exists: a seal nothing can produce is a seal nothing has tested.
     pub store_fault_every: u32,
@@ -192,6 +196,7 @@ impl Default for Options {
             store_sync: LatencyRange::fixed(Duration::ZERO),
             store_iops: 0,
             store_queue_depth: 128,
+            store_write_depth: 128,
             store_fault_every: 0,
             store_corrupt_every: 0,
             store_dir: None,
@@ -337,6 +342,7 @@ impl Cli {
             "store-sync" => options.store_sync = Self::latency(value)?,
             "store-iops" => options.store_iops = Self::count(value)?,
             "store-queue-depth" => options.store_queue_depth = Self::count(value)?.max(1) as usize,
+            "store-write-depth" => options.store_write_depth = Self::count(value)?.max(1) as usize,
             "store-fault-every" => options.store_fault_every = Self::count(value)? as u32,
             "store-corrupt-every" => options.store_corrupt_every = Self::count(value)? as u32,
             // Leaked on purpose: `Options` is `Copy` so a run can be repeated and swept without cloning, and

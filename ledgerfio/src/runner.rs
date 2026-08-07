@@ -144,6 +144,7 @@ impl Runner {
                     .as_nanos() as u64,
                     iops: options.store_iops,
                     queue_depth: options.store_queue_depth,
+                    write_queue_depth: options.store_write_depth,
                     fault_every: options.store_fault_every,
                     corrupt_every: options.store_corrupt_every,
                 },

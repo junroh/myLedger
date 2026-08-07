@@ -389,8 +389,12 @@ pub struct MemoryPending {
     applies_sent: u64,
     /// What the store is holding, published by the worker because the store lives on its thread.
     occupancy: Arc<Occupancy>,
-    /// Blocks the volume's read cache was given. Fixed at start-up, so it is a number rather than a gauge.
+    /// Block buffers the volume took at start-up and holds for the life of the node: the read cache, and
+    /// the queues' own, one per slot they may hold. Fixed, so they are numbers rather than gauges — and
+    /// reported for the same reason everything else is, that an absent line reads as a free one.
     read_cache_blocks: usize,
+    lane_blocks: usize,
+    read_pool_blocks: usize,
     /// A test's hold on the replies — see `AnswerGate`. Open unless somebody closed it.
     replies: AnswerGate,
     _thread: WorkerThread,
@@ -732,8 +736,21 @@ impl MemoryPending {
         // question: dropping the backing here is what says the blocks' store is this dump's store too.
         let dumps = snapshots.is_some();
         let apart = snapshots.filter(|backing| !backing.same_volume(&blocks));
-        let queue_depth = config.store.queue_depth.max(1);
+        let depths = config.store.depths();
         let share = config.snapshot_queue_share();
+        // Read before the backing is moved into the thread: what the queues will take is a property of
+        // what was asked for, and after this it belongs to a store on the other side of a boundary.
+        let (lane_blocks, pool_blocks) = match &blocks {
+            OpenBacking::Files {
+                read_threads,
+                write_lane,
+                ..
+            } => (
+                if *write_lane { depths.write } else { 0 },
+                if *read_threads > 0 { depths.read } else { 0 },
+            ),
+            OpenBacking::Memory => (0, 0),
+        };
         let thread = WorkerThread::spawn("pending", move |shutdown| {
             PendingWorker {
                 commands: command_rx,
@@ -756,7 +773,7 @@ impl MemoryPending {
                 // other direction. A snapshot on the modelled device is what declaring one volume gets.
                 snapshots: dumps.then(|| {
                     Snapshots::new(
-                        apart.map(|backing| backing.open(queue_depth)),
+                        apart.map(|backing| backing.open(depths)),
                         config.snapshot,
                         share,
                     )
@@ -797,6 +814,8 @@ impl MemoryPending {
             applies_sent: 0,
             occupancy,
             read_cache_blocks: config.read_cache_blocks,
+            lane_blocks,
+            read_pool_blocks: pool_blocks,
             replies,
             _thread: thread,
         })
@@ -887,13 +906,16 @@ impl MemoryPending {
         // Taken at start-up whether or not it is used, so entries and peak are the same number. No
         // capacity is passed: a fixed allocation is not a ceiling something reached, and reporting it as
         // one would put it in the list of things a run should worry about.
-        footprint.other(
-            "volume read cache",
-            self.read_cache_blocks,
-            self.read_cache_blocks,
-            0,
-            self.read_cache_blocks * BLOCK_BYTES,
-        );
+        for (name, blocks) in [
+            ("volume read cache", self.read_cache_blocks),
+            ("volume write lane", self.lane_blocks),
+            ("volume read pool", self.read_pool_blocks),
+        ] {
+            if blocks == 0 {
+                continue;
+            }
+            footprint.other(name, blocks, blocks, 0, blocks * BLOCK_BYTES);
+        }
         for part in self.overlay.footprint().parts() {
             footprint.other(
                 part.name,

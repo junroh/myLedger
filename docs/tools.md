@@ -189,6 +189,10 @@ decides what the prediction is worth:
   it runs*, and a deployment multiplies by its own cadence. Read the median at `--rate 1m` and the throughput
   at `--rate 0` — a saturated run has no median left to move, and a rate-limited one has no throughput left
   to lose.
+- **The two queues have two depths, because the arithmetic differs.** `--store-queue-depth` is the reads'
+  and `--store-write-depth` is the lane's; every depth number recorded in these documents is a read-side
+  one. Neither grows at run time: a full queue is how a device slower than the ledger becomes backpressure,
+  and the volume line's peak and refusal counts are how a number that is too small or too large shows.
 - **The read queue's depth is a flag, and it bounds what a slow read can hide behind.**
   `--store-queue-depth` (128) is how many reads the store holds at once; past it reads are refused and the
   engine keeps the command. At 40,000 store reads a second, 5ms reads need about two hundred outstanding — at

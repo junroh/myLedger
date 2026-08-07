@@ -895,7 +895,15 @@ pub struct StoreModel {
     /// by holding the thread, which is a rate of its own and needs no second gate.
     pub iops: u64,
     /// Reads it will hold at once. Past this the engine keeps the command and asks again.
+    ///
+    /// Reads only, and that is the point of there being two: the depth a read side wants is Little's law
+    /// on the read rate — reads a second times the latency of one — and the depth a write side wants is
+    /// the block seal rate against one ordered thread. Two arithmetics, and one number could only be
+    /// right for one of them.
     pub queue_depth: usize,
+    /// Writes and barriers the lane will hold at once. Past this the caller keeps the block and offers it
+    /// again, which is how a device slower than the ledger becomes backpressure rather than memory.
+    pub write_queue_depth: usize,
     /// Fail every nth call the store is given, as a device would. A fault, and the only reason this exists:
     /// the reaction to a store that will not do as it is told is rule 19's seal, and a seal nothing can
     /// produce is a seal nothing has tested.
@@ -964,7 +972,7 @@ impl OpenBacking {
     }
 
     /// The store this backing is, with no device modelled in front of it.
-    pub fn open(self, queue_depth: usize) -> Box<dyn DurableStore> {
+    pub fn open(self, depths: QueueDepths) -> Box<dyn DurableStore> {
         match self {
             Self::Memory => Box::new(MemoryStore::default()),
             Self::Files {
@@ -975,7 +983,7 @@ impl OpenBacking {
             } => Box::new(crate::files::FileStore::new(
                 dir,
                 path,
-                queue_depth,
+                depths,
                 read_threads,
                 write_lane,
             )),
@@ -983,9 +991,26 @@ impl OpenBacking {
     }
 }
 
+/// How deep each of a volume's two queues may go. Grouped because they are one property of one device
+/// asked in two different arithmetics (rule 11), and passed together so a caller cannot set one and
+/// forget the other.
+#[derive(Debug, Clone, Copy)]
+pub struct QueueDepths {
+    pub read: usize,
+    pub write: usize,
+}
+
 impl StoreModel {
+    /// The two depths, each at least one.
+    pub fn depths(&self) -> QueueDepths {
+        QueueDepths {
+            read: self.queue_depth.max(1),
+            write: self.write_queue_depth.max(1),
+        }
+    }
+
     pub fn build(&self, backing: OpenBacking, seed: u64) -> Box<dyn DurableStore> {
-        let exact = backing.open(self.queue_depth.max(1));
+        let exact = backing.open(self.depths());
         if self.is_exact() {
             return exact;
         }
@@ -1065,6 +1090,7 @@ pub struct LatencyStore {
     /// Buffers of completions already released, so the steady state allocates nothing.
     spare: Vec<Box<Block>>,
     queue_depth: usize,
+    write_queue_depth: usize,
     /// Device time charged by synchronous calls and not yet handed to whoever has a clock.
     charged_nanos: u64,
     /// Writes and barriers this model refused, waiting to be answered as failed completions. A queue rather
@@ -1091,6 +1117,7 @@ pub struct LatencyStore {
 impl LatencyStore {
     pub fn new(inner: Box<dyn DurableStore>, model: StoreModel, seed: u64) -> Self {
         let queue_depth = model.queue_depth.max(1);
+        let write_queue_depth = model.write_queue_depth.max(1);
         Self {
             inner,
             device: Server::new(model.read_base_nanos, model.read_tail_nanos, model.iops),
@@ -1111,6 +1138,7 @@ impl LatencyStore {
             completed: Vec::with_capacity(queue_depth),
             spare: Vec::new(),
             queue_depth,
+            write_queue_depth,
             charged_nanos: 0,
             refused: VecDeque::new(),
             write_due: VecDeque::new(),
@@ -1166,7 +1194,7 @@ impl LatencyStore {
             }
             return submit(self.inner.as_mut(), handle, now);
         }
-        if self.writes_queued() >= self.queue_depth {
+        if self.writes_queued() >= self.write_queue_depth {
             self.invented.writes_refused += 1;
             return false;
         }
@@ -1221,7 +1249,7 @@ impl DurableStore for LatencyStore {
                 .inner
                 .submit_write(handle, object, offset, block, creating, now);
         }
-        if self.writes_queued() >= self.queue_depth {
+        if self.writes_queued() >= self.write_queue_depth {
             self.invented.writes_refused += 1;
             return false;
         }
@@ -1250,7 +1278,7 @@ impl DurableStore for LatencyStore {
             }
             return self.inner.submit_barrier(handle, now);
         }
-        if self.writes_queued() >= self.queue_depth {
+        if self.writes_queued() >= self.write_queue_depth {
             self.invented.writes_refused += 1;
             return false;
         }

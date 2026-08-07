@@ -171,7 +171,10 @@ fn print_help() {
         "  --store-iops <n>            (0) reads a second that store can serve, 0 for no ceiling"
     );
     println!(
-        "  --store-queue-depth <n>     (128) reads the store holds at once; past it reads are refused"
+        "  --store-queue-depth <n>     (128) reads the volume holds at once; past it reads are refused"
+    );
+    println!(
+        "  --store-write-depth <n>     (128) writes and barriers its lane holds; its own arithmetic"
     );
     println!(
         "  --store-fault-every <n>     (0) refuse every nth store call, so the seal is exercised"

@@ -9,7 +9,7 @@ use std::thread::{JoinHandle, Thread};
 use ledger_base::{channel, Consumer, Producer};
 
 use crate::block::{
-    Block, DurableStore, ObjectId, StoreFault, VolumeStats, BLOCK_BYTES, OBJECT_VALUES,
+    Block, DurableStore, ObjectId, QueueDepths, StoreFault, VolumeStats, BLOCK_BYTES, OBJECT_VALUES,
 };
 
 /// The snapshot a restart reads, and the one being written. Two names because the replacement is a rename
@@ -501,6 +501,7 @@ pub struct FileStore {
     /// `read_at` could never become one.
     pool: Option<ReadPool>,
     queue_depth: usize,
+    write_depth: usize,
     /// Writes and barriers taken and not yet collected, when there is no lane. Bounded by `queue_depth`,
     /// which is what turns a backing that cannot keep up into backpressure rather than a queue that grows
     /// (rule 12).
@@ -520,14 +521,15 @@ impl FileStore {
     pub fn new(
         dir: File,
         path: PathBuf,
-        queue_depth: usize,
+        depths: QueueDepths,
         read_threads: usize,
         write_lane: bool,
     ) -> Self {
-        let queue_depth = queue_depth.max(1);
+        let queue_depth = depths.read.max(1);
+        let write_depth = depths.write.max(1);
         let lane = write_lane.then(|| {
             let owned = File::open(&path).expect("the directory this store was opened on");
-            WriteLane::new(owned, path.clone(), queue_depth)
+            WriteLane::new(owned, path.clone(), write_depth)
         });
         Self {
             dir,
@@ -538,6 +540,7 @@ impl FileStore {
             submitted: VecDeque::new(),
             pool: (read_threads > 0).then(|| ReadPool::new(read_threads, queue_depth)),
             queue_depth,
+            write_depth,
             written: VecDeque::new(),
             lane,
             stats: VolumeStats::default(),
@@ -710,7 +713,7 @@ impl DurableStore for FileStore {
             }
             return taken;
         }
-        if self.written.len() >= self.queue_depth {
+        if self.written.len() >= self.write_depth {
             self.stats.writes_refused += 1;
             return false;
         }
@@ -734,7 +737,7 @@ impl DurableStore for FileStore {
             }
             return taken;
         }
-        if self.written.len() >= self.queue_depth {
+        if self.written.len() >= self.write_depth {
             self.stats.writes_refused += 1;
             return false;
         }
@@ -844,7 +847,7 @@ impl DurableStore for FileStore {
         if let Some(lane) = self.lane.as_mut() {
             return lane.submit(handle, LaneOp::Remove(object), None);
         }
-        if self.written.len() >= self.queue_depth {
+        if self.written.len() >= self.write_depth {
             self.stats.writes_refused += 1;
             return false;
         }
@@ -870,7 +873,7 @@ impl DurableStore for FileStore {
         if let Some(lane) = self.lane.as_mut() {
             return lane.submit(handle, LaneOp::Rename(from, to), None);
         }
-        if self.written.len() >= self.queue_depth {
+        if self.written.len() >= self.write_depth {
             self.stats.writes_refused += 1;
             return false;
         }
@@ -946,7 +949,16 @@ mod tests {
 
         fn store_lane(&self, read_threads: usize, write_lane: bool) -> Box<FileStore> {
             let (dir, path) = open_directory(&self.0).expect("the scratch directory opens");
-            Box::new(FileStore::new(dir, path, 32, read_threads, write_lane))
+            Box::new(FileStore::new(
+                dir,
+                path,
+                QueueDepths {
+                    read: 32,
+                    write: 32,
+                },
+                read_threads,
+                write_lane,
+            ))
         }
 
         fn files(&self) -> Vec<String> {

@@ -555,7 +555,16 @@ mod tests {
         fn volume(&self, at: &str) -> Box<dyn DurableStore> {
             let (dir, path) = crate::files::open_directory(&self.0.join(at))
                 .expect("the scratch directory opens");
-            Box::new(crate::files::FileStore::new(dir, path, 32, 0, false))
+            Box::new(crate::files::FileStore::new(
+                dir,
+                path,
+                crate::block::QueueDepths {
+                    read: 32,
+                    write: 32,
+                },
+                0,
+                false,
+            ))
         }
 
         /// Snapshots and blocks on volumes of their own, which is what two directories mean until a

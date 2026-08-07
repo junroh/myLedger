@@ -815,7 +815,16 @@ unanswered, and **when that default stops being safe**. The source design's own 
   because a deferral recorded only where the work was is one nobody finds again.
 
 - **What queue depth should the store hold, and who says so?**
-  *Default:* 128, and it is now a flag (`--store-queue-depth`) rather than a constant. It is enough until a
+  *Default:* 128 each, and they are two flags now rather than one: `--store-queue-depth` for the reads and
+  `--store-write-depth` for the lane. **One number could only ever be right for one of them** — a read side
+  wants Little's law on the read rate, reads a second times the latency of one, and a write side wants the
+  block seal rate against a single ordered thread. Every depth figure recorded here is a read-side one,
+  which is why that flag kept its name and its meaning.
+  *Neither is variable at run time and neither should be.* A full queue is the signal that the device is
+  sustainably slower than the ledger produces; growing it hides that until the memory runs out, which is
+  rule 12's failure with the signal removed. What the volume line now prints — the peak each queue reached
+  and the refusals against it — is how a declared number is found to be wrong in either direction.
+  *(The rest of this entry is the original, and its numbers are read-side.)* 128 It is enough until a
   read is slow, and then it is the whole answer: at 40,000 store reads a second against a real filesystem,
   128 gives p99 93.7ms and 2048 gives p99 5.4ms. The same thing happened against the modelled store, where a
   `--store-read 5000` run reported p50 212ms at 128 and p99.9 9.7ms at 512.
