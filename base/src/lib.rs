@@ -17,6 +17,7 @@ mod pool;
 mod prng;
 mod protocol;
 mod signals;
+mod sizing;
 #[allow(unsafe_code)]
 mod spsc;
 mod time;
@@ -36,6 +37,7 @@ pub use pool::BufferPool;
 pub use prng::Prng;
 pub use protocol::{Ack, AckOutcome, Request};
 pub use signals::Signals;
+pub use sizing::{bucket_bytes, buckets_for, parts_are_sound, SizedPart, Unit};
 pub use spsc::{channel, Consumer, Producer, StagedProducer};
 pub use time::{Clock, ManualClock, SystemClock};
 pub use transfer::{Transfer, TransferFlags, TransferKind};

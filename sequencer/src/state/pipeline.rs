@@ -124,6 +124,10 @@ struct Answer {
     expects_applies: u64,
 }
 
+/// One slot carries all three of the pool's parallel arrays, so its cost is their sum rather than the
+/// work item alone — which is the number a reader guesses and gets 44% low.
+pub const SLOT_BYTES: usize = size_of::<WorkItem>() + size_of::<Answer>() + size_of::<SlotId>();
+
 impl SlotPool {
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -189,9 +193,7 @@ impl SlotPool {
     /// The pool and its free list are one allocation as far as sizing goes: the list exists to hand
     /// out the slots, so a peak on it would just be the pool's peak upside down.
     fn footprint(&self, footprint: &mut Footprint) {
-        let bytes = self.items.capacity() * size_of::<WorkItem>()
-            + self.records.capacity() * size_of::<Answer>()
-            + self.free.capacity() * size_of::<SlotId>();
+        let bytes = self.items.capacity() * SLOT_BYTES;
         footprint.other(
             "work slots",
             self.in_flight(),

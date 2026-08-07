@@ -33,6 +33,9 @@ pub struct LaneState {
 
 ledger_base::layout_claim!(LAYOUT: LaneState, size = 32, ledger_base::LineFit::Inside);
 
+/// One lane per account, and nothing else per account here.
+pub const LANE_BYTES: usize = size_of::<LaneState>();
+
 impl LaneState {
     /// Capped so the counter cannot wrap and under-report, which would break lane ordering.
     pub const MAX_PENDING_REPLIES: u16 = u16::MAX;
@@ -141,7 +144,7 @@ impl LaneTable {
             live,
             live,
             0,
-            self.lanes.capacity() * size_of::<LaneState>(),
+            self.lanes.capacity() * LANE_BYTES,
         );
     }
 }

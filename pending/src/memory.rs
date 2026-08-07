@@ -16,8 +16,7 @@ use ledger_base::{
 use ledger_stubkit::{AnswerGate, IdleBackoff, LatencyRange, WorkerThread};
 
 use crate::block::{
-    LogTraffic, OpenBacking, RecordAddr, StoreModel, VolumeStats, BLOCK_BYTES, RECORDS_PER_BLOCK,
-    SEGMENTS,
+    LogTraffic, OpenBacking, StoreModel, VolumeStats, BLOCK_BYTES, RECORDS_PER_BLOCK, SEGMENTS,
 };
 use crate::cache::Cached;
 use crate::engine::{BudgetState, PendingEngine, Started};
@@ -870,7 +869,20 @@ impl MemoryPending {
         // The index is what a hold costs in memory; the record itself lives on a block, and the blocks
         // are where the store's own size is. Both are memory today — the disk tier is not built — so
         // neither figure is a disk figure.
-        footprint.gauged_table::<TxId, RecordAddr>("engine index", &self.occupancy.holds);
+        // **Not `gauged_table`, and it was for a year.** The index is a cuckoo table, not a hashbrown
+        // one: it allocates the slots it was told to and nothing more — no rounding to a power of two,
+        // no control byte. Priced as a hash table it read 138MB where it holds 17, because the helper
+        // was given a slot count and treated it as a hashbrown capacity. Both numbers looked plausible,
+        // which is why nothing caught it. The structure prices itself now (`SLOT_BYTES`), and the
+        // index asserts that a bucket is still exactly its slots.
+        let slots = self.occupancy.holds.capacity();
+        footprint.other(
+            "engine index",
+            self.occupancy.holds.entries(),
+            self.occupancy.holds.peak(),
+            slots,
+            slots * SLOT_BYTES,
+        );
         footprint.gauged_table::<BudgetGroup, BudgetState>(
             "engine budget groups",
             &self.occupancy.budgets,

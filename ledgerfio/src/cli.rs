@@ -238,7 +238,12 @@ pub enum Command {
         knob: String,
         values: Vec<String>,
     },
-    Layout,
+    /// The layout claims and the sizing units. `json` is for a consumer rather than a reader — a
+    /// sizing model that hard-codes these numbers goes wrong silently when a struct changes, so the
+    /// numbers are published rather than remembered.
+    Layout {
+        json: bool,
+    },
     Help,
 }
 
@@ -255,7 +260,10 @@ impl Cli {
         let mut args = self.args.into_iter();
         let command = args.next().unwrap_or_else(|| "help".to_owned());
         match command.as_str() {
-            "layout" => Ok(Command::Layout),
+            "layout" => {
+                let json = args.any(|arg| arg == "--json");
+                Ok(Command::Layout { json })
+            }
             "help" | "-h" | "--help" => Ok(Command::Help),
             "run" => Self::parse_run(args.collect()),
             other => Err(format!("unknown command `{other}`")),

@@ -125,6 +125,15 @@ struct Bucket {
 
 ledger_base::layout_claim!(BUCKET_LAYOUT: Bucket, size = 32, LineFit::Inside);
 
+/// A bucket is exactly its slots, so what the table costs can be worked out from the number a load
+/// factor is already measured against. Asserted rather than assumed: an alignment change or a field
+/// beside `slots` would make the two disagree, and the reader that noticed would be a sizing answer
+/// nobody checks.
+const _: () = assert!(
+    core::mem::size_of::<Bucket>() == WAYS * SLOT_BYTES,
+    "a bucket is no longer four slots and nothing else, so slots no longer price the table"
+);
+
 /// Where each hold is, by transaction id: a bucketed cuckoo index over record addresses. It answers
 /// *where*, never *what*, and it answers without reading anything.
 pub struct HoldTable {

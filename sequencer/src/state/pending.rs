@@ -6,6 +6,9 @@ use ledger_base::ports::{
 };
 use ledger_base::{Amount, Footprint, Peak, TxId};
 
+/// One committed decision waiting to be handed to the engine.
+pub const PENDING_EFFECT_BYTES: usize = std::mem::size_of::<PendingEffect>();
+
 /// The sequencer's end of the pending path: the port plus the committed decisions that have
 /// not been handed over yet. Both live together because the ordering rule ties them: a queued
 /// write must reach the store before any later lookup, or the lookup could still see a hold

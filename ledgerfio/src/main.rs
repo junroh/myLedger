@@ -7,6 +7,7 @@ mod runner;
 mod workload;
 
 use cli::{Cli, Command};
+use ledger_pending::{BLOCK_BYTES, RECORDS_PER_BLOCK};
 use report::RunReport;
 use runner::Runner;
 use workload::WorkloadKind;
@@ -16,7 +17,7 @@ fn main() {
     match Cli::new(args).parse() {
         Ok(Command::Run(options)) => run_workload(options),
         Ok(Command::Sweep { base, knob, values }) => sweep(base, &knob, &values),
-        Ok(Command::Layout) => print_layout(),
+        Ok(Command::Layout { json }) => print_layout(json),
         Ok(Command::Help) => print_help(),
         Err(err) => {
             eprintln!("ledgerfio: {err}");
@@ -91,7 +92,26 @@ fn interrupted() -> bool {
     ledger_base::Signals::requested()
 }
 
-fn print_layout() {
+/// Every crate's sizing units, in the order a reader meets them. Gathered here for the same reason
+/// `HOT_TYPES` is: each crate declares what it owns, and the tool is what puts them side by side.
+fn sizing() -> Vec<(&'static str, &'static ledger_base::SizedPart)> {
+    [
+        ("sequencer", ledger_sequencer::SIZING),
+        ("accounts", ledger_account::SIZING),
+        ("idem", ledger_idempotency::SIZING),
+        ("pending", ledger_pending::SIZING),
+        ("consensus", ledger_raft::SIZING),
+    ]
+    .into_iter()
+    .flat_map(|(owner, parts)| parts.iter().map(move |part| (owner, part)))
+    .collect()
+}
+
+fn print_layout(json: bool) {
+    if json {
+        print_sizing_json();
+        return;
+    }
     // Per-line packing is printed for both line sizes the claims are checked against: it is the same
     // struct either way, but not the same number of misses.
     println!(
@@ -118,6 +138,50 @@ fn print_layout() {
         ledger_base::CACHE_LINE,
         ledger_base::SUPPORTED_LINES
     );
+    println!();
+    println!(
+        "{:<28} {:<10} {:>10}  unit",
+        "sizing part", "owner", "bytes/unit"
+    );
+    for (owner, part) in sizing() {
+        println!(
+            "{:<28} {:<10} {:>10}  {}",
+            part.name,
+            owner,
+            part.bytes,
+            part.unit.name()
+        );
+    }
+    println!(
+        "a bucket count is next_pow2(entries * 8 / 7), so a hash table's cost is a staircase; \
+         {RECORDS_PER_BLOCK} records fit a {BLOCK_BYTES}B block"
+    );
+}
+
+/// The same table as a document, for a sizing model that would otherwise hard-code these numbers and
+/// go quietly wrong when a struct changes. `bucket_rule` and `records_per_block` are here because a
+/// consumer cannot derive them from a unit cost, and getting either wrong is a whole factor rather
+/// than a rounding.
+fn print_sizing_json() {
+    let parts: Vec<serde_json::Value> = sizing()
+        .into_iter()
+        .map(|(owner, part)| {
+            serde_json::json!({
+                "name": part.name,
+                "owner": owner,
+                "unit": part.unit.name(),
+                "bytes": part.bytes,
+            })
+        })
+        .collect();
+    let document = serde_json::json!({
+        "cache_line": ledger_base::CACHE_LINE,
+        "bucket_rule": "next_power_of_two(entries * 8 / 7)",
+        "records_per_block": RECORDS_PER_BLOCK,
+        "block_bytes": BLOCK_BYTES,
+        "parts": parts,
+    });
+    println!("{document}");
 }
 
 fn print_help() {

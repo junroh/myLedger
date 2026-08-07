@@ -113,13 +113,14 @@ impl Footprint {
         capacity: usize,
         peak: usize,
     ) {
-        let buckets = Self::buckets(capacity);
         self.parts.push(Part {
             name,
             entries,
             peak_entries: peak,
             capacity,
-            bytes: buckets * (size_of::<(K, V)>() + 1),
+            // The same two rules a `SizedPart` declares, so a prediction and the run it is checked
+            // against cannot disagree about the same structure in the same build.
+            bytes: crate::sizing::buckets_for(capacity) * crate::sizing::bucket_bytes::<K, V>(),
             exact: false,
         });
     }
@@ -160,16 +161,6 @@ impl Footprint {
     /// Whether every part's bytes are exact, so a report can say once whether the total is.
     pub fn exact(&self) -> bool {
         self.parts.iter().all(|part| part.exact)
-    }
-
-    /// `hashbrown`'s capacity-to-buckets rule, which is what decides the allocation.
-    fn buckets(capacity: usize) -> usize {
-        match capacity {
-            0 => 0,
-            1..=3 => 4,
-            4..=7 => 8,
-            capacity => (capacity * 8 / 7).next_power_of_two(),
-        }
     }
 }
 

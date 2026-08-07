@@ -9,6 +9,14 @@ use ledger_base::BufferPool;
 
 use crate::state::pipeline::SlotId;
 
+/// A batch in flight costs this plus one [`SLOT_ID_BYTES`] for each request it will answer, which is
+/// the batch size — so the two are declared apart rather than folded into a per-batch number that
+/// would only be true at one batch size.
+pub const BATCH_BYTES: usize = size_of::<InFlightBatch>();
+pub const SLOT_ID_BYTES: usize = size_of::<SlotId>();
+/// What one judged effect costs, wherever it waits — an open batch here, the log in consensus.
+pub const EFFECT_BYTES: usize = size_of::<Effect>();
+
 pub struct InFlightBatch {
     pub batch_id: u64,
     pub slots: Vec<SlotId>,
@@ -94,7 +102,7 @@ impl Batcher {
             self.effects.len(),
             self.open_peak.entries(),
             self.policy.queued,
-            self.open_bytes_peak.entries() * size_of::<Effect>(),
+            self.open_bytes_peak.entries() * EFFECT_BYTES,
         );
         // Each batch in flight carries the slot list it will answer, which comes from the pool.
         let in_flight_slots: usize = self
@@ -109,8 +117,7 @@ impl Batcher {
             // Consensus holding every proposal it may is the intended steady state, not a bound that
             // went wrong, so there is nothing here for a fill ratio to warn about.
             0,
-            self.in_flight.capacity() * size_of::<InFlightBatch>()
-                + in_flight_slots * size_of::<SlotId>(),
+            self.in_flight.capacity() * BATCH_BYTES + in_flight_slots * SLOT_ID_BYTES,
         );
         footprint.other(
             "spare batch buffers",

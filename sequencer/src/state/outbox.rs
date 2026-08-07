@@ -2,6 +2,9 @@ use std::collections::VecDeque;
 
 use ledger_base::{Ack, Footprint, Peak, Producer};
 
+/// One answer the client has not taken.
+pub const ACK_BYTES: usize = std::mem::size_of::<Ack>();
+
 /// Acks the client has not taken yet. The backlog is bounded on purpose: when it fills,
 /// intake pauses so backpressure reaches the client instead of growing memory here.
 pub struct Outbox {

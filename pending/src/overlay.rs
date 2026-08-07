@@ -17,6 +17,11 @@ pub struct HoldOverlay {
     peak: Peak,
 }
 
+/// What one overlay entry costs, priced as the hash table it is. Larger than the index's slot, which
+/// surprises: a live hold costs the index eight bytes and the overlay forty-nine, because the overlay
+/// keeps what was decided about it and the index keeps only where it is.
+pub const ENTRY_BUCKET_BYTES: usize = ledger_base::bucket_bytes::<TxId, Entry>();
+
 enum Entry {
     /// Nothing decided yet. It exists so that an answer on its way, and the pins of the requests
     /// waiting for it, have somewhere to land.

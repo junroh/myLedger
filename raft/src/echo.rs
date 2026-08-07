@@ -38,6 +38,13 @@ impl Default for EchoRaftConfig {
     }
 }
 
+/// One entry the log keeps. It is also what a *durable* log writes per effect, which is the figure a
+/// sizing model needs and the one nothing here bounds: there is no compaction, so the count is the
+/// run's whole volume until a snapshot cuts it.
+pub const LOG_EFFECT_BYTES: usize = size_of::<Effect>();
+/// One proposal outstanding, apart from the effects it carries.
+pub const PROPOSAL_BYTES: usize = size_of::<RaftProposal>();
+
 /// Stand-in for consensus: batches commit in proposal order after a round trip, and the
 /// sequencer never waits for one. Real replication across five nodes is not built yet.
 pub struct EchoRaft {
@@ -113,21 +120,14 @@ impl EchoRaft {
             .lock()
             .map(|log| (log.len(), log.capacity()))
             .unwrap_or_default();
-        footprint.other(
-            "kept log",
-            entries,
-            entries,
-            0,
-            capacity * size_of::<Effect>(),
-        );
+        footprint.other("kept log", entries, entries, 0, capacity * LOG_EFFECT_BYTES);
         let effects = self.inflight.effects.peak();
         footprint.other(
             "proposals in flight",
             self.inflight.proposals.entries(),
             self.inflight.proposals.peak(),
             0,
-            self.inflight.proposals.capacity() * size_of::<RaftProposal>()
-                + effects * size_of::<Effect>(),
+            self.inflight.proposals.capacity() * PROPOSAL_BYTES + effects * LOG_EFFECT_BYTES,
         );
         footprint
     }

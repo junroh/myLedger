@@ -54,3 +54,66 @@ const _: () = assert!(
     ledger_base::layouts_are_sound(HOT_TYPES),
     "a watched type broke its layout contract"
 );
+
+/// What the pending engine charges per unit. The longest list, because this is the component whose
+/// size a rate and a retention actually decide.
+///
+/// **Three units and they are not interchangeable.** A slot is linear — the index allocates what it was
+/// told and nothing more. A bucket is a staircase — a hash table rounds up to a power of two, so one
+/// percent more entries can double it. A block is 4KB whether or not the records in it are live.
+///
+/// One part is disk rather than memory and its unit says so: `pending record` is what a hold costs in a
+/// segment file, and it is the only entry here with no counterpart in `MemoryPending::footprint`. It
+/// belongs in the list anyway — a sizing answer that reported memory and left the disk to a second
+/// source is how the two drift apart.
+pub const SIZING: &[ledger_base::SizedPart] = &[
+    ledger_base::SizedPart::new("engine index", ledger_base::Unit::Slot, index::SLOT_BYTES),
+    ledger_base::SizedPart::table::<ledger_base::BudgetGroup, engine::BudgetState>(
+        "engine budget groups",
+    ),
+    ledger_base::SizedPart::new(
+        "overlay entries",
+        ledger_base::Unit::Bucket,
+        overlay::ENTRY_BUCKET_BYTES,
+    ),
+    ledger_base::SizedPart::new(
+        "engine writeback buffer",
+        ledger_base::Unit::Block,
+        block::BLOCK_BYTES,
+    ),
+    ledger_base::SizedPart::new(
+        "engine resident blocks",
+        ledger_base::Unit::Block,
+        block::BLOCK_BYTES,
+    ),
+    ledger_base::SizedPart::new(
+        "engine record blocks",
+        ledger_base::Unit::Block,
+        block::BLOCK_BYTES,
+    ),
+    ledger_base::SizedPart::new(
+        "volume read cache",
+        ledger_base::Unit::Block,
+        block::BLOCK_BYTES,
+    ),
+    ledger_base::SizedPart::new(
+        "volume write lane",
+        ledger_base::Unit::Block,
+        block::BLOCK_BYTES,
+    ),
+    ledger_base::SizedPart::new(
+        "volume read pool",
+        ledger_base::Unit::Block,
+        block::BLOCK_BYTES,
+    ),
+    ledger_base::SizedPart::new(
+        "pending record",
+        ledger_base::Unit::Record,
+        block::RECORD_BYTES,
+    ),
+];
+
+const _: () = assert!(
+    ledger_base::parts_are_sound(SIZING),
+    "two parts share a name, or one is free"
+);

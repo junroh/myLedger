@@ -3,6 +3,10 @@ use std::mem::size_of;
 
 use ledger_base::{AccountId, AcctHandle, Effect, Footprint, FxHashMap, LedgerError};
 
+/// What one account costs outside the index: its record and the id kept beside it, which is the pair
+/// the two parallel arrays hold.
+pub const ACCOUNT_BYTES: usize = size_of::<AccountRecord>() + size_of::<AccountId>();
+
 /// In-memory tier of the account component. Every account is resident in DRAM because the
 /// judge reads it inline; durability is this component's own concern (checkpoint plus log
 /// replay), not something the sequencer waits for. The disk tier is not built yet.
@@ -55,8 +59,7 @@ impl MemoryAccounts {
             live,
             live,
             0,
-            self.records.capacity() * size_of::<AccountRecord>()
-                + self.ids.capacity() * size_of::<AccountId>(),
+            self.records.capacity() * ACCOUNT_BYTES,
         );
         let mut index = Footprint::new();
         index.hash_table::<AccountId, AcctHandle>(
