@@ -187,9 +187,12 @@ fail. `MemoryStore` backs it today and `LatencyStore` prices a device in front o
 
 What it unblocks, and what each is worth now:
 
-- **`SE-OQ-4`**, the read backend — io_uring against a thread pool — is a choice between implementations of
-  `submit` and `poll`, and `FileStore` is the baseline both would be measured against: it reads synchronously
-  inside `poll`, so nothing overlaps and any answer improves on it.
+- **`SE-OQ-4`**, the read backend, has its portable third: `FileStore` reads on N threads
+  (`--store-read-threads`), each with its own SPSC pair, and zero threads is the synchronous baseline. What it
+  does *not* have is a reason to be turned on here — measured, the pool costs a third of the read ceiling and
+  buys nothing, because without `O_DIRECT` every read is a page-cache hit and there is nothing to overlap. So
+  the default is zero rather than the design's sixteen, and the arithmetic for a deployment is in §16. io_uring
+  and libaio are the same two methods again, and the trait arrives with the second implementation.
 - **`SE-OQ-6`**, the `≤5ms` worst case, has its tooling and not its answer. Against the model: 5ms reads
   sustain 100k tx/s at p99.9 9.7ms with a queue depth of 512. Against a real filesystem at 40,000 store reads
   a second: p99 5.4ms and p99.9 6.1ms at depth 2048, against p99 93.7ms at 128 — **twice now a "the device is
@@ -505,6 +508,16 @@ unanswered, and **when that default stops being safe**. The source design's own 
   *Stops being safe:* whenever a client's correctness depends on distinguishing "expired" from "never
   existed". It needs a push channel the ledger does not have, so this is a protocol decision, not an
   engine one.
+
+- **How many threads should issue the store's reads in a deployment?**
+  *Default:* none. Reads happen synchronously inside `poll`, which overlaps nothing, and that is the measured
+  best answer on this machine: with the page cache in front of the files a pool costs a third of the read
+  ceiling. The design says sixteen, from Little's law at half a millisecond a read.
+  *Stops being safe:* the moment `O_DIRECT` is in play, because then every store read is a device read and a
+  synchronous one serialises them into a single round's worth. The arithmetic is not in doubt — reads a second
+  times the latency of one — what is missing is the latency, which needs the device. It is a flag rather than a
+  derivation because `PendingCapacity` declares arrivals and survivor shares but not the *miss* rate, which is
+  what turns a lookup rate into a store read rate.
 
 - **Which of the design's storage questions are still untouched, and is that acceptable?**
   *Default:* three of the five have moved and two have not. `SE-OQ-4` (io_uring against a thread pool) is now

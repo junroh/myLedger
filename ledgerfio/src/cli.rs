@@ -99,6 +99,15 @@ pub struct Options {
     /// A directory to put the engine's segment files in. Unset is memory, which is what every number in this
     /// repository was taken against — a run that names a directory is measuring a filesystem as well.
     pub store_dir: Option<&'static str>,
+    /// Threads issuing the store's `pread`s when `--store-dir` is set. Zero reads synchronously inside `poll`,
+    /// which overlaps nothing.
+    ///
+    /// **Zero by default, which is not the design's sixteen, and the difference is a page cache.** A pool pays
+    /// for itself only where a read blocks; measured here it costs a third of the read ceiling and buys
+    /// nothing, because without `O_DIRECT` every read is a cache hit and there is nothing to overlap. A
+    /// deployment that bypasses the cache has to set it, and the arithmetic is Little's law on the *store
+    /// read* rate: threads ≈ reads a second × the latency of one. Design notes §16.
+    pub store_read_threads: usize,
     /// Holds the engine's overlay may keep before idle ones are evicted. Small enough and a resolution
     /// has to ask the engine, which is the only way a run reaches the fetch path at all.
     pub overlay_limit: usize,
@@ -164,6 +173,7 @@ impl Default for Options {
             store_fault_every: 0,
             store_corrupt_every: 0,
             store_dir: None,
+            store_read_threads: 0,
             overlay_limit: 1 << 20,
             idem_latency: LatencyRange::new(Duration::from_micros(1), Duration::from_micros(5)),
             violate_order_every: 0,
@@ -305,6 +315,7 @@ impl Cli {
             // Leaked on purpose: `Options` is `Copy` so a run can be repeated and swept without cloning, and
             // one path per process is not a leak worth a lifetime parameter for.
             "store-dir" => options.store_dir = Some(Box::leak(value.to_owned().into_boxed_str())),
+            "store-read-threads" => options.store_read_threads = Self::count(value)? as usize,
             "overlay-limit" => options.overlay_limit = Self::count(value)? as usize,
             "idem-latency" => options.idem_latency = Self::latency(value)?,
             "violate-order-every" => options.violate_order_every = Self::count(value)? as u32,

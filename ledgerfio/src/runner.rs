@@ -147,10 +147,13 @@ impl Runner {
             calendar.source(),
             match options.store_dir {
                 None => OpenBacking::Memory,
-                Some(dir) => OpenBacking::files(std::path::Path::new(dir)).unwrap_or_else(|_| {
-                    eprintln!("ledgerfio: --store-dir {dir} cannot be opened");
-                    std::process::exit(2);
-                }),
+                Some(dir) => {
+                    OpenBacking::files(std::path::Path::new(dir), options.store_read_threads)
+                        .unwrap_or_else(|_| {
+                            eprintln!("ledgerfio: --store-dir {dir} cannot be opened");
+                            std::process::exit(2);
+                        })
+                }
             },
         )
         .unwrap_or_else(|err| {

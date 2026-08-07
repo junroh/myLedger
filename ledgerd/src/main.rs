@@ -10,6 +10,12 @@ use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_service::{ClientEndpoint, LedgerService, ServiceConfig};
 
 const DEFAULT_ACCOUNTS: u64 = 1_000;
+/// Threads issuing the store's `pread`s. Zero reads synchronously, which is what is verified: a pool pays for
+/// itself only where a read blocks, and without `O_DIRECT` every read is a page-cache hit — measured, it costs
+/// a third of the read ceiling and buys nothing. A deployment that bypasses the cache sets this from Little's
+/// law on the store read rate; design notes §16 has the numbers and why the design's sixteen is not the
+/// default here.
+const READ_THREADS: usize = 0;
 const EXTERNAL: AccountId = AccountId(1);
 const FIRST_ACCOUNT: u64 = 1_000;
 const LEDGER: u32 = 1;
@@ -73,10 +79,12 @@ fn serve(_endpoint: ClientEndpoint) {
 fn start_pending() -> MemoryPending {
     let backing = match flag("--store-dir") {
         None => OpenBacking::Memory,
-        Some(dir) => OpenBacking::files(std::path::Path::new(&dir)).unwrap_or_else(|err| {
-            eprintln!("ledgerd: --store-dir {dir} cannot be opened ({err:?})");
-            std::process::exit(2);
-        }),
+        Some(dir) => {
+            OpenBacking::files(std::path::Path::new(&dir), READ_THREADS).unwrap_or_else(|err| {
+                eprintln!("ledgerd: --store-dir {dir} cannot be opened ({err:?})");
+                std::process::exit(2);
+            })
+        }
     };
     MemoryPending::start_with_days(
         MemoryPendingConfig::default(),

@@ -2010,6 +2010,54 @@ recycled so the steady state allocates nothing.
 `a_modelled_read_waits_for_the_later_of_the_two_times` checks both directions, the second by nesting two
 models: a free one over a slow one releases when the slow one does, which is the forwarding being exercised.
 
+### The read pool, and why its default is zero rather than the design's sixteen
+
+`SE-OQ-4` names three read backends — io_uring as the mainline, libaio as the alternative, a thread pool as the
+portable fallback — and the fallback is the one this machine can run. `FileStore` has it: N threads, each with
+its own pair of `base`'s SPSC rings, taking `(handle, file, offset, buffer)` and handing back the buffer with
+the result.
+
+**A pair of rings per thread rather than one shared queue**, because `base`'s ring is single-producer
+single-consumer and a queue several threads read is neither. That keeps every queue the one lock-free structure
+here that is measured and tested, and costs a round-robin instead of a lock — nothing knows which thread will
+be free first, and asking would cost more than the imbalance.
+
+**The buffer travels as a `Box`**, so a pointer moves through the ring and not four kilobytes, and it comes back
+down with the next ask, which is what makes the steady state allocation-free. Sharing one slot array between the
+worker and the threads would have been faster still and needs `unsafe`, which rule 7 does not allow here.
+
+**It is inside the backing rather than above it**, and that is io_uring's doing rather than a preference:
+io_uring owns the descriptors and issues its own reads, so a decorator over a synchronous `read_at` could never
+become one. The field is not a trait yet — the design abstracts the backend and this is one implementation, so
+the trait arrives with the second (rule 4).
+
+**Measured, and the answer is that it costs a third of the read ceiling and buys nothing here.**
+
+| `--store-read-threads` | p99 at 100k tx/s | ceiling |
+|---|---|---|
+| 0 (synchronous in `poll`) | 5.43ms | 993k tx/s, 490k reads/s |
+| 16 | 5.71ms | 663k tx/s, 322k reads/s |
+| 64 | 5.74ms | — |
+
+The reason is the page cache. A pool pays for itself where a read *blocks*; without `O_DIRECT` every read is a
+cache hit of a few microseconds, the queue hop and the wakeup cost more than the read, and the threads take CPU
+from the reactor on a machine with four performance cores. So the default is **zero**, which is what is
+verified, and not the design's sixteen — that figure assumes half-millisecond reads, and a deployment which
+bypasses the cache has to set it from Little's law on the *store read* rate: threads ≈ reads a second × the
+latency of one.
+
+**And its value cannot be measured here at all**, which is worth stating rather than leaving as an absence. To
+see a pool help, the reads have to block, and the only slow reads available are modelled — but `LatencyStore`
+sits *outside* `FileStore`, so it holds completions the pool has already produced and the pool's threads never
+block for the modelled time. The composition cannot express "the backing is slow". Same wall as `O_DIRECT`, and
+the same answer: a Linux host.
+
+**One measurement was of my own mistake, and it is the reason the table above has no cliff.** The first version
+parked each idle thread with a fifty-microsecond timeout, so sixty-four idle threads woke twenty thousand times
+a second each — 1.3M wakeups against four cores — and that configuration reported p50 174ms against 1.6ms.
+`park` needs no timeout: `unpark` leaves a token when it arrives first, so a thread about to sleep returns
+immediately instead. With the timeout gone, sixty-four threads are indistinguishable from sixteen.
+
 ### Still unbuilt, and named so it is not read as done
 
 - **Nothing reconciles at startup**, but the worst of it is now refused rather than done. `reclaim` only

@@ -572,15 +572,31 @@ pub enum OpenBacking {
     /// Memory. The exact store, and what every other answer is measured against.
     Memory,
     /// One file per segment, in a directory that has been opened.
-    Files { dir: std::fs::File, path: PathBuf },
+    /// One file per segment, in a directory that has been opened, with `read_threads` threads issuing the
+    /// `pread`s. Zero reads synchronously, which is the baseline the pool is measured against.
+    Files {
+        dir: std::fs::File,
+        path: PathBuf,
+        read_threads: usize,
+    },
 }
 
 impl OpenBacking {
     /// The directory to put a segment's files in, opened and created if it was not there.
-    pub fn files(path: &Path) -> Result<Self, LedgerError> {
+    ///
+    /// `read_threads` follows Little's law on the *store read* rate — the share of lookups that miss both
+    /// memory windows — and not on the lookup rate: threads ≈ reads a second × the latency of one. The
+    /// design's sixteen comes from 0.5ms against tens of thousands a second. A configuration that forces every
+    /// read to miss needs an order more, and sixteen failing to keep up there is the arithmetic holding rather
+    /// than the pool being wrong.
+    pub fn files(path: &Path, read_threads: usize) -> Result<Self, LedgerError> {
         let (dir, path) =
             crate::files::open_directory(path).map_err(|_| LedgerError::ConfigInvalid)?;
-        Ok(Self::Files { dir, path })
+        Ok(Self::Files {
+            dir,
+            path,
+            read_threads,
+        })
     }
 }
 
@@ -588,10 +604,15 @@ impl StoreModel {
     pub fn build(&self, backing: OpenBacking, seed: u64) -> Box<dyn DurableStore> {
         let exact: Box<dyn DurableStore> = match backing {
             OpenBacking::Memory => Box::new(MemoryStore::default()),
-            OpenBacking::Files { dir, path } => Box::new(crate::files::FileStore::new(
+            OpenBacking::Files {
+                dir,
+                path,
+                read_threads,
+            } => Box::new(crate::files::FileStore::new(
                 dir,
                 path,
                 self.queue_depth.max(1),
+                read_threads,
             )),
         };
         if self.is_exact() {

@@ -2,8 +2,194 @@ use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::thread::{JoinHandle, Thread};
+
+use ledger_base::{channel, Consumer, Producer};
 
 use crate::block::{Block, DurableStore, StoreFault, SEGMENT_VALUES};
+
+/// A read handed to a pool thread, and the same buffer handed back with it.
+///
+/// The buffer travels as a `Box`, so what moves through the queue is a pointer and not four kilobytes — and it
+/// comes back down with the next ask, which is what makes the steady state allocation-free. Sharing one slot
+/// array between the worker and the threads instead would need `unsafe`, which rule 7 does not allow here.
+struct Ask {
+    handle: u64,
+    /// Shared rather than borrowed: `read_at` takes `&self`, so a file needs no lock to be read by several
+    /// threads at once, and an `Arc` clone is two atomics against a read that is about to touch a device.
+    file: Arc<File>,
+    offset: u64,
+    buffer: Box<Block>,
+}
+
+struct Done {
+    handle: u64,
+    buffer: Box<Block>,
+    read: Result<usize, ()>,
+}
+
+/// One thread's two queues and the handle to wake it.
+struct Lane {
+    asks: Producer<Ask>,
+    dones: Consumer<Done>,
+    thread: Thread,
+    outstanding: usize,
+}
+
+/// `pread` on N threads: the portable backend of the design's three, and the one this machine can run.
+///
+/// **Why N queue pairs rather than one queue.** `base`'s ring is single-producer single-consumer, and one
+/// shared request queue read by several threads is neither. A pair per thread keeps every queue SPSC — the one
+/// lock-free structure here that is measured and tested — and costs a round-robin instead of a lock. Nothing
+/// knows which thread will be free first, and asking would cost more than the imbalance.
+///
+/// **How many threads.** Little's law on the *store read* rate, which is the share of lookups that miss both
+/// memory windows rather than the lookup rate itself: threads ≈ reads a second × the latency of one. The
+/// design's figures are 0.5ms and a miss rate that leaves tens of thousands a second, which is where its
+/// sixteen comes from. A configuration that forces every read to miss — `--residency 1` with a resolve age —
+/// needs about two hundred at the same latency, and sixteen threads should visibly fail to keep up with it.
+/// That is a check on the arithmetic rather than a problem with the pool.
+struct ReadPool {
+    lanes: Vec<Lane>,
+    next: usize,
+    stop: Arc<AtomicBool>,
+    threads: Vec<JoinHandle<()>>,
+    /// Buffers not currently with a thread. Bounded by the depth the pool was built for.
+    spare: Vec<Box<Block>>,
+}
+
+impl ReadPool {
+    fn new(threads: usize, depth: usize) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut lanes = Vec::with_capacity(threads);
+        let mut handles = Vec::with_capacity(threads);
+        // At least one slot per thread, and the depth spread over them.
+        let per_lane = depth.div_ceil(threads).max(1);
+        for index in 0..threads {
+            let (asks, ask_rx) = channel::<Ask>(per_lane);
+            let (done_tx, dones) = channel::<Done>(per_lane);
+            let stopping = Arc::clone(&stop);
+            let handle = std::thread::Builder::new()
+                .name(format!("pending-read-{index}"))
+                .spawn(move || Self::serve(ask_rx, done_tx, stopping))
+                .expect("a read thread");
+            lanes.push(Lane {
+                asks,
+                dones,
+                thread: handle.thread().clone(),
+                outstanding: 0,
+            });
+            handles.push(handle);
+        }
+        Self {
+            lanes,
+            next: 0,
+            stop,
+            threads: handles,
+            spare: (0..depth.max(1)).map(|_| Block::zeroed()).collect(),
+        }
+    }
+
+    /// One thread: take a read, do it, hand it back. It parks rather than spinning, which is the right thing
+    /// on this side of the queue — a thread about to block in `pread` has no reason to burn a core waiting for
+    /// work, and the *worker* never blocks because `unpark` takes no lock it can contend on.
+    fn serve(asks: Consumer<Ask>, dones: Producer<Done>, stop: Arc<AtomicBool>) {
+        while !stop.load(Ordering::Relaxed) {
+            let Some(mut ask) = asks.pop() else {
+                // Parked with no timeout, and that needs no lost-wakeup guard: `unpark` leaves a token when it
+                // arrives before the `park`, so a thread that was about to sleep returns at once instead. A
+                // timeout here was a self-inflicted cost — every idle thread waking twenty thousand times a
+                // second, which is scheduler churn against the four cores this machine has for the reactor.
+                std::thread::park();
+                continue;
+            };
+            let read = ask
+                .file
+                .read_at(&mut ask.buffer, ask.offset)
+                .map_err(|_| ());
+            let mut done = Done {
+                handle: ask.handle,
+                buffer: ask.buffer,
+                read,
+            };
+            // Cannot overflow — the queues are as deep as the reads outstanding on this lane — but a push
+            // that failed would drop a completion the caller is waiting for, so it is retried rather than
+            // trusted.
+            while let Err(returned) = dones.push(done) {
+                done = returned;
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    fn submit(&mut self, handle: u64, file: Arc<File>, offset: u64) -> bool {
+        let Some(buffer) = self.spare.pop() else {
+            return false;
+        };
+        let lane = self.next % self.lanes.len();
+        self.next = self.next.wrapping_add(1);
+        let ask = Ask {
+            handle,
+            file,
+            offset,
+            buffer,
+        };
+        match self.lanes[lane].asks.push(ask) {
+            Ok(()) => {
+                self.lanes[lane].outstanding += 1;
+                self.lanes[lane].thread.unpark();
+                true
+            }
+            Err(refused) => {
+                self.spare.push(refused.buffer);
+                false
+            }
+        }
+    }
+
+    /// The next completion any thread has finished. Round-robin from where the last one came, so no lane is
+    /// starved by a busier neighbour.
+    fn poll(&mut self, into: &mut Block) -> Option<Result<u64, StoreFault>> {
+        for step in 0..self.lanes.len() {
+            let lane = (self.next + step) % self.lanes.len();
+            let Some(done) = self.lanes[lane].dones.pop() else {
+                continue;
+            };
+            self.lanes[lane].outstanding -= 1;
+            let answer = match done.read {
+                Err(()) => Err(StoreFault::Device),
+                Ok(read) if read == into.len() => {
+                    into.copy_from_slice(&done.buffer);
+                    Ok(done.handle)
+                }
+                // A short read is the offset being past what the file holds, which is this node's own record
+                // of where blocks are disagreeing with the store.
+                Ok(_) => Err(StoreFault::Missing),
+            };
+            self.spare.push(done.buffer);
+            return Some(answer);
+        }
+        None
+    }
+
+    fn outstanding(&self) -> usize {
+        self.lanes.iter().map(|lane| lane.outstanding).sum()
+    }
+}
+
+impl Drop for ReadPool {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for lane in &self.lanes {
+            lane.thread.unpark();
+        }
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
 
 /// One file per segment, in one directory. The backing a deployment has, against `MemoryStore`'s which
 /// nothing survives.
@@ -24,24 +210,33 @@ pub struct FileStore {
     /// synced, and syncing a directory means having it open.
     dir: File,
     path: PathBuf,
-    files: [Option<File>; SEGMENT_VALUES],
+    /// Shared so a pool thread can read one without a lock: `read_at` takes `&self`.
+    files: [Option<Arc<File>>; SEGMENT_VALUES],
     /// Segments written to since the last sync, one bit each. At most two are ever set — the day being
     /// written and, for one block, the day before it.
     dirty: u64,
     /// Whether a file has come into being since the last sync, so the directory needs one too.
     created: bool,
-    /// Reads asked for and not yet answered. The `pread` happens in `poll` rather than here, so nothing is
-    /// buffered per outstanding read — which makes this the simplest correct implementation and the slowest.
-    /// **`SE-OQ-4` is the choice that replaces it**: a thread pool that reads while the engine works, or
-    /// io_uring. Choosing now would answer that question without measuring it.
+    /// Reads asked for and not yet answered, when there is no pool. The `pread` then happens in `poll`, so
+    /// nothing overlaps: the simplest correct implementation and the slowest, and the baseline any backend is
+    /// measured against.
     submitted: VecDeque<(u64, u8, u64)>,
+    /// `pread` on N threads, absent when the pool is zero threads wide.
+    ///
+    /// A field rather than a trait, for now. The design abstracts the read backend and names three — io_uring,
+    /// libaio, a thread pool — and this is the third; the trait arrives with the second implementation, not
+    /// before it (rule 4). It lives *inside* the backing rather than above it because io_uring cannot be
+    /// anywhere else: it owns the descriptors and issues the reads itself, so a decorator over a synchronous
+    /// `read_at` could never become one.
+    pool: Option<ReadPool>,
     queue_depth: usize,
 }
 
 impl FileStore {
     /// Takes the directory already opened by whoever validated it, so nothing here can fail at start-up on a
     /// thread that has no way to report it (rule 6).
-    pub fn new(dir: File, path: PathBuf, queue_depth: usize) -> Self {
+    pub fn new(dir: File, path: PathBuf, queue_depth: usize, read_threads: usize) -> Self {
+        let queue_depth = queue_depth.max(1);
         Self {
             dir,
             path,
@@ -49,7 +244,8 @@ impl FileStore {
             dirty: 0,
             created: false,
             submitted: VecDeque::new(),
-            queue_depth: queue_depth.max(1),
+            pool: (read_threads > 0).then(|| ReadPool::new(read_threads, queue_depth)),
+            queue_depth,
         }
     }
 
@@ -63,15 +259,16 @@ impl FileStore {
     /// The segment's file, opened if this store has not touched it yet. Lazy because a restart begins with no
     /// open files and the blocks are still there: the index a snapshot restored names them, and the offset
     /// needs nothing but the address.
-    fn file_of(&mut self, segment: u8) -> Result<&File, StoreFault> {
+    fn file_of(&mut self, segment: u8) -> Result<Arc<File>, StoreFault> {
         if self.files[segment as usize].is_none() {
             let opened = Self::options()
                 .open(self.name_of(segment))
                 .map_err(|_| StoreFault::Missing)?;
-            self.files[segment as usize] = Some(opened);
+            self.files[segment as usize] = Some(Arc::new(opened));
         }
         self.files[segment as usize]
             .as_ref()
+            .cloned()
             .ok_or(StoreFault::Missing)
     }
 
@@ -103,7 +300,7 @@ impl DurableStore for FileStore {
             .map_err(|_| StoreFault::Device)?;
         file.write_at(block, offset)
             .map_err(|_| StoreFault::Device)?;
-        self.files[segment as usize] = Some(file);
+        self.files[segment as usize] = Some(Arc::new(file));
         self.created = true;
         self.note_write(segment);
         Ok(())
@@ -132,6 +329,15 @@ impl DurableStore for FileStore {
     }
 
     fn submit(&mut self, handle: u64, segment: u8, offset: u64, _now: u64) -> bool {
+        if self.pool.is_some() {
+            // A segment with no file is a read this cannot take at all, which is backpressure's answer rather
+            // than a fault's: nothing has been promised, so the caller keeps the command and asks again.
+            let Ok(file) = self.file_of(segment) else {
+                return false;
+            };
+            let pool = self.pool.as_mut().expect("just checked");
+            return pool.submit(handle, file, offset);
+        }
         if self.submitted.len() >= self.queue_depth {
             return false;
         }
@@ -140,12 +346,18 @@ impl DurableStore for FileStore {
     }
 
     fn poll(&mut self, _now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
+        if let Some(pool) = self.pool.as_mut() {
+            return pool.poll(into);
+        }
         let (handle, segment, offset) = self.submitted.pop_front()?;
         Some(self.read_at(segment, offset, into).map(|()| handle))
     }
 
     fn inflight(&self) -> usize {
-        self.submitted.len()
+        match self.pool.as_ref() {
+            Some(pool) => pool.outstanding(),
+            None => self.submitted.len(),
+        }
     }
 
     /// The file's bytes, then the directory's entries, and that order is the whole of why this call takes no
@@ -224,9 +436,15 @@ mod tests {
             Self(path)
         }
 
+        /// Synchronous by default: a test about the format and the offsets should not depend on threads, and
+        /// the one test that is about the pool asks for it.
         fn store(&self) -> Box<FileStore> {
+            self.store_with(0)
+        }
+
+        fn store_with(&self, read_threads: usize) -> Box<FileStore> {
             let (dir, path) = open_directory(&self.0).expect("the scratch directory opens");
-            Box::new(FileStore::new(dir, path, 8))
+            Box::new(FileStore::new(dir, path, 32, read_threads))
         }
 
         fn files(&self) -> Vec<String> {
@@ -306,6 +524,65 @@ mod tests {
         );
         assert_eq!(log.traffic().store_faults, 0);
         assert_eq!(log.traffic().store_corruptions, 0);
+    }
+
+    /// The pool answers the same records the synchronous path does, and answers them out of the order they
+    /// were asked in. Both halves matter: the first is that concurrency changed nothing about correctness, and
+    /// the second is that it is concurrency at all — a pool whose completions came back in order would be the
+    /// synchronous path with extra threads.
+    #[test]
+    fn a_read_pool_answers_the_same_records_and_not_in_the_order_asked() {
+        let scratch = Scratch::new();
+        // Written synchronously, so what the pool is being asked about is only the reading.
+        let addrs = {
+            let mut log = RecordLog::new(scratch.store(), 1, 0);
+            // Twenty blocks, because only the first record of each is read here — one read per block is what
+            // makes the completions distinguishable.
+            let kept = seal_blocks(&mut log, RECORDS_PER_BLOCK * 20);
+            log.sync();
+            kept
+        };
+        let mut store = scratch.store_with(4);
+        let sealed: Vec<_> = addrs
+            .iter()
+            .filter(|(_, addr)| addr.index() == 0)
+            .take(16)
+            .collect();
+        assert!(sealed.len() > 4, "not enough sealed blocks to interleave");
+
+        for (handle, (_, addr)) in sealed.iter().enumerate() {
+            assert!(
+                store.submit(handle as u64, addr.segment(), addr.block_offset(), 0),
+                "the pool would not take read {handle}"
+            );
+        }
+        let mut order = Vec::new();
+        let mut into = Block::zeroed();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while order.len() < sealed.len() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pool answered {} of {} reads",
+                order.len(),
+                sealed.len()
+            );
+            let Some(answered) = store.poll(0, &mut into) else {
+                std::thread::yield_now();
+                continue;
+            };
+            let handle = answered.expect("a read of a block the store has");
+            let (key, _) = crate::block::decode(&into[..crate::block::RECORD_BYTES], sealed[0].1);
+            assert_eq!(
+                key, sealed[handle as usize].0,
+                "read {handle} came back with another block's record"
+            );
+            order.push(handle);
+        }
+        assert_ne!(
+            order,
+            (0..sealed.len() as u64).collect::<Vec<_>>(),
+            "every completion came back in the order it was asked for, so nothing overlapped"
+        );
     }
 
     /// **The test the absolute offset was chosen for.** A second store over the same directory reads the
