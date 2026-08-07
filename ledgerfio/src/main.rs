@@ -140,16 +140,17 @@ fn print_layout(json: bool) {
     );
     println!();
     println!(
-        "{:<26} {:<15} {:>10}  unit",
-        "sizing part", "owner", "bytes/unit"
+        "{:<26} {:<15} {:>7} {:<8} what one is",
+        "sizing part", "owner", "bytes", "unit"
     );
     for (owner, part) in sizing() {
         println!(
-            "{:<26} {:<15} {:>10}  {}",
+            "{:<26} {:<15} {:>7} {:<8} {}",
             part.name,
             owner,
             part.bytes,
-            part.unit.name()
+            part.unit.name(),
+            part.what
         );
     }
     println!(
@@ -171,6 +172,7 @@ fn print_sizing_json() {
                 "owner": owner,
                 "unit": part.unit.name(),
                 "bytes": part.bytes,
+                "what": part.what,
             })
         })
         .collect();

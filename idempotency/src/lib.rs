@@ -11,7 +11,10 @@ use ledger_base::{parts_are_sound, SizedPart, TxId};
 /// count is the busiest hour's transactions rather than a rate or a day's volume, and the rotating
 /// generations that would enforce that hour are not built: the map only grows today. A sizing model
 /// has to take the hour as an input and say so.
-pub const SIZING: &[SizedPart] = &[SizedPart::table::<TxId, u64>("idem keys")];
+pub const SIZING: &[SizedPart] = &[SizedPart::table::<TxId, u64>(
+    "idem keys",
+    "a transaction id already seen, so a retry is answered rather than applied twice",
+)];
 
 const _: () = assert!(
     parts_are_sound(SIZING),

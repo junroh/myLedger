@@ -71,49 +71,63 @@ const _: () = assert!(
 /// rather than a structure and no footprint reports it. It belongs here anyway — a sizing answer that
 /// reported memory and left the record size to a second source is how the two drift apart.
 pub const SIZING: &[ledger_base::SizedPart] = &[
-    ledger_base::SizedPart::new("pending index", ledger_base::Unit::Slot, index::SLOT_BYTES),
+    ledger_base::SizedPart::new(
+        "pending index",
+        ledger_base::Unit::Slot,
+        index::SLOT_BYTES,
+        "where one hold is: a fingerprint, an ambiguity bit and a record address. Never what it is",
+    ),
     ledger_base::SizedPart::table::<ledger_base::BudgetGroup, engine::BudgetState>(
         "pending budget groups",
+        "a live budget group's member count and remainder -- the one place those two are kept",
     ),
     ledger_base::SizedPart::new(
         "pending overlay",
         ledger_base::Unit::Bucket,
         overlay::ENTRY_BUCKET_BYTES,
+        "what the sequencer has decided about a hold and not handed over yet, plus its pins",
     ),
     ledger_base::SizedPart::new(
         "pending writeback buffer",
         ledger_base::Unit::Block,
         block::BLOCK_BYTES,
+        "a block of records not written yet: how far a restart replays, so it is the recovery bound",
     ),
     ledger_base::SizedPart::new(
         "pending resident blocks",
         ledger_base::Unit::Block,
         block::BLOCK_BYTES,
+        "a written block kept in memory so a resolution need not read a device: the latency bound",
     ),
     ledger_base::SizedPart::new(
         "pending stored blocks",
         ledger_base::Unit::Block,
         block::BLOCK_BYTES,
+        "a block in the segment files -- memory today, and the disk figure once the store is a directory",
     ),
     ledger_base::SizedPart::new(
         "volume read cache",
         ledger_base::Unit::Block,
         block::BLOCK_BYTES,
+        "a block kept from a read the volume already answered, so a re-read costs no device",
     ),
     ledger_base::SizedPart::new(
         "volume write lane",
         ledger_base::Unit::Block,
         block::BLOCK_BYTES,
+        "a block the write thread holds while its pwrite is outstanding",
     ),
     ledger_base::SizedPart::new(
         "volume read pool",
         ledger_base::Unit::Block,
         block::BLOCK_BYTES,
+        "a block one read thread reads into, so a pread allocates nothing",
     ),
     ledger_base::SizedPart::new(
         "pending record",
         ledger_base::Unit::Record,
         block::RECORD_BYTES,
+        "one hold inside a block: its key, both accounts, its amounts, its ledger and its budget group",
     ),
 ];
 

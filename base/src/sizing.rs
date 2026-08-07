@@ -22,19 +22,28 @@ pub struct SizedPart {
     /// The name the component's `Footprint` reports it under, so a prediction and a run line up by
     /// name rather than by the order somebody wrote them in.
     pub name: &'static str,
+    /// What **one unit of it is**, in a phrase. Declared by the crate that owns the structure, because
+    /// that is the only place that knows — a sizing model can say how many there are and never what
+    /// they are, and a table of names and byte counts is a table nobody can check.
+    pub what: &'static str,
     pub unit: Unit,
     pub bytes: usize,
 }
 
 impl SizedPart {
-    pub const fn new(name: &'static str, unit: Unit, bytes: usize) -> Self {
-        Self { name, unit, bytes }
+    pub const fn new(name: &'static str, unit: Unit, bytes: usize, what: &'static str) -> Self {
+        Self {
+            name,
+            what,
+            unit,
+            bytes,
+        }
     }
 
     /// A hash table's cost per **bucket**, not per entry — the two differ by up to a factor of two and
     /// the difference is the whole reason `Unit::Bucket` exists.
-    pub const fn table<K, V>(name: &'static str) -> Self {
-        Self::new(name, Unit::Bucket, bucket_bytes::<K, V>())
+    pub const fn table<K, V>(name: &'static str, what: &'static str) -> Self {
+        Self::new(name, Unit::Bucket, bucket_bytes::<K, V>(), what)
     }
 }
 
@@ -101,7 +110,7 @@ pub const fn buckets_for(entries: usize) -> usize {
 pub const fn parts_are_sound(parts: &[SizedPart]) -> bool {
     let mut index = 0;
     while index < parts.len() {
-        if parts[index].bytes == 0 {
+        if parts[index].bytes == 0 || parts[index].what.is_empty() {
             return false;
         }
         let mut earlier = 0;
@@ -156,9 +165,18 @@ mod tests {
 
     #[test]
     fn a_list_with_two_parts_of_one_name_is_refused() {
-        const ONE: SizedPart = SizedPart::new("slots", Unit::Slot, 8);
+        const ONE: SizedPart = SizedPart::new("slots", Unit::Slot, 8, "one request in flight");
         assert!(parts_are_sound(&[ONE]));
         assert!(!parts_are_sound(&[ONE, ONE]));
-        assert!(!parts_are_sound(&[SizedPart::new("free", Unit::Slot, 0)]));
+        assert!(!parts_are_sound(&[SizedPart::new(
+            "free",
+            Unit::Slot,
+            0,
+            "nothing"
+        )]));
+        assert!(
+            !parts_are_sound(&[SizedPart::new("mute", Unit::Slot, 8, "")]),
+            "a part with no description is a row a reader cannot check"
+        );
     }
 }

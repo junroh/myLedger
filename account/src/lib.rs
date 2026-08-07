@@ -8,8 +8,16 @@ use ledger_base::{parts_are_sound, AccountId, AcctHandle, SizedPart, Unit};
 /// else: an account never leaves, so no rate and no lifetime enters here — which is why this is the
 /// one component whose size a deployment already knows.
 pub const SIZING: &[SizedPart] = &[
-    SizedPart::new("account records", Unit::Account, store::ACCOUNT_BYTES),
-    SizedPart::table::<AccountId, AcctHandle>("account index"),
+    SizedPart::new(
+        "account records",
+        Unit::Account,
+        store::ACCOUNT_BYTES,
+        "one account's four durable columns and the id kept beside them",
+    ),
+    SizedPart::table::<AccountId, AcctHandle>(
+        "account index",
+        "an account id against its dense handle, resolved once at intake so no later stage re-hashes",
+    ),
 ];
 
 const _: () = assert!(

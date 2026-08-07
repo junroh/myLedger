@@ -2,145 +2,168 @@
   "block_bytes": 4096,
   "bucket_rule": "next_power_of_two(entries * 8 / 7)",
   "cache_line": 128,
-  "commit": "f63d51d7672f01edf6c9d6c3c0bfdc8427de23b6",
+  "commit": "269d99fe945f27c865b204a3e4af7c37e047acf4",
   "parts": [
     {
       "bytes": 228,
       "name": "work slots",
       "owner": "sequencer",
-      "unit": "slot"
+      "unit": "slot",
+      "what": "one request in flight: its work item, the engine's answer to it, and a free-list entry"
     },
     {
       "bytes": 4,
       "name": "deferred dispatches",
       "owner": "sequencer",
-      "unit": "slot"
+      "unit": "slot",
+      "what": "a slot waiting to retry a dispatch a full component queue refused"
     },
     {
       "bytes": 32,
       "name": "lane state",
       "owner": "sequencer",
-      "unit": "account"
+      "unit": "account",
+      "what": "one account's ordering: the seq it has issued, its continuity check and its quarantine flag"
     },
     {
       "bytes": 112,
       "name": "open batch effects",
       "owner": "sequencer",
-      "unit": "effect"
+      "unit": "effect",
+      "what": "a judged effect in the batch being filled, waiting for consensus to be asked"
     },
     {
       "bytes": 40,
       "name": "batches awaiting consensus",
       "owner": "sequencer",
-      "unit": "batch"
+      "unit": "batch",
+      "what": "a proposal handed to consensus and not answered, apart from the slot list it will answer"
     },
     {
       "bytes": 116,
       "name": "spare batch buffers",
       "owner": "sequencer",
-      "unit": "effect"
+      "unit": "effect",
+      "what": "one effect of recycled batch room and the slot id beside it, so proposing allocates nothing"
     },
     {
       "bytes": 80,
       "name": "ack backlog",
       "owner": "sequencer",
-      "unit": "entry"
+      "unit": "entry",
+      "what": "an answer a client has not collected, held until it does or intake pauses"
     },
     {
       "bytes": 80,
       "name": "queued pending writes",
       "owner": "sequencer",
-      "unit": "effect"
+      "unit": "effect",
+      "what": "a committed decision the pending engine has not taken yet"
     },
     {
       "bytes": 48,
       "name": "account records",
       "owner": "accounts",
-      "unit": "account"
+      "unit": "account",
+      "what": "one account's four durable columns and the id kept beside them"
     },
     {
       "bytes": 17,
       "name": "account index",
       "owner": "accounts",
-      "unit": "bucket"
+      "unit": "bucket",
+      "what": "an account id against its dense handle, resolved once at intake so no later stage re-hashes"
     },
     {
       "bytes": 33,
       "name": "idem keys",
       "owner": "idem",
-      "unit": "bucket"
+      "unit": "bucket",
+      "what": "a transaction id already seen, so a retry is answered rather than applied twice"
     },
     {
       "bytes": 8,
       "name": "pending index",
       "owner": "pending engine",
-      "unit": "slot"
+      "unit": "slot",
+      "what": "where one hold is: a fingerprint, an ambiguity bit and a record address. Never what it is"
     },
     {
       "bytes": 33,
       "name": "pending budget groups",
       "owner": "pending engine",
-      "unit": "bucket"
+      "unit": "bucket",
+      "what": "a live budget group's member count and remainder -- the one place those two are kept"
     },
     {
       "bytes": 49,
       "name": "pending overlay",
       "owner": "pending engine",
-      "unit": "bucket"
+      "unit": "bucket",
+      "what": "what the sequencer has decided about a hold and not handed over yet, plus its pins"
     },
     {
       "bytes": 4096,
       "name": "pending writeback buffer",
       "owner": "pending engine",
-      "unit": "block"
+      "unit": "block",
+      "what": "a block of records not written yet: how far a restart replays, so it is the recovery bound"
     },
     {
       "bytes": 4096,
       "name": "pending resident blocks",
       "owner": "pending engine",
-      "unit": "block"
+      "unit": "block",
+      "what": "a written block kept in memory so a resolution need not read a device: the latency bound"
     },
     {
       "bytes": 4096,
       "name": "pending stored blocks",
       "owner": "pending engine",
-      "unit": "block"
+      "unit": "block",
+      "what": "a block in the segment files -- memory today, and the disk figure once the store is a directory"
     },
     {
       "bytes": 4096,
       "name": "volume read cache",
       "owner": "pending engine",
-      "unit": "block"
+      "unit": "block",
+      "what": "a block kept from a read the volume already answered, so a re-read costs no device"
     },
     {
       "bytes": 4096,
       "name": "volume write lane",
       "owner": "pending engine",
-      "unit": "block"
+      "unit": "block",
+      "what": "a block the write thread holds while its pwrite is outstanding"
     },
     {
       "bytes": 4096,
       "name": "volume read pool",
       "owner": "pending engine",
-      "unit": "block"
+      "unit": "block",
+      "what": "a block one read thread reads into, so a pread allocates nothing"
     },
     {
       "bytes": 68,
       "name": "pending record",
       "owner": "pending engine",
-      "unit": "record"
+      "unit": "record",
+      "what": "one hold inside a block: its key, both accounts, its amounts, its ledger and its budget group"
     },
     {
       "bytes": 112,
       "name": "kept log",
       "owner": "consensus",
-      "unit": "effect"
+      "unit": "effect",
+      "what": "a committed effect the log still holds, because no snapshot has let it be truncated"
     },
     {
       "bytes": 32,
       "name": "proposals in flight",
       "owner": "consensus",
-      "unit": "batch"
+      "unit": "batch",
+      "what": "one proposal outstanding, apart from the effects it carries"
     }
   ],
   "records_per_block": 60,

@@ -814,13 +814,17 @@ def print_unit_costs(units=None, overrides=None):
     ask "what if this were smaller" about."""
     units = units or load_units()
     overrides = overrides or {}
-    print(f"{'structure':<28}{'owner':<16}{'unit':<9}{'measured':>10}{'used':>10}")
+    print(f"{'structure':<28}{'unit':<9}{'measured':>9}{'used':>9}  what one is")
+    owner = None
     for part in units["parts"]:
+        if part["owner"] != owner:
+            owner = part["owner"]
+            print(f"\n[{owner}]")
         used = overrides.get(part["name"], part["bytes"])
-        mark = "  <-- overridden" if used != part["bytes"] else ""
+        mark = "  <-- OVERRIDDEN" if used != part["bytes"] else ""
         print(
-            f"{part['name']:<28}{part['owner']:<16}{part['unit']:<9}"
-            f"{part['bytes']:>10,}{used:>10,}{mark}"
+            f"{part['name']:<28}{part['unit']:<9}{part['bytes']:>9,}{used:>9,}"
+            f"  {part['what']}{mark}"
         )
     print()
     print(

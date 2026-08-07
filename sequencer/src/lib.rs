@@ -47,22 +47,35 @@ const _: () = assert!(
 /// listing them apart: lanes follow the accounts a deployment has, while slots, acks and batches
 /// follow what the components' latencies leave outstanding.
 pub const SIZING: &[SizedPart] = &[
-    SizedPart::new("work slots", Unit::Slot, state::pipeline::SLOT_BYTES),
+    SizedPart::new(
+        "work slots",
+        Unit::Slot,
+        state::pipeline::SLOT_BYTES,
+        "one request in flight: its work item, the engine's answer to it, and a free-list entry",
+    ),
     SizedPart::new(
         "deferred dispatches",
         Unit::Slot,
         state::batcher::SLOT_ID_BYTES,
+        "a slot waiting to retry a dispatch a full component queue refused",
     ),
-    SizedPart::new("lane state", Unit::Account, state::lane::LANE_BYTES),
+    SizedPart::new(
+        "lane state",
+        Unit::Account,
+        state::lane::LANE_BYTES,
+        "one account's ordering: the seq it has issued, its continuity check and its quarantine flag",
+    ),
     SizedPart::new(
         "open batch effects",
         Unit::Effect,
         state::batcher::EFFECT_BYTES,
+        "a judged effect in the batch being filled, waiting for consensus to be asked",
     ),
     SizedPart::new(
         "batches awaiting consensus",
         Unit::Batch,
         state::batcher::BATCH_BYTES,
+        "a proposal handed to consensus and not answered, apart from the slot list it will answer",
     ),
     // Counted per effect of batch room, not per buffer: the two pools hold one effect and one slot id
     // for each, and how much room a buffer has is the batch ceiling rather than anything fixed. So the
@@ -71,12 +84,19 @@ pub const SIZING: &[SizedPart] = &[
         "spare batch buffers",
         Unit::Effect,
         state::batcher::EFFECT_BYTES + state::batcher::SLOT_ID_BYTES,
+        "one effect of recycled batch room and the slot id beside it, so proposing allocates nothing",
     ),
-    SizedPart::new("ack backlog", Unit::Entry, state::outbox::ACK_BYTES),
+    SizedPart::new(
+        "ack backlog",
+        Unit::Entry,
+        state::outbox::ACK_BYTES,
+        "an answer a client has not collected, held until it does or intake pauses",
+    ),
     SizedPart::new(
         "queued pending writes",
         Unit::Effect,
         state::pending::PENDING_EFFECT_BYTES,
+        "a committed decision the pending engine has not taken yet",
     ),
 ];
 

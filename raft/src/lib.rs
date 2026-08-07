@@ -9,8 +9,18 @@ use ledger_base::{parts_are_sound, SizedPart, Unit};
 /// last snapshot rather than a steady state, and a model that multiplies it by a day is describing a
 /// node nobody would run.
 pub const SIZING: &[SizedPart] = &[
-    SizedPart::new("kept log", Unit::Effect, echo::LOG_EFFECT_BYTES),
-    SizedPart::new("proposals in flight", Unit::Batch, echo::PROPOSAL_BYTES),
+    SizedPart::new(
+        "kept log",
+        Unit::Effect,
+        echo::LOG_EFFECT_BYTES,
+        "a committed effect the log still holds, because no snapshot has let it be truncated",
+    ),
+    SizedPart::new(
+        "proposals in flight",
+        Unit::Batch,
+        echo::PROPOSAL_BYTES,
+        "one proposal outstanding, apart from the effects it carries",
+    ),
 ];
 
 const _: () = assert!(
