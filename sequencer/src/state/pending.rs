@@ -21,6 +21,11 @@ pub struct PendingChannel<P: PendingPort> {
     /// is one channel and a queued write blocks lookups — so an answer that reflects fewer is an engine
     /// that has reordered its own queue.
     applies_sent: u64,
+    /// Expiry voids this sequencer would not take, waiting to be handed back. Retried like a write and
+    /// for a weaker version of the same reason: a lost one does not lose money, but it leaves the sweep
+    /// unable to tell a refused void from one still in flight, which is the state it used to be in for
+    /// all of them.
+    declines: VecDeque<TxId>,
 }
 
 impl<P: PendingPort> PendingChannel<P> {
@@ -38,7 +43,39 @@ impl<P: PendingPort> PendingChannel<P> {
             limit,
             peak: Peak::default(),
             applies_sent: 0,
+            declines: VecDeque::new(),
         }
+    }
+
+    /// Hands back an expiry void this sequencer refused, so the sweep retries that one and not the ones
+    /// it is still waiting on.
+    pub fn decline_expiry(&mut self, hold: TxId) {
+        if !self.declines.is_empty()
+            || self
+                .port
+                .send(PendingCommand::ExpiryDeclined { hold })
+                .is_err()
+        {
+            self.declines.push_back(hold);
+        }
+    }
+
+    /// Offers again whatever the engine would not take. Called where the writes are, because both are
+    /// the same job: a command the queue refused is one this end still owes.
+    pub fn drain_declines(&mut self) -> bool {
+        let mut sent = false;
+        while let Some(hold) = self.declines.front().copied() {
+            if self
+                .port
+                .send(PendingCommand::ExpiryDeclined { hold })
+                .is_err()
+            {
+                break;
+            }
+            self.declines.pop_front();
+            sent = true;
+        }
+        sent
     }
 
     pub fn lookup(&mut self, lookup: PendingLookup) -> bool {
@@ -95,7 +132,7 @@ impl<P: PendingPort> PendingChannel<P> {
             self.applies_sent += 1;
             progress = true;
         }
-        progress
+        progress | self.drain_declines()
     }
 
     /// While writes are queued no lookup may be sent, because the queue is what preserves

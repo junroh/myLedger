@@ -475,6 +475,9 @@ impl PendingFake {
                 // A write occupies the engine like anything else. The store is updated now rather than at
                 // completion: the inbox is in order, so a later lookup of the same hold is processed
                 // after it either way, and the engine's queue is what the write actually costs.
+                // The sequencer refused an expiry void, so the sweep may offer that one again. Driven here
+                // as well as in the real worker, or a seed would see a sweep that never retries.
+                PendingCommand::ExpiryDeclined { hold } => state.store.expiry_declined(hold),
                 PendingCommand::Apply { effect, at } => {
                     state.engine_time();
                     if let Err(not_stored) = state.store.write(effect, at) {

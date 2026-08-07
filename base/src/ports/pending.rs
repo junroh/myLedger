@@ -105,6 +105,16 @@ pub enum PendingCommand {
         effect: PendingEffect,
         at: ApplyIndex,
     },
+    /// An expiry void the sequencer did not take, named by the hold it would have released.
+    ///
+    /// **The one answer an expiry void gets, and it goes to the engine rather than to a client.** No ack
+    /// leaves for a void nobody asked for, so the sweep learns that one landed only by the hold ceasing to
+    /// exist — and it could not tell a void still in flight from one that was refused. So it retried every
+    /// round, and every retry is a lookup: measured at twenty-two store reads per hold released. Telling it
+    /// which ones were refused is what makes retrying those and only those possible.
+    ExpiryDeclined {
+        hold: TxId,
+    },
 }
 
 /// What the engine says without being asked.

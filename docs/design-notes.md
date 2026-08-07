@@ -1287,7 +1287,8 @@ never meant that. It is the **imminent day's detail**, exactly as its lazy-load 
 survivors, 150 million addresses, about 1.2GB. That is the 2GB.
 
 And even that is not needed here, because the walk is **resumable**. Materialising the day would buy one
-thing: no block read when a void has to be offered again. Retries are rare, and the walk that would replace
+thing: no block read when a void has to be offered again. Retries are rare — rarer since a void is offered
+again only when the sequencer says it came back — and the walk that would replace
 them is sequential and costs 2.9 million blocks a day at the design's scale — thirty-four a second against a
 200k/s read budget. So only what has been offered and not landed has to be remembered, which is one slice:
 
@@ -1358,13 +1359,26 @@ somewhere to go. That is the half a leadership gate belongs on, and the half who
 
 ### Two things weighed here that the code does not show
 
-**Pacing the retry.** Once a declined void is offered again, something has to say *when*, or a persistently
-full backlog turns the retry into a re-offer every round — measured at 780,000 declines in five seconds, with
-p99.9 three times what it was.
+**Pacing the retry, and the answer turned out not to be pacing.** Once a declined void is offered again,
+something has to say *when*, or a persistently full backlog turns the retry into a re-offer every round —
+measured at 780,000 declines in five seconds, with p99.9 three times what it was.
 
 A doubling backoff counted in rounds was the first idea and is the wrong unit: the worker spins under load
 and sleeps when idle, so the same count of rounds is microseconds in one case and seconds in the other, and a
 limit expressed that way is one nobody declared (rule 20 again, in miniature).
+
+**What the retry actually needed was news, not a timer**, and that is what it has now. The engine could see
+that a void had landed — the hold stops existing — and could not see that one had been refused, so it
+retried everything outstanding every round on the chance that some of it had. Every retry is judged like any
+resolution, so every retry is a lookup: measured at **1,939,198 lookups to release 89,352 holds, twenty-two
+reads for each one**. `PendingCommand::ExpiryDeclined` names the void that came back, and the sweep offers
+that one and nothing else. The same run is **90,000 lookups for 89,800 holds — one apiece**, and the
+simulator's sweep goes from 678,000 offers with 325,000 dropped to 142,000 with none dropped, at the same
+number admitted.
+
+So the timer question closes without a timer being chosen. What remains of it is the case where the
+*decline itself* is what keeps arriving — a quarantined lane, which `status.md` carries as its own
+question — and that is now paced by the round trip rather than by the round.
 
 Splitting the notice channel is the better long-term answer and is deliberately not taken yet. `ExpiryQueue`
 declines rather than blocking for exactly one reason, stated in its own doc: the apply-path seal travels the

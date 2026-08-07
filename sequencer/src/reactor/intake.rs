@@ -160,9 +160,14 @@ where
         let request = Request::single(void, self.clock.now_nanos());
         match self.prepare(&request, None) {
             Ok(slot) => self.dispatch_or_defer(slot),
-            // Nobody to tell: no client asked for this. The sweep offers it again next round, and if the
-            // reason was terminal — a sealed apply path — nothing is being released anyway.
-            Err(_) => self.metrics.expiry_refused += 1,
+            // No *client* to tell — nobody asked for this — but the engine has to hear it, or its sweep
+            // cannot tell a void this sequencer refused from one still on its way through consensus, and
+            // it retries both. Every retry is a lookup. If the reason was terminal, a sealed apply path,
+            // nothing is being released anyway and the engine's retry meets the same refusal.
+            Err(_) => {
+                self.metrics.expiry_refused += 1;
+                self.pending.decline_expiry(void.pending_ref);
+            }
         }
     }
 

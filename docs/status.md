@@ -118,9 +118,16 @@ runs out is emptied by releasing whatever survived it. Design notes §14.
   holds all resolved early. Every node runs it for itself, which is what keeps a follower's store from
   growing while the leader's shrinks. `propose_expiry` walks an expired day and offers voids, and that
   needs the leader's clock. Once consensus is real the leadership gate goes on the second one only.
-- **A void nobody took is offered again, and that is now true rather than claimed.** The engine keeps the
-  slice it handed over — bounded by `expiry_blocks_per_round` times the records on a block, not by the
-  size of a day — and re-offers whatever the index still points at. Four comments claimed the sweep
+- **A void nobody took is offered again, and the engine is now *told* which one rather than guessing.** It
+  keeps the slice it handed over — bounded by `expiry_blocks_per_round` times the records on a block, not
+  by the size of a day. What it could see was a void landing: the hold stops existing. What it could not
+  see was one being refused, so it re-offered the whole slice every round on the chance that some of it
+  had been — and a re-offer is judged like any resolution, so every one is a lookup. **1,939,198 lookups
+  to release 89,352 holds: twenty-two reads apiece.** `PendingCommand::ExpiryDeclined` is the missing
+  half — an expiry void gets no ack because no client asked for it, but the engine has to hear a refusal
+  or it cannot tell one from a void still in flight. Now: **90,000 lookups for 89,800 holds, one apiece**,
+  and `ledgersim check` goes from 678,000 offers with 325,000 dropped to 142,000 with none dropped, at the
+  same number admitted. Four comments claimed the sweep
   re-offered a declined void; none did, because the re-walk was gated on the day's live count moving, so
   a declined void that was the last of its day left that day unfinished for ever — and with it every
   later day, since deletion is strictly ordered. Storage then grew without bound and the index never
@@ -711,18 +718,16 @@ unanswered, and **when that default stops being safe**. The source design's own 
   *Default:* a constant, two blocks a round. The headroom argument for it measured the **requirement** — a
   design day's survivors against a day — and never measured the **cost**, which is the other side of the
   same number and is now measured.
-  *What the cost is:* a round is cheap, so two blocks a round is two blocks times the round rate. On this
-  machine that is **75,000 to 125,000 synchronous reads a second**, on the thread that answers lookups.
-  Measured with `void-heavy --residency 1 --overlay-limit 10000 --resolve-after 900000 --expiry-days 6`,
-  where no resolution lands, so every store read is the sweep's: 225,068 reads to release 5,100 holds, and
-  552,108 to release 23,766 in a longer one. **Twenty to forty reads per hold released.**
-  *Why so many:* a day is walked from block zero again whenever the walk reaches the end, and a block whose
-  holds have all gone is read again to find nothing. That re-walk is deliberate and it fixed a real bug —
-  gating it on the day's live count moving left a declined void's day unfinished for ever — but `outstanding`
-  now re-offers a declined void by itself, so the two jobs the re-walk was doing may not both still need it.
-  *Stops being safe:* on a device. Here the reads are page-cache hits; at 100µs each, 80,000 a second is
-  eight thread-seconds a second, which is not a throttle at all. Moving these reads to the read pool would
-  parallelise the waste rather than remove it, which is why that work is not the first thing to do.
+  *What the cost is:* the sweep's own reads turn out to be small — measured, it walks fewer than two
+  thousand blocks in three seconds while releasing ninety thousand holds. **The reads that looked like the
+  sweep's were the re-offers'**, and they are gone: an expiry void is now offered again only when the
+  sequencer hands it back, which took a store read count from twenty-two per hold released to one. The
+  attribution is worth keeping because it was wrong twice — first the sweep's walk was blamed, then a
+  low-water mark was built for it that changed nothing, and only counting the lookups separated them.
+  *Stops being safe:* if a day's blocks ever grow faster than the rounds available to read them — a much
+  larger `daily_arrivals`, or a store whose reads are slow enough that a round no longer fits beside the
+  lookups. The budget being per round rather than per second is still a number nobody declared in those
+  units; it has simply stopped being the expensive one.
 
 - **When does the idem engine get its rotating generations?**
   *Default:* a map that only grows, which owns the worst tail of any long run (see above).

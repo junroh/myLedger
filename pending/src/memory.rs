@@ -1252,6 +1252,10 @@ impl PendingWorker {
                     }
                 }
                 // A fence reads nothing; the order it leaves in is all it is for.
+                // The one answer an expiry void gets. Without it the sweep cannot tell a void this
+                // sequencer refused from one still on its way through consensus, so it retried both —
+                // and a retry is a lookup.
+                PendingCommand::ExpiryDeclined { hold } => self.engine.expiry_declined(hold),
                 PendingCommand::Fence(fence) => {
                     let result = PendingReply {
                         correlation: fence.correlation,

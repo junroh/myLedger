@@ -567,6 +567,27 @@ impl MemoryStore {
 }
 
 impl MemoryStore {
+    /// The read itself. **Counting is the caller's**, because the same work is an inline read when
+    /// `read_at` asks for it and the queue's when `poll` does, and a method that counted both would count
+    /// one of them twice.
+    fn read_block(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        into: &mut Block,
+    ) -> Result<(), StoreFault> {
+        match self.block_at(object, offset) {
+            Ok(found) => {
+                into.copy_from_slice(found);
+                Ok(())
+            }
+            Err(fault) => {
+                self.stats.faults += 1;
+                Err(fault)
+            }
+        }
+    }
+
     fn open_with(
         &mut self,
         object: ObjectId,
@@ -659,7 +680,9 @@ impl DurableStore for MemoryStore {
 
     fn poll(&mut self, _now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
         let (handle, object, offset) = self.submitted.pop_front()?;
-        Some(self.read_at(object, offset, into).map(|()| handle))
+        let answered = self.read_block(object, offset, into).map(|()| handle);
+        self.stats.answered_read(answered.is_ok());
+        Some(answered)
     }
 
     fn inflight(&self) -> usize {

@@ -51,6 +51,10 @@ pub struct PendingEngine {
     /// match a removal against this list as it is applied, and that puts the cost on the path that applies
     /// committed decisions in order. Background work is the right place to pay, so it pays there.
     outstanding: Vec<(RecordAddr, Transfer)>,
+    /// Voids the sequencer handed back, to be offered again. **Only these**: a void that is neither here
+    /// nor gone is one still on its way through consensus, and offering it again costs a lookup and buys
+    /// nothing.
+    declined: Vec<TxId>,
     overflowed: u64,
     /// The log position of the last batch whose effects reached this engine. Not the same thing as the
     /// count below: that says how many, this says *where*, and only the second is a position a snapshot can
@@ -101,6 +105,18 @@ struct Sweep {
     /// what every day did. The index scan this replaces cost 2.2 seconds a pass at the design's table, on
     /// this same thread, ahead of the lookups it would otherwise be answering.
     at_block: u64,
+    /// The first block of the day that still had something live, and so where the next pass starts.
+    ///
+    /// **A day's records only ever leave**, because a closed day is written to no more — so a block that
+    /// yields nothing live will never yield anything again, and reading it on the next pass is a read for
+    /// no reason. That is where the sweep's cost was going: a day is walked from its start again whenever
+    /// the walk reaches the end, and a day finishes only as fast as its voids land, so a few stubborn
+    /// holds made every pass re-read the whole day. Measured before this: twenty to forty reads per hold
+    /// released, 75,000 to 125,000 of them a second.
+    ///
+    /// It does not replace the re-walk, which is still what finds a hold a pass had not reached. It makes
+    /// the re-walk cost the live part of the day instead of all of it.
+    from_block: u64,
 }
 
 /// Whether an effect is arriving for the first time or again.
@@ -718,12 +734,13 @@ impl PendingEngine {
             self.sweep = Sweep {
                 day: self.sweep.day.map(|day| day + 1),
                 at_block: 0,
+                from_block: 0,
             };
             return;
         }
-        // Voids already handed over and not yet landed. Offered again rather than walked past, and the test
-        // for "landed" is the same one the walk makes — a record is alive exactly when the index points at
-        // it — so nothing has to be tracked on the apply path to know which of them are done.
+        // Voids already handed over and not yet landed. The test for "landed" is the one the walk makes —
+        // a record is alive exactly when the index points at it — so nothing has to be tracked on the
+        // apply path to know which of them are done.
         //
         // This is what the day's detail level of a timing wheel is for, at the size the throttle makes it:
         // one slice, not one day. Without it the only way to retry a lost void was to walk the day again,
@@ -732,12 +749,27 @@ impl PendingEngine {
         let index = &self.index;
         self.outstanding
             .retain(|(addr, void)| index.points_at(void.pending_ref, *addr));
+        // **Offered again only if the sequencer said it would not take it.** This used to re-offer the
+        // whole outstanding slice every round, because a void that had not landed was indistinguishable
+        // from one that had been refused — and a re-offer is judged like any resolution, so it costs a
+        // lookup and a store read. Measured at twenty-two reads per hold released. What removed it was
+        // being told: `PendingCommand::ExpiryDeclined` names the one that came back.
+        if !self.declined.is_empty() {
+            let declined = std::mem::take(&mut self.declined);
+            into.extend(
+                self.outstanding
+                    .iter()
+                    .filter_map(|(_, void)| declined.contains(&void.pending_ref).then_some(*void)),
+            );
+            return;
+        }
         if !self.outstanding.is_empty() {
-            into.extend(self.outstanding.iter().map(|(_, void)| *void));
             return;
         }
         let index = &self.index;
         let outstanding = &mut self.outstanding;
+        // Read by the loop below while the closure still holds the queue, which is what a `Cell` is for.
+        let found = std::cell::Cell::new(0usize);
         let mut visit = |key: TxId, hold: HoldData, addr: RecordAddr| {
             if !index.points_at(key, addr) {
                 return;
@@ -756,10 +788,12 @@ impl PendingEngine {
                 ledger: hold.ledger,
                 flags: TransferFlags::VOID_PENDING,
             };
+            found.set(found.get() + 1);
             outstanding.push((addr, void));
             into.push(void);
         };
         for _ in 0..blocks.max(1) {
+            let offered = found.get();
             if !self
                 .records
                 .each_record_in_day(segment, self.sweep.at_block, &mut visit)
@@ -768,12 +802,23 @@ impl PendingEngine {
                 // in flight — which `outstanding` is now holding, so the next round offers it again rather
                 // than walking — or they were never reached because the walk stopped short. Either way the
                 // walk starts over, and the day stays open, which is late rather than wrong.
-                self.sweep.at_block = 0;
+                self.sweep.at_block = self.sweep.from_block;
                 return;
+            }
+            // A block at the front of the walk with nothing live in it is one no later pass need read: a
+            // closed day is written to no more, so what it has now is the most it will ever have.
+            if found.get() == offered && self.sweep.at_block == self.sweep.from_block {
+                self.sweep.from_block += 1;
             }
             self.sweep.at_block += 1;
             self.swept_blocks += 1;
         }
+    }
+
+    /// A void the sequencer would not take, named by its hold. Offered again on the next round, and it is
+    /// the only thing that is — see `propose_expiry`.
+    pub fn expiry_declined(&mut self, hold: TxId) {
+        self.declined.push(hold);
     }
 
     /// Blocks of any day nothing points into any more, handed back to the store. Answers how many.
@@ -1746,13 +1791,18 @@ mod expiry_tests {
         let (mut engine, _) = written_on_day_zero();
         engine.open_day(LIFETIME, LIFETIME);
 
-        // Nothing is ever committed, so day zero never finishes and the sweep never advances.
+        // Every void is refused, so day zero never finishes and the sweep never advances. Refused rather
+        // than swallowed, because those are the only two things a sequencer does with one — and the engine
+        // now offers a void again only when it is told the first offer came back.
         let mut day = LIFETIME;
         for _ in 0..(SEGMENTS * 2) {
             day += 1;
             engine.open_day(day, LIFETIME);
             let mut voids = Vec::new();
             engine.propose_expiry(1, &mut voids);
+            for void in &voids {
+                engine.expiry_declined(void.pending_ref);
+            }
         }
 
         assert_eq!(
@@ -1834,17 +1884,25 @@ mod expiry_tests {
         let first = offered(&mut engine, 1);
         assert!(!first.is_empty(), "the day offered nothing to begin with");
 
-        // Twenty rounds, nothing applied. The same voids have to keep coming back.
+        // **Nothing comes back while nothing has been said.** A void neither applied nor declined is one
+        // still on its way through consensus, and offering it again would cost a lookup for news the
+        // sweep already has. Twenty rounds of silence, twenty rounds of nothing.
         for round in 0..20 {
-            let again = offered(&mut engine, 1);
-            let ids: Vec<TxId> = again.iter().map(|void| void.id).collect();
-            let expected: Vec<TxId> = first.iter().map(|void| void.id).collect();
-            assert_eq!(
-                ids, expected,
-                "round {round} offered something other than the slice nobody took"
+            assert!(
+                offered(&mut engine, 1).is_empty(),
+                "round {round} offered a void that was still in flight"
             );
         }
         assert!(engine.sweeping(), "the day finished with holds still in it");
+
+        // And the one the sequencer hands back is offered again — that one, and only that one.
+        engine.expiry_declined(first[0].pending_ref);
+        let again = offered(&mut engine, 1);
+        assert_eq!(
+            again.iter().map(|void| void.id).collect::<Vec<_>>(),
+            vec![first[0].id],
+            "a declined void was not the thing offered again"
+        );
 
         // And once they are applied the walk moves on, so retrying is not a loop the day cannot leave.
         commit(&mut engine, &first);

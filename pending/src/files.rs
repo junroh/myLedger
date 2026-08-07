@@ -592,6 +592,28 @@ impl FileStore {
         self.dirty |= 1 << object.index();
     }
 
+    /// The `pread` itself. **Counting is the caller's**, because the same work is an inline read when
+    /// `read_at` asks for it and the queue's when `poll` does, and a method that counted both would count
+    /// one of them twice.
+    fn read_block(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        into: &mut Block,
+    ) -> Result<(), StoreFault> {
+        let read = self
+            .file_of(object)?
+            .read_at(into, offset)
+            .map_err(|_| StoreFault::Device)?;
+        // A short read is the offset being past what the file holds, which is this node's own record of where
+        // blocks are disagreeing with the store rather than the device refusing.
+        if read == into.len() {
+            Ok(())
+        } else {
+            Err(StoreFault::Missing)
+        }
+    }
+
     fn rename_now(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault> {
         std::fs::rename(self.name_of(from), self.name_of(to)).map_err(|_| StoreFault::Device)?;
         self.files[from.index()] = None;
@@ -808,10 +830,7 @@ impl DurableStore for FileStore {
             return answered;
         }
         let (handle, object, offset) = self.submitted.pop_front()?;
-        // The synchronous backend does the `pread` here, and it is the queue's read rather than an inline
-        // one: counted once, as what it was asked for.
-        self.stats.reads_inline -= 1;
-        let answered = self.read_at(object, offset, into).map(|()| handle);
+        let answered = self.read_block(object, offset, into).map(|()| handle);
         self.stats.answered_read(answered.is_ok());
         Some(answered)
     }
