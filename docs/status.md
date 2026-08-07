@@ -528,6 +528,15 @@ neither is outstanding work.
   **`rename` beside `remove`**, because publishing is a namespace change and the directory sync belongs
   inside it. And the **stream padded to whole blocks** (version 4), because a block is what the store takes.
 
+  **Everything that changes the volume is on one queue.** A write, a barrier, a rename and a removal are
+  submitted the same way and served in the order they were asked for, which is what decides three
+  orderings that used to be the caller's to arrange or nobody's at all: a removal cannot overtake a write
+  into the file it removes, a rename cannot overtake the writes it publishes, and a removal cannot
+  overtake a *read* of the file — which held under unix semantics rather than by anything declared (§20).
+  The caller still waits for a completion where it needs an **outcome** rather than an order: a barrier
+  that failed must not be followed by a rename. And the directory `fsync` inside a rename is now the
+  lane's rather than the worker's, which is where it belonged.
+
   **A dump may hold only half the volume's queue**, derived from the depth rather than configured beside
   it. Within a round the blocks already ask first, so the dump takes what they did not want — but a slot it
   takes it holds until the device answers, and on a device that has stalled while the ledger happens to

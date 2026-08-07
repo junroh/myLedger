@@ -171,20 +171,21 @@ pub struct Snapshots {
 
 /// What a dump is doing. The phases exist because the write is submitted rather than done: each one is a
 /// thing that must not happen until the one before it has been answered for.
+/// What a dump is doing. Each phase is a thing that must not happen until the one before it has been
+/// **answered for** — the queue is what keeps them in order, and a completion is what says the one before
+/// it succeeded. Order and outcome are different questions and only the second needs waiting.
+///
+/// `None` in each is an operation the volume's queue has not taken yet; it is offered again next round.
 enum Phase {
     /// Producing chunks and submitting them.
     Filling,
-    /// The stream is submitted. A barrier is what makes it durable before the name changes; `None` is one
-    /// the queue has not taken yet.
+    /// The stream is submitted. A barrier is what makes it durable before the name changes.
     Sealing(Option<u64>),
-    /// The barrier has been answered, so the bytes are on the disk. What is left is the name — and it
-    /// waits for the last completion, because a rename with a write of this dump still out would publish
-    /// a prefix.
-    Publishing,
-    /// This dump will not be published. The shadow is already gone; what is left is to answer for the
-    /// writes still out and then remove the partial — removing it first would leave writes landing in a
-    /// file nothing will ever look at.
-    Draining,
+    /// The barrier has been answered, so the bytes are on the disk. What is left is the name.
+    Publishing(Option<u64>),
+    /// This dump will not be published, and the partial goes. The removal is queued behind whatever of
+    /// this dump is still in flight, so it cannot overtake a write into the file it removes.
+    Draining(Option<u64>),
 }
 
 struct InFlight {
@@ -278,14 +279,17 @@ impl Snapshots {
     /// `creating` is what a store checks with `O_EXCL`, and a partial left by a crash would otherwise
     /// refuse the first write of every dump until one of them cleared it.
     fn begin(&mut self, engine: &mut PendingEngine, now: u64) -> bool {
+        let handle = IoOwner::Snapshot.handle(self.handles + 1);
         let store = Self::volume(&mut self.own, engine);
-        let _ = now;
-        let _ = store.remove(ObjectId::SNAPSHOT_PARTIAL);
+        if !store.submit_remove(handle, ObjectId::SNAPSHOT_PARTIAL, now) {
+            return false;
+        }
+        self.handles += 1;
         self.inflight = Some(InFlight {
             writer: engine.begin_snapshot(),
             rounds: 0,
             blocks: 0,
-            outstanding: 0,
+            outstanding: 1,
             phase: Phase::Filling,
         });
         self.unsubmitted = false;
@@ -298,6 +302,7 @@ impl Snapshots {
         };
         run.rounds += 1;
         let mut broken = false;
+        let mut published = false;
         while let Some((handle, outcome)) = Self::completion(&mut self.own, engine, now) {
             debug_assert!(
                 IoOwner::Snapshot.owns(handle),
@@ -306,8 +311,10 @@ impl Snapshots {
             run.outstanding = run.outstanding.saturating_sub(1);
             if outcome.is_err() {
                 broken = true;
-            } else if matches!(run.phase, Phase::Sealing(Some(barrier)) if barrier == handle) {
-                run.phase = Phase::Publishing;
+            } else if matches!(run.phase, Phase::Sealing(Some(at)) if at == handle) {
+                run.phase = Phase::Publishing(None);
+            } else if matches!(run.phase, Phase::Publishing(Some(at)) if at == handle) {
+                published = true;
             }
         }
         if broken {
@@ -321,8 +328,8 @@ impl Snapshots {
             Phase::Filling => self.fill(&mut run, engine, now),
             Phase::Sealing(None) => {
                 // Everything this dump wrote is submitted, and a barrier is what makes it durable. Asked
-                // for before the writes are answered for on purpose: the lane keeps the order, so a barrier
-                // behind them in the queue is a barrier behind them on the device.
+                // for before the writes are answered for on purpose: the queue keeps the order, so a
+                // barrier behind them in it is a barrier behind them on the device.
                 let handle = IoOwner::Snapshot.handle(self.handles + 1);
                 let store = Self::volume(&mut self.own, engine);
                 if store.submit_barrier(handle, now) {
@@ -331,8 +338,33 @@ impl Snapshots {
                     run.phase = Phase::Sealing(Some(handle));
                 }
             }
-            // Waiting: for the barrier, or for the last completion the two arms below need.
-            Phase::Sealing(Some(_)) | Phase::Publishing | Phase::Draining => {}
+            // The name, once the barrier has been *answered* — the queue would have ordered it either
+            // way, but only the answer says the bytes are really durable.
+            Phase::Publishing(None) => {
+                let handle = IoOwner::Snapshot.handle(self.handles + 1);
+                let store = Self::volume(&mut self.own, engine);
+                if store.submit_rename(
+                    handle,
+                    ObjectId::SNAPSHOT_PARTIAL,
+                    ObjectId::SNAPSHOT_CURRENT,
+                    now,
+                ) {
+                    self.handles += 1;
+                    run.outstanding += 1;
+                    run.phase = Phase::Publishing(Some(handle));
+                }
+            }
+            Phase::Draining(None) => {
+                let handle = IoOwner::Snapshot.handle(self.handles + 1);
+                let store = Self::volume(&mut self.own, engine);
+                if store.submit_remove(handle, ObjectId::SNAPSHOT_PARTIAL, now) {
+                    self.handles += 1;
+                    run.outstanding += 1;
+                    run.phase = Phase::Draining(Some(handle));
+                }
+            }
+            // Waiting for an answer.
+            Phase::Sealing(Some(_)) | Phase::Publishing(Some(_)) | Phase::Draining(Some(_)) => {}
         }
         // Asked after the chunk rather than before it, because the chunk is what the shadow was holding
         // for: the buckets this round read are dropped as they are read, so the peak is what is left.
@@ -346,25 +378,24 @@ impl Snapshots {
         if shadow > self.policy.shadow_budget {
             self.give_up(&mut run, engine);
         }
-        // Nothing destructive while a write of this dump is still out, and the two ends of that need
-        // different amounts of it. The **rename** is ordered by the barrier already — a barrier follows
-        // every write it covers, and its completion is what `Publishing` means — so the count is belt
-        // beside braces there. The **removal** has no barrier and nothing else: `abandon` arrives whenever
-        // the store breaks, and removing the object with chunks still queued would leave them landing in a
-        // file nothing will look at, their completions arriving for a dump that no longer exists. One
-        // counter for both, because "this dump still has IO out" is one fact (rule 18).
+        // **Order is the queue's and outcome is the completion's**, and only the second needs waiting for.
+        // The rename cannot overtake the writes it publishes, and the removal cannot overtake the writes
+        // it discards, because all of them are on one queue in the order they were asked for. What a
+        // completion adds is whether they *worked*: a barrier that failed must not be followed by a
+        // rename, and a dump with a failed chunk must not be published at all.
         if run.outstanding > 0 {
             self.inflight = Some(run);
             return true;
         }
-        match run.phase {
-            Phase::Publishing => self.publish(run, engine),
-            Phase::Draining => {
-                let store = Self::volume(&mut self.own, engine);
-                let _ = store.remove(ObjectId::SNAPSHOT_PARTIAL);
-            }
-            _ => self.inflight = Some(run),
+        if published {
+            self.finish(run, engine);
+            return true;
         }
+        if matches!(run.phase, Phase::Draining(Some(_))) {
+            self.next_from = engine.applied_through();
+            return true;
+        }
+        self.inflight = Some(run);
         true
     }
 
@@ -418,28 +449,12 @@ impl Snapshots {
         }
     }
 
-    /// The name, and then the cadence. The bytes are durable already — the barrier this waited for is what
-    /// made them so — and the store's rename is what makes the *name* durable, which is the half a `sync`
-    /// of the file alone would leave out.
-    fn publish(&mut self, run: InFlight, engine: &mut PendingEngine) {
-        let coverage = run.writer.coverage();
-        let store = Self::volume(&mut self.own, engine);
-        let published = store
-            .rename(ObjectId::SNAPSHOT_PARTIAL, ObjectId::SNAPSHOT_CURRENT)
-            .is_ok();
-        if !published {
-            let _ = store.remove(ObjectId::SNAPSHOT_PARTIAL);
-        }
-        // Whatever happened, the next dump is measured from here: a destination that refused the rename
-        // will refuse it again in a round's time, and the cadence is the right thing to wait for.
+    /// The rename has been answered, so the dump is published and the cadence starts again from here.
+    fn finish(&mut self, run: InFlight, engine: &mut PendingEngine) {
+        self.stats.written += 1;
+        self.stats.last_rounds = run.rounds;
+        self.stats.covered = run.writer.coverage().raw();
         self.next_from = engine.applied_through();
-        if published {
-            self.stats.written += 1;
-            self.stats.last_rounds = run.rounds;
-            self.stats.covered = coverage.raw();
-            return;
-        }
-        self.stats.abandoned += 1;
     }
 
     /// Ends a dump that will not be published: the shadow goes now, the cadence starts again from here, and
@@ -449,10 +464,10 @@ impl Snapshots {
     /// The shadow does not wait for the IO and must not: it is the index holding buckets aside, so keeping
     /// it until a device answers would make a slow disk cost the apply path memory.
     fn give_up(&mut self, run: &mut InFlight, engine: &mut PendingEngine) {
-        if matches!(run.phase, Phase::Draining) {
+        if matches!(run.phase, Phase::Draining(_)) {
             return;
         }
-        run.phase = Phase::Draining;
+        run.phase = Phase::Draining(None);
         self.unsubmitted = false;
         engine.abandon_snapshot();
         self.stats.abandoned += 1;
@@ -512,7 +527,7 @@ mod tests {
     use super::*;
     use crate::block::{MemoryStore, RECORDS_PER_BLOCK};
     use crate::snapshot::RECORD;
-    use crate::testkit::HoldingStore;
+    use crate::testkit::{HoldingStore, StoreOp};
 
     /// A directory of its own per test, removed with it. Named from the process and a counter for the same
     /// reason `files.rs`'s is: a test that could collide with another run of itself fails for a reason
@@ -963,9 +978,9 @@ mod tests {
     /// seals: nothing more will be applied, so a dump of a state that has stopped moving is bytes nobody
     /// will read, and finishing it would hold the shadow for the whole of it.
     ///
-    /// The shadow goes at once and the partial goes when the writes still out have been answered for —
-    /// two events, because a removal that overtook a write would leave it landing in a file nothing looks
-    /// at.
+    /// The shadow goes at once and the partial's removal goes on the queue **behind** the writes still
+    /// out, so it cannot overtake one into the file it removes. Order is what the queue promises, so that
+    /// is what this asserts: the removal is the last thing the volume was asked for.
     #[test]
     fn a_dump_is_given_up_on_when_the_store_breaks_under_it() {
         let mut source = engine(1 << 12);
@@ -996,16 +1011,24 @@ mod tests {
         assert_eq!(snapshots.stats().written, 0);
         assert_eq!(snapshots.stats().abandoned, 1);
 
-        // **The shadow goes now and the object goes later**, which is the whole of what a submitted write
-        // changed here: removing it with chunks still queued would leave them landing in a file nothing
-        // will look at.
-        drive(&mut snapshots, &mut source, 8);
-        assert!(
-            held.holds(ObjectId::SNAPSHOT_PARTIAL),
-            "the partial was removed while writes to it were still outstanding"
-        );
+        // **The removal is queued, not raced.** It reaches the volume after every write this dump asked
+        // for, which is what one ordered queue is for — before, it was a synchronous call beside the
+        // queue and the caller had to buy that order by waiting.
         held.stop_holding();
         drive(&mut snapshots, &mut source, 8);
+        let ops = held.ops();
+        let removed = ops
+            .iter()
+            .rposition(|op| *op == StoreOp::Remove)
+            .expect("the partial was never removed");
+        let last_write = ops
+            .iter()
+            .rposition(|op| *op == StoreOp::Write)
+            .expect("the dump wrote nothing");
+        assert!(
+            removed > last_write,
+            "the removal overtook a write into the file it removes: {ops:?}"
+        );
         assert!(
             !held.holds(ObjectId::SNAPSHOT_PARTIAL),
             "the given-up dump left its partial behind"

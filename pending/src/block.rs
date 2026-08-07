@@ -376,15 +376,19 @@ pub trait DurableStore {
     ///
     /// It answers nothing about how many blocks there were. The caller wrote them and so already knows,
     /// and a real store could not answer anyway — `unlink` does not count what it removes.
-    fn remove(&mut self, object: ObjectId) -> Result<(), StoreFault>;
+    ///
+    /// **Submitted, on the same queue as the writes, because it is ordered against them.** A removal that
+    /// overtook a write to the object it removes would leave the write in a file nothing will look at, and
+    /// one that overtook a *read* would be the same race the other way — which held by unix semantics
+    /// rather than by anything declared here (§20). One queue is what decides it instead of a coincidence.
+    fn submit_remove(&mut self, handle: u64, object: ObjectId, now: u64) -> bool;
     /// Gives `from`'s bytes the name `to`, replacing whatever wore it, and makes the name itself durable.
     /// The one way an object is published: a reader that finds `to` finds all of it or the previous one,
     /// never a prefix (§19).
     ///
-    /// Synchronous, beside `remove` rather than on the write queue, and the caller is what orders it: a
-    /// rename issued while writes to `from` are still in flight would publish a prefix. `Snapshots` waits
-    /// for every completion and then a barrier before asking.
-    fn rename(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault>;
+    /// On the queue for the same reason a removal is, and one more: the directory `fsync` inside it is a
+    /// real one, and on the caller's thread it was an `fsync` on the thread that answers lookups.
+    fn submit_rename(&mut self, handle: u64, from: ObjectId, to: ObjectId, now: u64) -> bool;
     /// Whether the store has this object at all. Asked before a snapshot is read back, because a node that
     /// has never written one is the ordinary case and a device that refuses is not — and a read of block
     /// zero cannot tell them apart, both being `Missing`.
@@ -571,23 +575,28 @@ impl DurableStore for MemoryStore {
         self.submitted.len()
     }
 
-    fn remove(&mut self, object: ObjectId) -> Result<(), StoreFault> {
+    fn submit_remove(&mut self, handle: u64, object: ObjectId, _now: u64) -> bool {
         // One drop, which is what `unlink` costs. What this replaced went looking through a map for the
         // blocks of a day, and that was a stand-in's cost rather than a store's: the sweep bench had to
         // leave the round that frees a day out of its numbers because it was the worst round at every
         // size and hid the one being measured.
         self.objects[object.index()] = None;
-        Ok(())
+        self.written.push_back((handle, Ok(())));
+        true
     }
 
     /// A move, which is what a rename is: the bytes do not go anywhere and whatever wore the name is
     /// dropped by being replaced.
-    fn rename(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault> {
-        let moved = self.objects[from.index()]
-            .take()
-            .ok_or(StoreFault::Missing)?;
-        self.objects[to.index()] = Some(moved);
-        Ok(())
+    fn submit_rename(&mut self, handle: u64, from: ObjectId, to: ObjectId, _now: u64) -> bool {
+        let done = match self.objects[from.index()].take() {
+            Some(moved) => {
+                self.objects[to.index()] = Some(moved);
+                Ok(())
+            }
+            None => Err(StoreFault::Missing),
+        };
+        self.written.push_back((handle, done));
+        true
     }
 
     fn exists(&mut self, object: ObjectId) -> bool {
@@ -654,6 +663,19 @@ struct Unwritten {
     segment: u8,
     /// Whether this is the segment's first block, and so what brings the segment into being.
     opening: bool,
+}
+
+/// What the log owes the volume, in the order it owes it.
+///
+/// **One backlog rather than two, because the order between them is the point.** A day's file is removed
+/// when nothing points into it any more, and the blocks written to that day are ahead of the removal in
+/// this queue — so the removal cannot overtake them. Two deques would have made that order a property of
+/// which one the round drained first (rule 18).
+#[derive(Clone, Copy)]
+enum Owed {
+    Block(Unwritten),
+    /// A day's file, once the index has no entry in it.
+    Free(u8),
 }
 
 struct Filling {
@@ -977,6 +999,36 @@ impl LatencyStore {
         self.write_due.len()
     }
 
+    /// A namespace change, in its turn and at no cost. One shape for both because they differ only in
+    /// which call the backing makes.
+    fn queue_namespace(
+        &mut self,
+        handle: u64,
+        now: u64,
+        submit: impl FnOnce(&mut dyn DurableStore, u64, u64) -> bool,
+    ) -> bool {
+        if !self.inner.writes_are_queued() {
+            if self.refuses() {
+                self.refused.push_back(handle);
+                return true;
+            }
+            return submit(self.inner.as_mut(), handle, now);
+        }
+        if self.writes_queued() >= self.queue_depth {
+            return false;
+        }
+        if self.refuses() {
+            self.refused.push_back(handle);
+            return true;
+        }
+        if !submit(self.inner.as_mut(), handle, now) {
+            return false;
+        }
+        let due = self.serve_write(now, Cost::default());
+        self.write_due.push_back((handle, due));
+        true
+    }
+
     /// When the lane will be done with this one. **One server, not many**, because that is what a write
     /// lane is: writes do not commute, so they are served in order by one thread, and a second write
     /// waits for the first rather than overlapping it. The read side draws from a rate gate instead,
@@ -1193,16 +1245,22 @@ impl DurableStore for LatencyStore {
     }
 
     /// Freeing costs the device nothing this model charges for: it is off any request's path, and a device
-    /// that made it expensive would be one whose extents this store does not model.
-    fn remove(&mut self, object: ObjectId) -> Result<(), StoreFault> {
-        self.inner.remove(object)
+    /// that made it expensive would be one whose extents this store does not model. **It still takes its
+    /// turn in the queue**, at no cost, because leaving it out would let it overtake the writes it is
+    /// ordered against — which is the whole reason it is on this queue.
+    fn submit_remove(&mut self, handle: u64, object: ObjectId, now: u64) -> bool {
+        self.queue_namespace(handle, now, |inner, handle, now| {
+            inner.submit_remove(handle, object, now)
+        })
     }
 
     /// A namespace change costs the device nothing this model charges for, for the same reason freeing does
-    /// not. What it does cost — the directory sync a real backing does inside it — is the barrier's cost and
-    /// is charged there.
-    fn rename(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault> {
-        self.inner.rename(from, to)
+    /// not. What it does cost — the directory sync a real backing does inside it — is a barrier's cost, and
+    /// a barrier is priced beside it.
+    fn submit_rename(&mut self, handle: u64, from: ObjectId, to: ObjectId, now: u64) -> bool {
+        self.queue_namespace(handle, now, |inner, handle, now| {
+            inner.submit_rename(handle, from, to, now)
+        })
     }
 
     fn exists(&mut self, object: ObjectId) -> bool {
@@ -1255,7 +1313,7 @@ pub struct RecordLog {
     ///
     /// They are read from as well as written from: a record on a closed block is still in memory, and a
     /// lookup that could not see it would go to a device that has not been given the block yet.
-    pending_writes: VecDeque<Unwritten>,
+    pending_writes: VecDeque<Owed>,
     /// Writes the store has taken and not yet answered for, by the handle it was given. Only the note
     /// travels: the block itself is in residency the whole time.
     ///
@@ -1263,7 +1321,7 @@ pub struct RecordLog {
     /// residency, or a read of it would go to a device that has not been given it — which is the invariant
     /// the whole read path rests on: *a block that is not in the memory tier has already been written*
     /// (rule 22).
-    submitted_writes: VecDeque<(u64, Unwritten)>,
+    submitted_writes: VecDeque<(u64, Owed)>,
     /// The barrier in flight, if any. **One at a time on purpose**: a barrier covers everything submitted
     /// before it, so a second while one is outstanding covers a subset of the first and buys nothing.
     barrier: Option<u64>,
@@ -1427,11 +1485,13 @@ impl RecordLog {
     /// Residency is not touched, and it does not have to be: it holds the most recently written blocks,
     /// and a day old enough to be freed left it long before. A configuration that kept records in memory
     /// longer than they are allowed to exist is refused at startup rather than handled here.
+    /// **Queued rather than done here**, behind whatever this log still owes that day. The removal is
+    /// offered to the volume in `submit_writes` like every other thing this log owes it, and a volume that
+    /// will not take it yet keeps it in the queue rather than losing it — which a call made and dropped
+    /// here would have done, because the day's range is reset now and `reclaim` would never ask again.
     pub fn free_segment(&mut self, segment: u8) -> usize {
         let freed = self.days[segment as usize].blocks as usize;
-        // Nothing to react to: the reaction to a store that cannot do as it is told is rule 19's, and it
-        // arrives with a store that can fail at it.
-        let _ = self.store.remove(ObjectId::segment(segment));
+        self.pending_writes.push_back(Owed::Free(segment));
         self.freed += freed as u64;
         self.days[segment as usize] = BlockRange::default();
         freed
@@ -1867,11 +1927,11 @@ impl RecordLog {
         // dropped from the front — which is the same shape the writeback buffer has and depends on nothing
         // outside this file.
         self.resident.push_back(closed);
-        self.pending_writes.push_back(Unwritten {
+        self.pending_writes.push_back(Owed::Block(Unwritten {
             block: self.next_block,
             segment: self.segment,
             opening,
-        });
+        }));
         self.next_block += 1;
         self.store_open.filled = 0;
     }
@@ -1897,34 +1957,41 @@ impl RecordLog {
             write_handles,
             ..
         } = self;
-        while let Some(unwritten) = pending_writes.front().copied() {
-            let offset = RecordAddr::new(unwritten.segment, unwritten.block, 0).block_offset();
-            // The bytes are in residency, because closing put them there. A block with no entry there is one
-            // eviction has taken, which cannot happen before its write is answered for.
-            let Some(held) = unwritten
-                .block
-                .checked_sub(*oldest_resident)
-                .and_then(|slot| resident.get(slot as usize))
-            else {
-                break;
-            };
+        while let Some(owed) = pending_writes.front().copied() {
             let handle = IoOwner::Blocks.handle(*write_handles + 1);
             // Refused means the store's queue is full: the note stays where it is and is offered again next
             // round. Nothing observable moves before the store has taken it (rule 17) — the handle is only
             // spent once the submit succeeded.
-            if !store.submit_write(
-                handle,
-                ObjectId::segment(unwritten.segment),
-                offset,
-                &held.bytes,
-                unwritten.opening,
-                now,
-            ) {
+            let taken = match owed {
+                Owed::Block(unwritten) => {
+                    let offset =
+                        RecordAddr::new(unwritten.segment, unwritten.block, 0).block_offset();
+                    // The bytes are in residency, because closing put them there. A block with no entry
+                    // there is one eviction has taken, which cannot happen before its write is answered for.
+                    let Some(held) = unwritten
+                        .block
+                        .checked_sub(*oldest_resident)
+                        .and_then(|slot| resident.get(slot as usize))
+                    else {
+                        break;
+                    };
+                    store.submit_write(
+                        handle,
+                        ObjectId::segment(unwritten.segment),
+                        offset,
+                        &held.bytes,
+                        unwritten.opening,
+                        now,
+                    )
+                }
+                Owed::Free(segment) => store.submit_remove(handle, ObjectId::segment(segment), now),
+            };
+            if !taken {
                 break;
             }
             *write_handles += 1;
             pending_writes.pop_front();
-            submitted_writes.push_back((handle, unwritten));
+            submitted_writes.push_back((handle, owed));
             any = true;
         }
         any
@@ -2020,14 +2087,15 @@ impl RecordLog {
     fn trim_residency(&mut self) {
         while self.resident.len() > self.resident_blocks {
             let oldest = self.oldest_resident;
+            let held_by_write = |owed: &Owed| match owed {
+                Owed::Block(unwritten) => unwritten.block == oldest,
+                Owed::Free(_) => false,
+            };
             if self
                 .submitted_writes
                 .iter()
-                .any(|(_, unwritten)| unwritten.block == oldest)
-                || self
-                    .pending_writes
-                    .iter()
-                    .any(|unwritten| unwritten.block == oldest)
+                .any(|(_, owed)| held_by_write(owed))
+                || self.pending_writes.iter().any(held_by_write)
             {
                 break;
             }

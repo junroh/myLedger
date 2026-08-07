@@ -2581,6 +2581,27 @@ volumes and get two instances — and a snapshot on a volume of its own is opene
 modelled in front of it, because the `--store-*` knobs describe the blocks' device and pricing a second
 disk with the first one's numbers would be the same guess in the other direction.
 
+### Everything that changes the volume is on the one queue
+
+`unlink` and `rename` were left synchronous when the lane arrived, for no reason beyond that they were
+synchronous before it. Three things came of that and all three are gone now that they are submitted like a
+write.
+
+**Order stopped being arranged.** §20 above says an `unlink` must not overtake a read of the file and that
+"today this holds by accident" — the pool holds an `Arc<File>`, so unix semantics keep the inode alive.
+That is still true and no longer load-bearing: the removal is behind the reads and writes in one queue.
+`Snapshots` used to buy the same order for its rename by waiting for every completion and a barrier before
+asking; it still waits, but for the *outcome* — a barrier that failed must not be followed by a rename —
+which is a different and smaller thing than waiting for order.
+
+**An `fsync` left the worker's thread.** A rename makes a name durable by syncing the directory, and that
+call was on the thread that answers lookups, once per published dump. It is the lane's now.
+
+**A refused removal stopped being a lost one.** `free_segment` resets the day's range, so a `remove` whose
+call was made and dropped would never be asked for again — `reclaim` looks at days the index has entries
+in, and that one no longer has a range. It is queued in the same backlog as the blocks now, offered again
+next round if the volume will not take it, and behind the writes to that day by construction.
+
 ### Ordering belongs to the implementation, the reaction belongs to the caller
 
 The read side commutes. The write side does not:

@@ -202,9 +202,25 @@ impl Drop for ReadPool {
 /// nothing.
 struct WriteAsk {
     handle: u64,
-    /// `None` is a barrier: everything asked for before it is made durable.
-    at: Option<(ObjectId, u64, bool)>,
+    op: LaneOp,
     buffer: Box<Block>,
+}
+
+/// What the lane can be asked for. **Everything that changes the volume**, in one queue, because the
+/// order between them is what the queue is for: a write must follow the creation of the object it goes
+/// in, a barrier must follow the writes it claims to cover, and a removal or a rename must not overtake
+/// the writes to the object it renames or removes.
+#[derive(Clone, Copy)]
+enum LaneOp {
+    Write {
+        object: ObjectId,
+        offset: u64,
+        creating: bool,
+    },
+    /// Everything asked for before it is made durable.
+    Barrier,
+    Remove(ObjectId),
+    Rename(ObjectId, ObjectId),
 }
 
 struct WriteDone {
@@ -301,6 +317,32 @@ impl LaneFiles {
         self.created = false;
         true
     }
+
+    /// Already gone is the state this is asking for, so it is not a failure.
+    fn remove(&mut self, object: ObjectId) -> bool {
+        self.files[object.index()] = None;
+        let name = FileStore::name_in(&self.path, object);
+        match std::fs::remove_file(&name) {
+            Ok(()) => true,
+            Err(err) => err.kind() == std::io::ErrorKind::NotFound,
+        }
+    }
+
+    /// The name, then the directory: a name is not durable until the directory holding it is, and that
+    /// `fsync` is why this belongs on the lane rather than on the thread that answers lookups.
+    fn rename(&mut self, from: ObjectId, to: ObjectId) -> bool {
+        if std::fs::rename(
+            FileStore::name_in(&self.path, from),
+            FileStore::name_in(&self.path, to),
+        )
+        .is_err()
+        {
+            return false;
+        }
+        self.files[from.index()] = None;
+        self.files[to.index()] = None;
+        self.dir.sync_all().is_ok()
+    }
 }
 
 impl WriteLane {
@@ -347,11 +389,15 @@ impl WriteLane {
                 std::thread::park();
                 continue;
             };
-            let ok = match ask.at {
-                Some((object, offset, creating)) => {
-                    owned.write(object, offset, creating, &ask.buffer)
-                }
-                None => owned.barrier(),
+            let ok = match ask.op {
+                LaneOp::Write {
+                    object,
+                    offset,
+                    creating,
+                } => owned.write(object, offset, creating, &ask.buffer),
+                LaneOp::Barrier => owned.barrier(),
+                LaneOp::Remove(object) => owned.remove(object),
+                LaneOp::Rename(from, to) => owned.rename(from, to),
             };
             let mut done = WriteDone {
                 handle: ask.handle,
@@ -368,19 +414,14 @@ impl WriteLane {
         }
     }
 
-    fn submit(
-        &mut self,
-        handle: u64,
-        at: Option<(ObjectId, u64, bool)>,
-        block: Option<&Block>,
-    ) -> bool {
+    fn submit(&mut self, handle: u64, op: LaneOp, block: Option<&Block>) -> bool {
         let Some(mut buffer) = self.spare.pop() else {
             return false;
         };
         if let Some(block) = block {
             buffer.copy_from_slice(block);
         }
-        let ask = WriteAsk { handle, at, buffer };
+        let ask = WriteAsk { handle, op, buffer };
         match self.asks.push(ask) {
             Ok(()) => {
                 self.outstanding += 1;
@@ -548,6 +589,14 @@ impl FileStore {
     fn note_write(&mut self, object: ObjectId) {
         self.dirty |= 1 << object.index();
     }
+
+    fn rename_now(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault> {
+        std::fs::rename(self.name_of(from), self.name_of(to)).map_err(|_| StoreFault::Device)?;
+        self.files[from.index()] = None;
+        self.files[to.index()] = None;
+        self.dir.sync_all().map_err(|_| StoreFault::Device)?;
+        Ok(())
+    }
 }
 
 impl FileStore {
@@ -620,7 +669,15 @@ impl DurableStore for FileStore {
         _now: u64,
     ) -> bool {
         if let Some(lane) = self.lane.as_mut() {
-            return lane.submit(handle, Some((object, offset, creating)), Some(block));
+            return lane.submit(
+                handle,
+                LaneOp::Write {
+                    object,
+                    offset,
+                    creating,
+                },
+                Some(block),
+            );
         }
         if self.written.len() >= self.queue_depth {
             return false;
@@ -636,7 +693,7 @@ impl DurableStore for FileStore {
 
     fn submit_barrier(&mut self, handle: u64, _now: u64) -> bool {
         if let Some(lane) = self.lane.as_mut() {
-            return lane.submit(handle, None, None);
+            return lane.submit(handle, LaneOp::Barrier, None);
         }
         if self.written.len() >= self.queue_depth {
             return false;
@@ -719,28 +776,42 @@ impl DurableStore for FileStore {
 
     /// Closed and unlinked. The unlink itself is not synced, and does not need to be: `reclaim` uses no clock
     /// and no cursor, so a file that comes back after a crash is found and freed again on the next pass.
-    fn remove(&mut self, object: ObjectId) -> Result<(), StoreFault> {
+    /// On the lane where there is one, so it takes its turn behind the writes to the object it removes.
+    /// Where there is not, it happens here and is answered from the same queue the writes are.
+    fn submit_remove(&mut self, handle: u64, object: ObjectId, _now: u64) -> bool {
+        if let Some(lane) = self.lane.as_mut() {
+            return lane.submit(handle, LaneOp::Remove(object), None);
+        }
+        if self.written.len() >= self.queue_depth {
+            return false;
+        }
         self.files[object.index()] = None;
-        match std::fs::remove_file(self.name_of(object)) {
+        let done = match std::fs::remove_file(self.name_of(object)) {
             Ok(()) => Ok(()),
             // Already gone is the state this is asking for.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(StoreFault::Device),
-        }
+        };
+        self.written.push_back((handle, done));
+        true
     }
 
     /// `rename` and then the directory, because the name is the thing being published and a name is
     /// durable only once the directory holding it is. The bytes are already durable — the caller's barrier
-    /// is what made them so, and it has to precede this call for the same reason it precedes coverage.
+    /// is what made them so, and the queue is what keeps this behind it.
     ///
-    /// Both cached handles go: this side's for `to` would otherwise still be the file the name was taken
+    /// Both cached handles go: the one for `to` would otherwise still be the file the name was taken
     /// from, and a read of the published object would answer with the snapshot before it.
-    fn rename(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault> {
-        std::fs::rename(self.name_of(from), self.name_of(to)).map_err(|_| StoreFault::Device)?;
-        self.files[from.index()] = None;
-        self.files[to.index()] = None;
-        self.dir.sync_all().map_err(|_| StoreFault::Device)?;
-        Ok(())
+    fn submit_rename(&mut self, handle: u64, from: ObjectId, to: ObjectId, _now: u64) -> bool {
+        if let Some(lane) = self.lane.as_mut() {
+            return lane.submit(handle, LaneOp::Rename(from, to), None);
+        }
+        if self.written.len() >= self.queue_depth {
+            return false;
+        }
+        let done = self.rename_now(from, to);
+        self.written.push_back((handle, done));
+        true
     }
 
     fn exists(&mut self, object: ObjectId) -> bool {
@@ -1087,7 +1158,11 @@ mod tests {
         log.collect_writes(0);
         assert_eq!(scratch.files().len(), 1);
 
+        // Queued behind whatever the log still owes that day, so freeing is offered and answered like
+        // every other thing this log asks the volume for.
         log.free_segment(0);
+        log.submit_writes(0);
+        log.collect_writes(0);
         assert!(
             scratch.files().is_empty(),
             "freeing a day left its file: {:?}",

@@ -417,12 +417,12 @@ mod tests {
             self.0.borrow().inflight()
         }
 
-        fn remove(&mut self, object: ObjectId) -> Result<(), StoreFault> {
-            self.0.borrow_mut().remove(object)
+        fn submit_remove(&mut self, handle: u64, object: ObjectId, now: u64) -> bool {
+            self.0.borrow_mut().submit_remove(handle, object, now)
         }
 
-        fn rename(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault> {
-            self.0.borrow_mut().rename(from, to)
+        fn submit_rename(&mut self, handle: u64, from: ObjectId, to: ObjectId, now: u64) -> bool {
+            self.0.borrow_mut().submit_rename(handle, from, to, now)
         }
 
         fn exists(&mut self, object: ObjectId) -> bool {
