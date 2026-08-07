@@ -54,7 +54,7 @@
 
 use ledger_base::ports::ApplyIndex;
 
-use crate::block::{Block, DurableStore, IoOwner, ObjectId, StoreFault, BLOCK_BYTES};
+use crate::block::{Block, DurableStore, IoOwner, ObjectId, StoreFault, VolumeStats, BLOCK_BYTES};
 use crate::engine::PendingEngine;
 use crate::snapshot::{NotASnapshot, SnapshotReader, SnapshotWriter};
 
@@ -219,6 +219,12 @@ impl Snapshots {
 
     pub fn stats(&self) -> SnapshotStats {
         self.stats
+    }
+
+    /// What the volume this dump goes to has done, when it is one of its own. `None` says the blocks'
+    /// volume serves this too, and its numbers already cover both.
+    pub fn volume_stats(&self) -> Option<VolumeStats> {
+        self.own.as_ref().map(|store| store.stats())
     }
 
     /// The disk. One place, whether it is this stage's own or shared with the blocks — which is the whole

@@ -144,6 +144,10 @@ impl DurableStore for HoldingStore {
     fn exists(&mut self, object: ObjectId) -> bool {
         self.0.borrow_mut().inner.exists(object)
     }
+
+    fn stats(&self) -> crate::block::VolumeStats {
+        self.0.borrow().inner.stats()
+    }
 }
 
 impl HoldingStore {

@@ -16,8 +16,8 @@ mod testkit;
 /// changing, and without anything having to be restored to know where a block sits. Design notes §16.
 pub use block::{
     DurableStore, LogTraffic, MemoryStore, ObjectId, OpenBacking, RecordAddr, StoreModel,
-    BLOCK_BYTES, DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS, RECORDS_PER_BLOCK, RECORD_BYTES,
-    SEGMENTS,
+    VolumeStats, BLOCK_BYTES, DEFAULT_FLUSH_BLOCKS, DEFAULT_RESIDENT_BLOCKS, RECORDS_PER_BLOCK,
+    RECORD_BYTES, SEGMENTS,
 };
 /// Exported for the same reason as the overlay: a simulation that drives the engine itself needs the
 /// store the engine actually keeps, and one that reimplemented it would be exercising something else.

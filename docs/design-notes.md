@@ -2581,6 +2581,23 @@ volumes and get two instances — and a snapshot on a volume of its own is opene
 modelled in front of it, because the `--store-*` knobs describe the blocks' device and pricing a second
 disk with the first one's numbers would be the same guess in the other direction.
 
+### The disk keeps its own numbers, because nothing else can
+
+Every IO figure this engine printed was counted above the store, by a caller, about what that caller asked
+for. `store_reads` is the log's count of reads it needed; `bytes` is the dump's count of bytes it wrote.
+Ask "what is this disk doing" and there was nowhere to look — and on a volume two writers share, each
+caller's account covers half of it.
+
+`VolumeStats` is the volume's own, filled by the backing because only the backing knows whether a submit
+was taken. What it answers that nothing else could: **one directory for both writers reports a write queue
+that reached its full depth of 128 and refused six calls**, and neither the log nor the dump could have
+said so — each saw only its own submissions succeed.
+
+Two things follow from having it. The read queue's peak depth was tracked by `RecordLog` and is the
+volume's now, because it is one fact and the disk is its owner (rule 18). And `writes_inflight` stops
+being a method one test calls: it is the field a report prints, which is the same accounting the watchdog
+will read when its reaction is chosen.
+
 ### What is left on the worker's thread, and the one that turned out not to be a threading problem
 
 Two reads are still synchronous on the pending worker's thread. One is the apply-path fallback and it

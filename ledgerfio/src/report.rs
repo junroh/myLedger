@@ -166,6 +166,12 @@ pub struct RunReport {
     pub footprints: Vec<(&'static str, Footprint)>,
     /// Where the engine's records went and where its reads came from.
     pub pending_traffic: ledger_pending::LogTraffic,
+    /// What each volume did, counted by the volume rather than by a caller — the blocks' disk, and the
+    /// snapshot's when it is one of its own.
+    pub volumes: (
+        ledger_pending::VolumeStats,
+        Option<ledger_pending::VolumeStats>,
+    ),
     /// What keeping each lane in seq order cost on top of the reads. Its own field because it is the
     /// engine's orderer's number, not the log's.
     pub order_wait: ledger_pending::OrderWait,
@@ -473,8 +479,10 @@ impl RunReport {
         // Where each read was answered from, which is what says whether either window is earning its
         // size. `unwritten` is the flush window's, `resident` is the residency window's, and only the
         // last kind is an IO once the store is a disk.
+        // How deep the read queue got is the *volume's* answer and is printed there: the log counts where
+        // its reads were answered from, and the disk counts what it was asked to do (rule 18).
         println!(
-            "  engine reads  unwritten={} resident={} store={} ({:.1}% of reads, apply {}, peak depth {})",
+            "  engine reads  unwritten={} resident={} store={} ({:.1}% of reads, apply {})",
             traffic.buffer_reads,
             traffic.resident_reads,
             traffic.store_reads,
@@ -482,8 +490,7 @@ impl RunReport {
                 traffic.store_reads,
                 traffic.buffer_reads + traffic.resident_reads + traffic.store_reads
             ),
-            traffic.apply_store_reads,
-            traffic.inflight_peak
+            traffic.apply_store_reads
         );
         // A read that finished on time and then waited for an earlier read on its lane is a speed problem
         // no per-read bound covers, and it is the product — lane depth times read latency — rather than
@@ -631,6 +638,10 @@ impl RunReport {
             self.metrics.slot_exhaustion,
             self.metrics.commit_failures
         );
+        self.print_volume("blocks", self.volumes.0);
+        if let Some(snapshot) = self.volumes.1 {
+            self.print_volume("snapshot", snapshot);
+        }
         let waits = &self.waits;
         if waits.total() > 0 {
             println!(
@@ -644,6 +655,34 @@ impl RunReport {
                 waits.outran
             );
         }
+    }
+
+    /// One volume's own numbers. **The only line here that answers for a disk rather than for a caller**:
+    /// everything else counts what somebody asked for, and this counts what the volume did with all of it
+    /// together. Printed only when the volume was asked for something, because a memory store that nothing
+    /// reached has nothing to say.
+    fn print_volume(&self, name: &str, v: ledger_pending::VolumeStats) {
+        let touched = v.reads_submitted + v.reads_inline + v.writes + v.barriers;
+        if touched == 0 {
+            return;
+        }
+        println!(
+            "  volume {name:<8} reads {} queued ({} answered, peak {}) + {} inline | writes {} ({:.1}MB), \
+             {} barriers, {} removes, {} renames, peak {} | refused {}r {}w | faults {}",
+            v.reads_submitted,
+            v.reads_answered,
+            v.read_depth_peak,
+            v.reads_inline,
+            v.writes,
+            v.bytes_written as f64 / (1024.0 * 1024.0),
+            v.barriers,
+            v.removes,
+            v.renames,
+            v.write_depth_peak,
+            v.reads_refused,
+            v.writes_refused,
+            v.faults
+        );
     }
 
     /// Whether the run is one anyone should believe, and why it might not be.
@@ -772,6 +811,7 @@ mod tests {
         }
         RunReport {
             waits: ClientWaits::default(),
+            volumes: (ledger_pending::VolumeStats::default(), None),
             workload: "hold-settle",
             accounts: 100_000,
             elapsed: Duration::from_millis(2_500),

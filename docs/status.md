@@ -229,6 +229,17 @@ were (§20). `MemoryStore` backs it today and `LatencyStore` prices a device in 
   own to a full one: the log stops applying so backpressure reaches the client, a dump waits. A completion
   queue is one queue, so `IoOwner` in the top bits of a handle says whose each answer is, and the log
   routes what is not its own to a mailbox the snapshot drains.
+- **A volume counts what it did, and it is the only thing that can.** Every other IO number in this
+  engine is a caller's tally of what it asked for, which answers "what did the drain do" and never "what
+  is this disk doing" — and on a volume two writers share, neither caller can see the other's half.
+  `VolumeStats` is the disk's own: reads queued, answered and how deep the queue got, reads done inline,
+  writes and bytes, barriers, removes, renames, refusals by side, and faults. Counted by each backing,
+  because only the backing knows whether a submit was taken; the rule for what counts as what is in one
+  place. A run prints one line per volume, and the shared-volume case is where it earns itself — one
+  directory for both reports a write queue that reached its full 128 and six refusals, neither of which
+  any caller could see. It is also the accounting the watchdog needs (§20), which is why in-flight was a
+  method nobody called.
+
 - **What says two directories are one volume is a declaration, and only half of one exists.**
   `OpenBacking::same_volume` recognises the same directory, canonicalised — the case it cannot be wrong
   about. `st_dev` is refused for being wrong in both directions (§20). So two directories are two volumes

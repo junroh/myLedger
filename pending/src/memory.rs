@@ -16,7 +16,8 @@ use ledger_base::{
 use ledger_stubkit::{AnswerGate, IdleBackoff, LatencyRange, WorkerThread};
 
 use crate::block::{
-    LogTraffic, OpenBacking, RecordAddr, StoreModel, BLOCK_BYTES, RECORDS_PER_BLOCK, SEGMENTS,
+    LogTraffic, OpenBacking, RecordAddr, StoreModel, VolumeStats, BLOCK_BYTES, RECORDS_PER_BLOCK,
+    SEGMENTS,
 };
 use crate::engine::{BudgetState, PendingEngine, Started};
 use crate::index::{LOAD_TARGET, SLOT_BYTES};
@@ -396,7 +397,6 @@ struct TrafficGauge {
     resident_reads: AtomicU64,
     store_reads: AtomicU64,
     apply_store_reads: AtomicU64,
-    inflight_peak: AtomicU64,
     index_live: AtomicU64,
     index_slots: AtomicU64,
     worst_cascade: AtomicU64,
@@ -427,8 +427,6 @@ impl TrafficGauge {
             .store(traffic.store_reads, Ordering::Relaxed);
         self.apply_store_reads
             .store(traffic.apply_store_reads, Ordering::Relaxed);
-        self.inflight_peak
-            .store(traffic.inflight_peak as u64, Ordering::Relaxed);
         self.index_live
             .store(traffic.index_live as u64, Ordering::Relaxed);
         self.index_slots
@@ -462,7 +460,6 @@ impl TrafficGauge {
             resident_reads: self.resident_reads.load(Ordering::Relaxed),
             store_reads: self.store_reads.load(Ordering::Relaxed),
             apply_store_reads: self.apply_store_reads.load(Ordering::Relaxed),
-            inflight_peak: self.inflight_peak.load(Ordering::Relaxed) as usize,
             index_live: self.index_live.load(Ordering::Relaxed) as usize,
             index_slots: self.index_slots.load(Ordering::Relaxed) as usize,
             worst_cascade: self.worst_cascade.load(Ordering::Relaxed) as u32,
@@ -479,6 +476,76 @@ impl TrafficGauge {
 }
 
 /// The store's occupancy as the worker last published it.
+/// One volume's numbers across the thread boundary. Two of them, because a node may have two volumes and
+/// "how deep did the queue get" has no answer that spans a disk.
+#[derive(Debug, Default)]
+struct VolumeGauge {
+    reads_submitted: AtomicU64,
+    reads_answered: AtomicU64,
+    reads_inline: AtomicU64,
+    writes: AtomicU64,
+    barriers: AtomicU64,
+    removes: AtomicU64,
+    renames: AtomicU64,
+    bytes_written: AtomicU64,
+    reads_refused: AtomicU64,
+    writes_refused: AtomicU64,
+    read_depth_peak: AtomicU64,
+    write_depth_peak: AtomicU64,
+    faults: AtomicU64,
+    /// Whether anything published here at all. A volume of its own that never existed reads as one that
+    /// did nothing, and the two are worth telling apart.
+    present: AtomicBool,
+}
+
+impl VolumeGauge {
+    fn publish(&self, stats: VolumeStats) {
+        self.present.store(true, Ordering::Relaxed);
+        self.reads_submitted
+            .store(stats.reads_submitted, Ordering::Relaxed);
+        self.reads_answered
+            .store(stats.reads_answered, Ordering::Relaxed);
+        self.reads_inline
+            .store(stats.reads_inline, Ordering::Relaxed);
+        self.writes.store(stats.writes, Ordering::Relaxed);
+        self.barriers.store(stats.barriers, Ordering::Relaxed);
+        self.removes.store(stats.removes, Ordering::Relaxed);
+        self.renames.store(stats.renames, Ordering::Relaxed);
+        self.bytes_written
+            .store(stats.bytes_written, Ordering::Relaxed);
+        self.reads_refused
+            .store(stats.reads_refused, Ordering::Relaxed);
+        self.writes_refused
+            .store(stats.writes_refused, Ordering::Relaxed);
+        self.read_depth_peak
+            .store(stats.read_depth_peak as u64, Ordering::Relaxed);
+        self.write_depth_peak
+            .store(stats.write_depth_peak as u64, Ordering::Relaxed);
+        self.faults.store(stats.faults, Ordering::Relaxed);
+    }
+
+    fn read(&self) -> Option<VolumeStats> {
+        if !self.present.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(VolumeStats {
+            reads_submitted: self.reads_submitted.load(Ordering::Relaxed),
+            reads_answered: self.reads_answered.load(Ordering::Relaxed),
+            reads_inline: self.reads_inline.load(Ordering::Relaxed),
+            writes: self.writes.load(Ordering::Relaxed),
+            barriers: self.barriers.load(Ordering::Relaxed),
+            removes: self.removes.load(Ordering::Relaxed),
+            renames: self.renames.load(Ordering::Relaxed),
+            bytes_written: self.bytes_written.load(Ordering::Relaxed),
+            reads_refused: self.reads_refused.load(Ordering::Relaxed),
+            writes_refused: self.writes_refused.load(Ordering::Relaxed),
+            read_depth_peak: self.read_depth_peak.load(Ordering::Relaxed) as usize,
+            write_depth_peak: self.write_depth_peak.load(Ordering::Relaxed) as usize,
+            faults: self.faults.load(Ordering::Relaxed),
+        })
+    }
+}
+
 #[derive(Debug)]
 struct Occupancy {
     holds: MapGauge,
@@ -509,6 +576,9 @@ struct Occupancy {
     /// What the snapshot stage has written, given up on, and held aside. Zero throughout when no
     /// directory was named, which is how a report says "this run wrote none" rather than saying nothing.
     snapshots: SnapshotGauge,
+    /// The blocks' volume, and the snapshot's when it is one of its own.
+    blocks_volume: VolumeGauge,
+    snapshot_volume: VolumeGauge,
 }
 
 impl Default for Occupancy {
@@ -529,6 +599,8 @@ impl Default for Occupancy {
             buffer_stalls: AtomicU64::default(),
             wants_expiry: AtomicBool::new(true),
             snapshots: SnapshotGauge::default(),
+            blocks_volume: VolumeGauge::default(),
+            snapshot_volume: VolumeGauge::default(),
         }
     }
 }
@@ -731,6 +803,15 @@ impl MemoryPending {
     /// where the last published one covered to.
     pub fn snapshots(&self) -> SnapshotStats {
         self.occupancy.snapshots.read()
+    }
+
+    /// What each volume did, counted by the volume. The second is `None` when one store serves both,
+    /// because then the first covers everything on that disk.
+    pub fn volumes(&self) -> (VolumeStats, Option<VolumeStats>) {
+        (
+            self.occupancy.blocks_volume.read().unwrap_or_default(),
+            self.occupancy.snapshot_volume.read(),
+        )
     }
 
     /// What this engine is holding: the store on the worker's thread, and the overlay on the
@@ -1112,8 +1193,14 @@ impl PendingWorker {
         self.occupancy
             .buffer_stalls
             .store(self.buffer_stalls, Ordering::Relaxed);
+        self.occupancy
+            .blocks_volume
+            .publish(self.engine.volume_stats());
         if let Some(snapshots) = self.snapshots.as_ref() {
             self.occupancy.snapshots.publish(snapshots.stats());
+            if let Some(stats) = snapshots.volume_stats() {
+                self.occupancy.snapshot_volume.publish(stats);
+            }
         }
     }
 

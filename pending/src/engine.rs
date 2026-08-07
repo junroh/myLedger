@@ -2,7 +2,7 @@ use ledger_base::ports::{ApplyIndex, HoldData, PendingEffect};
 use ledger_base::{Amount, BudgetGroup, FxHashMap, MapGauge, Transfer, TransferFlags, TxId};
 
 use crate::block::{
-    DurableStore, LogTraffic, MemoryStore, RecordAddr, RecordLog, StoreFault, SEGMENTS,
+    DurableStore, LogTraffic, MemoryStore, RecordAddr, RecordLog, StoreFault, VolumeStats, SEGMENTS,
 };
 use crate::index::{Candidates, HoldTable};
 use crate::snapshot::SnapshotWriter;
@@ -904,6 +904,11 @@ impl PendingEngine {
     /// all (§20).
     pub fn volume(&mut self) -> &mut dyn DurableStore {
         self.records.volume()
+    }
+
+    /// What this engine's volume has done — the disk's own numbers, not a caller's.
+    pub fn volume_stats(&self) -> VolumeStats {
+        self.records.volume_stats()
     }
 
     /// The next completion the log polled that belongs to the other writer on this volume. One queue has one

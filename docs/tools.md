@@ -155,6 +155,11 @@ decides what the prediction is worth:
   it was running on the thread that answers every lookup. **One thread, not a pool**: a segment's first block
   has to land before the ones after it and a barrier has to follow what it covers, and one queue keeps both.
   Design notes §20.
+- **`volume` lines are the disk's own numbers, one per volume.** Everything else a run prints about IO is
+  a caller counting what it asked for; this is what the volume did with all of it. Read the refusals and
+  the peak depths first — a queue at its declared depth with refusals against it is the volume being
+  outrun, and it is invisible in every other line because each caller only sees its own submissions
+  succeed. A line appears only for a volume something reached.
 - **`--snapshot-dir <path>` is where snapshots go, and whether it is `--store-dir` is the declaration.** Two
   flags because they may be two volumes, and which they are is a provisioning decision the design makes
   elsewhere (§2.2). **Naming the same directory for both is how a run says they are one disk**: then one

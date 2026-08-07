@@ -428,6 +428,10 @@ mod tests {
         fn exists(&mut self, object: ObjectId) -> bool {
             self.0.borrow_mut().exists(object)
         }
+
+        fn stats(&self) -> crate::block::VolumeStats {
+            self.0.borrow().stats()
+        }
     }
 
     /// A pair of engines over one store, sized alike so a snapshot of the first restores into the second.

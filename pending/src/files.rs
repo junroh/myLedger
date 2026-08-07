@@ -8,7 +8,7 @@ use std::thread::{JoinHandle, Thread};
 
 use ledger_base::{channel, Consumer, Producer};
 
-use crate::block::{Block, DurableStore, ObjectId, StoreFault, OBJECT_VALUES};
+use crate::block::{Block, DurableStore, ObjectId, StoreFault, VolumeStats, OBJECT_VALUES};
 
 /// The snapshot a restart reads, and the one being written. Two names because the replacement is a rename
 /// (§19), and they are here rather than beside the dump because naming an object is the store's job — a
@@ -509,6 +509,7 @@ pub struct FileStore {
     /// compared against — the same role `--store-read-threads 0` plays for reads — and it is what a virtual
     /// clock can run, since a real thread underneath a simulated one measures neither. Design notes §20.
     lane: Option<WriteLane>,
+    stats: VolumeStats,
 }
 
 impl FileStore {
@@ -537,6 +538,7 @@ impl FileStore {
             queue_depth,
             written: VecDeque::new(),
             lane,
+            stats: VolumeStats::default(),
         }
     }
 
@@ -669,7 +671,7 @@ impl DurableStore for FileStore {
         _now: u64,
     ) -> bool {
         if let Some(lane) = self.lane.as_mut() {
-            return lane.submit(
+            let taken = lane.submit(
                 handle,
                 LaneOp::Write {
                     object,
@@ -678,42 +680,69 @@ impl DurableStore for FileStore {
                 },
                 Some(block),
             );
+            match taken {
+                true => self.stats.took_write(block.len(), self.writes_inflight()),
+                false => self.stats.writes_refused += 1,
+            }
+            return taken;
         }
         if self.written.len() >= self.queue_depth {
+            self.stats.writes_refused += 1;
             return false;
         }
+        self.stats.took_write(block.len(), self.written.len() + 1);
         let done = if creating {
             self.open_with(object, offset, block)
         } else {
             self.append(object, offset, block)
         };
+        self.stats.answered_write(done.is_ok());
         self.written.push_back((handle, done));
         true
     }
 
     fn submit_barrier(&mut self, handle: u64, _now: u64) -> bool {
         if let Some(lane) = self.lane.as_mut() {
-            return lane.submit(handle, LaneOp::Barrier, None);
+            let taken = lane.submit(handle, LaneOp::Barrier, None);
+            match taken {
+                true => self.stats.took_barrier(self.writes_inflight()),
+                false => self.stats.writes_refused += 1,
+            }
+            return taken;
         }
         if self.written.len() >= self.queue_depth {
+            self.stats.writes_refused += 1;
             return false;
         }
+        self.stats.took_barrier(self.written.len() + 1);
         let done = self.barrier();
+        self.stats.answered_write(done.is_ok());
         self.written.push_back((handle, done));
         true
     }
 
     fn poll_written(&mut self, _now: u64) -> Option<(u64, Result<(), StoreFault>)> {
-        match self.lane.as_mut() {
+        let answered = match self.lane.as_mut() {
             Some(lane) => lane.poll(),
             None => self.written.pop_front(),
+        };
+        // The lane answers on its own thread, so a completion is where its outcome is first seen here.
+        if let Some((_, outcome)) = answered.as_ref() {
+            if self.lane.is_some() {
+                self.stats.answered_write(outcome.is_ok());
+            }
         }
+        answered
     }
 
     /// The lane is the whole of the answer: with one, a write is handed to a thread and the caller goes
     /// on; without one, the `pwrite` happens right here.
     fn writes_are_queued(&self) -> bool {
         self.lane.is_some()
+    }
+
+    fn stats(&self) -> VolumeStats {
+        self.stats
     }
 
     fn writes_inflight(&self) -> usize {
@@ -747,24 +776,44 @@ impl DurableStore for FileStore {
             // An object with no file is a read this cannot take at all, which is backpressure's answer rather
             // than a fault's: nothing has been promised, so the caller keeps the command and asks again.
             let Ok(file) = self.file_of(object) else {
+                self.stats.reads_refused += 1;
                 return false;
             };
             let pool = self.pool.as_mut().expect("just checked");
-            return pool.submit(handle, file, offset);
+            let taken = pool.submit(handle, file, offset);
+            match taken {
+                true => {
+                    let depth = self.inflight();
+                    self.stats.took_read(depth);
+                }
+                false => self.stats.reads_refused += 1,
+            }
+            return taken;
         }
         if self.submitted.len() >= self.queue_depth {
+            self.stats.reads_refused += 1;
             return false;
         }
+        self.stats.took_read(self.submitted.len() + 1);
         self.submitted.push_back((handle, object, offset));
         true
     }
 
     fn poll(&mut self, _now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
         if let Some(pool) = self.pool.as_mut() {
-            return pool.poll(into);
+            let answered = pool.poll(into);
+            if let Some(outcome) = answered.as_ref() {
+                self.stats.answered_read(outcome.is_ok());
+            }
+            return answered;
         }
         let (handle, object, offset) = self.submitted.pop_front()?;
-        Some(self.read_at(object, offset, into).map(|()| handle))
+        // The synchronous backend does the `pread` here, and it is the queue's read rather than an inline
+        // one: counted once, as what it was asked for.
+        self.stats.reads_inline -= 1;
+        let answered = self.read_at(object, offset, into).map(|()| handle);
+        self.stats.answered_read(answered.is_ok());
+        Some(answered)
     }
 
     fn inflight(&self) -> usize {
@@ -779,10 +828,12 @@ impl DurableStore for FileStore {
     /// On the lane where there is one, so it takes its turn behind the writes to the object it removes.
     /// Where there is not, it happens here and is answered from the same queue the writes are.
     fn submit_remove(&mut self, handle: u64, object: ObjectId, _now: u64) -> bool {
+        self.stats.removes += 1;
         if let Some(lane) = self.lane.as_mut() {
             return lane.submit(handle, LaneOp::Remove(object), None);
         }
         if self.written.len() >= self.queue_depth {
+            self.stats.writes_refused += 1;
             return false;
         }
         self.files[object.index()] = None;
@@ -803,10 +854,12 @@ impl DurableStore for FileStore {
     /// Both cached handles go: the one for `to` would otherwise still be the file the name was taken
     /// from, and a read of the published object would answer with the snapshot before it.
     fn submit_rename(&mut self, handle: u64, from: ObjectId, to: ObjectId, _now: u64) -> bool {
+        self.stats.renames += 1;
         if let Some(lane) = self.lane.as_mut() {
             return lane.submit(handle, LaneOp::Rename(from, to), None);
         }
         if self.written.len() >= self.queue_depth {
+            self.stats.writes_refused += 1;
             return false;
         }
         let done = self.rename_now(from, to);

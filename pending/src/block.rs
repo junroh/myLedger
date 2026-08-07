@@ -290,6 +290,90 @@ pub enum StoreFault {
     Device,
 }
 
+/// What one volume has done, counted by the volume.
+///
+/// **Every other IO number in this engine is a caller's tally of what it asked for**, which answers "what
+/// did the drain do" and never "what is this disk doing". A volume is where reads and writes from every
+/// caller meet, so it is the only place that can answer the second — and the only place a hung IO could
+/// be noticed, which is where the watchdog goes when its reaction is chosen (§20).
+///
+/// Counted by each backing rather than by a layer above them, because only the backing knows whether a
+/// submit was taken. What counts as what lives here, in the methods, so the rule is in one place even
+/// where the calls are not (rule 1).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VolumeStats {
+    /// Reads handed to the queue, and the ones it has answered.
+    pub reads_submitted: u64,
+    pub reads_answered: u64,
+    /// Reads done on the calling thread instead: the apply-path fallback and the expiry sweep.
+    pub reads_inline: u64,
+    pub writes: u64,
+    pub barriers: u64,
+    pub removes: u64,
+    pub renames: u64,
+    pub bytes_written: u64,
+    /// Calls the volume would not take, by side. Backpressure rather than failure — the caller keeps the
+    /// work — but a number that climbs is a volume the ledger is outrunning.
+    pub reads_refused: u64,
+    pub writes_refused: u64,
+    /// The deepest each queue got, which is what says whether the declared depth is the binding constraint.
+    pub read_depth_peak: usize,
+    pub write_depth_peak: usize,
+    /// Calls the volume itself failed, counted here as well as by whoever asked: on a volume two callers
+    /// share, each of them sees only its own.
+    pub faults: u64,
+}
+
+impl VolumeStats {
+    pub(crate) fn took_read(&mut self, depth: usize) {
+        self.reads_submitted += 1;
+        self.read_depth_peak = self.read_depth_peak.max(depth);
+    }
+
+    pub(crate) fn answered_read(&mut self, ok: bool) {
+        self.reads_answered += 1;
+        if !ok {
+            self.faults += 1;
+        }
+    }
+
+    pub(crate) fn took_write(&mut self, bytes: usize, depth: usize) {
+        self.writes += 1;
+        self.bytes_written += bytes as u64;
+        self.write_depth_peak = self.write_depth_peak.max(depth);
+    }
+
+    pub(crate) fn took_barrier(&mut self, depth: usize) {
+        self.barriers += 1;
+        self.write_depth_peak = self.write_depth_peak.max(depth);
+    }
+
+    pub(crate) fn answered_write(&mut self, ok: bool) {
+        if !ok {
+            self.faults += 1;
+        }
+    }
+
+    /// Both counts a volume's own, so a caller adding its numbers to a model's does not double them.
+    pub(crate) fn merge(self, other: Self) -> Self {
+        Self {
+            reads_submitted: self.reads_submitted + other.reads_submitted,
+            reads_answered: self.reads_answered + other.reads_answered,
+            reads_inline: self.reads_inline + other.reads_inline,
+            writes: self.writes + other.writes,
+            barriers: self.barriers + other.barriers,
+            removes: self.removes + other.removes,
+            renames: self.renames + other.renames,
+            bytes_written: self.bytes_written + other.bytes_written,
+            reads_refused: self.reads_refused + other.reads_refused,
+            writes_refused: self.writes_refused + other.writes_refused,
+            read_depth_peak: self.read_depth_peak.max(other.read_depth_peak),
+            write_depth_peak: self.write_depth_peak.max(other.write_depth_peak),
+            faults: self.faults + other.faults,
+        }
+    }
+}
+
 /// Whole blocks at a segment and an offset, written once and freed a segment at a time. Memory backs it
 /// today; a file or a network volume goes underneath without the engine above changing.
 ///
@@ -348,6 +432,8 @@ pub trait DurableStore {
     fn writes_are_queued(&self) -> bool {
         false
     }
+    /// What this volume has done. **The one place that can answer for the disk rather than for a caller.**
+    fn stats(&self) -> VolumeStats;
     /// `&mut` although reading changes nothing a caller can see: a store that models a device charges
     /// the read, and one that can fail counts it.
     fn read_at(
@@ -413,6 +499,7 @@ pub struct MemoryStore {
     /// no queue to be behind in, so the completion is immediate — which is what makes this the baseline a
     /// backend with a lane is measured against.
     written: VecDeque<(u64, Result<(), StoreFault>)>,
+    stats: VolumeStats,
 }
 
 /// One segment's blocks, and the offset the first of them landed at.
@@ -461,6 +548,7 @@ impl Default for MemoryStore {
             objects: std::array::from_fn(|_| None),
             submitted: VecDeque::new(),
             written: VecDeque::new(),
+            stats: VolumeStats::default(),
         }
     }
 }
@@ -532,6 +620,8 @@ impl DurableStore for MemoryStore {
         } else {
             self.append(object, offset, block)
         };
+        self.stats.took_write(block.len(), self.written.len() + 1);
+        self.stats.answered_write(done.is_ok());
         self.written.push_back((handle, done));
         true
     }
@@ -539,6 +629,7 @@ impl DurableStore for MemoryStore {
     /// Nothing to do, and nothing dishonest about that: memory has no second layer to push bytes into.
     /// Answered anyway, so the caller's barrier bookkeeping runs here exactly as it does over a device.
     fn submit_barrier(&mut self, handle: u64, _now: u64) -> bool {
+        self.stats.took_barrier(self.written.len() + 1);
         self.written.push_back((handle, Ok(())));
         true
     }
@@ -576,6 +667,7 @@ impl DurableStore for MemoryStore {
     }
 
     fn submit_remove(&mut self, handle: u64, object: ObjectId, _now: u64) -> bool {
+        self.stats.removes += 1;
         // One drop, which is what `unlink` costs. What this replaced went looking through a map for the
         // blocks of a day, and that was a stand-in's cost rather than a store's: the sweep bench had to
         // leave the round that frees a day out of its numbers because it was the worst round at every
@@ -588,6 +680,7 @@ impl DurableStore for MemoryStore {
     /// A move, which is what a rename is: the bytes do not go anywhere and whatever wore the name is
     /// dropped by being replaced.
     fn submit_rename(&mut self, handle: u64, from: ObjectId, to: ObjectId, _now: u64) -> bool {
+        self.stats.renames += 1;
         let done = match self.objects[from.index()].take() {
             Some(moved) => {
                 self.objects[to.index()] = Some(moved);
@@ -601,6 +694,10 @@ impl DurableStore for MemoryStore {
 
     fn exists(&mut self, object: ObjectId) -> bool {
         self.objects[object.index()].is_some()
+    }
+
+    fn stats(&self) -> VolumeStats {
+        self.stats
     }
 }
 
@@ -935,6 +1032,9 @@ pub struct LatencyStore {
     corrupt_every: u32,
     calls: u64,
     reads: u64,
+    /// What this model added that the backing never saw: the calls it refused for a full queue and the
+    /// faults it invented. The backing counts what reached it, and these two are what did not.
+    invented: VolumeStats,
 }
 
 impl LatencyStore {
@@ -969,6 +1069,7 @@ impl LatencyStore {
             corrupt_every: model.corrupt_every,
             calls: 0,
             reads: 0,
+            invented: VolumeStats::default(),
         }
     }
 
@@ -1015,9 +1116,11 @@ impl LatencyStore {
             return submit(self.inner.as_mut(), handle, now);
         }
         if self.writes_queued() >= self.queue_depth {
+            self.invented.writes_refused += 1;
             return false;
         }
         if self.refuses() {
+            self.invented.faults += 1;
             self.refused.push_back(handle);
             return true;
         }
@@ -1068,9 +1171,11 @@ impl DurableStore for LatencyStore {
                 .submit_write(handle, object, offset, block, creating, now);
         }
         if self.writes_queued() >= self.queue_depth {
+            self.invented.writes_refused += 1;
             return false;
         }
         if self.refuses() {
+            self.invented.faults += 1;
             self.refused.push_back(handle);
             return true;
         }
@@ -1095,9 +1200,11 @@ impl DurableStore for LatencyStore {
             return self.inner.submit_barrier(handle, now);
         }
         if self.writes_queued() >= self.queue_depth {
+            self.invented.writes_refused += 1;
             return false;
         }
         if self.refuses() {
+            self.invented.faults += 1;
             self.refused.push_back(handle);
             return true;
         }
@@ -1149,6 +1256,11 @@ impl DurableStore for LatencyStore {
         self.inner.writes_are_queued()
     }
 
+    /// The backing's, plus what this model refused or failed that never reached it.
+    fn stats(&self) -> VolumeStats {
+        self.inner.stats().merge(self.invented)
+    }
+
     /// The read that cannot be submitted and harvested: the apply path is in order and cannot park a
     /// decision half way, and the expiry walk reads a whole block at a time. Both hold the thread, so both
     /// are charged to it rather than to the device's queue.
@@ -1179,6 +1291,7 @@ impl DurableStore for LatencyStore {
     /// here is what a device with a full queue does.
     fn submit(&mut self, handle: u64, object: ObjectId, offset: u64, now: u64) -> bool {
         if self.inflight.len() + self.completed.len() >= self.queue_depth {
+            self.invented.reads_refused += 1;
             return false;
         }
         // The store below first: a deadline recorded for a read it would not take is a read this would
@@ -1379,7 +1492,6 @@ pub struct RecordLog {
     resident_reads: u64,
     store_reads: u64,
     apply_store_reads: u64,
-    inflight_peak: usize,
 }
 
 impl Default for RecordLog {
@@ -1437,7 +1549,6 @@ impl RecordLog {
             resident_reads: 0,
             store_reads: 0,
             apply_store_reads: 0,
-            inflight_peak: 0,
         }
     }
 
@@ -1811,7 +1922,6 @@ impl RecordLog {
             return false;
         }
         self.fetching.insert(handle, addr);
-        self.inflight_peak = self.inflight_peak.max(self.store.inflight());
         true
     }
 
@@ -1850,7 +1960,6 @@ impl RecordLog {
             resident_reads: self.resident_reads,
             store_reads: self.store_reads,
             apply_store_reads: self.apply_store_reads,
-            inflight_peak: self.inflight_peak,
             freed: self.freed,
             store_faults: self.faults,
             store_corruptions: self.corruptions,
@@ -2007,6 +2116,12 @@ impl RecordLog {
         self.store.as_mut()
     }
 
+    /// What the volume these blocks are on has done. Counted by the volume rather than by this log,
+    /// which is what makes it an answer about the disk rather than about one of its callers.
+    pub fn volume_stats(&self) -> VolumeStats {
+        self.store.stats()
+    }
+
     /// The next completion this log polled that belongs to somebody else. Drained by that owner, which is
     /// how a shared volume keeps one poller and still answers two callers.
     pub fn take_foreign(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
@@ -2136,8 +2251,6 @@ pub struct LogTraffic {
     /// Store reads on the path that applies committed decisions, which cannot wait for them. The number
     /// a read cache would remove.
     pub apply_store_reads: u64,
-    /// The most reads the store held at once — the queue depth a device would have to serve.
-    pub inflight_peak: usize,
     /// Live entries against the slots the table was sized with, and the longest kick cascade seen. Both
     /// lengthen before inserts start failing, which is what makes "the table does not grow" safe.
     pub index_live: usize,

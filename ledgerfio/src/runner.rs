@@ -96,6 +96,7 @@ impl Runner {
                 ("consensus", stopped.reactor.raft().footprint()),
             ],
             pending_traffic: stopped.reactor.pending().traffic(),
+            volumes: stopped.reactor.pending().volumes(),
             order_wait: stopped.reactor.pending().order_wait(),
             drain_work: stopped.reactor.pending().drain_work(),
             snapshots: stopped.reactor.pending().snapshots(),
