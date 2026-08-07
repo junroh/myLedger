@@ -2219,11 +2219,11 @@ token when it arrives first — and with it gone the curve is monotonic past its
 > **Chose** — a cadence measured in **log positions**, a throttle of **4096 bytes a round**, one file
 > replaced by rename, and a **declared** shadow budget whose breach abandons the dump.
 >
-> ⚠ **The throttle is answered against an arrangement §20 changes, and does not survive it.** 4096 wins
-> only because a chunk is written on the thread that answers lookups. Once every IO has a lane of its own
-> the chunk stops holding that thread, the tail argument is gone, and the cheaper large chunk wins. The
-> cadence, the file discipline and the shadow budget are unaffected — they are about a log, a rename and a
-> map, none of which care which thread the bytes leave on.
+> **The throttle was answered against an arrangement §20 changed, and it was retaken.** 4096 stays and its
+> reason does not: on the store the flag no longer sizes a write, and on the lane it costs the median
+> nothing at any size. What was a trade is now "one block a round is enough" — the retake and its table are
+> at the end of this section. The cadence, the file discipline and the shadow budget were never affected:
+> they are about a log, a rename and a map, none of which care which thread the bytes leave on.
 
 §15 is the format, the coverage rule, replay and the stable read. This is the other half it names as
 missing: where the bytes go, how often, and how fast. `pending/src/snapshots.rs` is the code.
@@ -2302,6 +2302,38 @@ apart with no baseline between them, which is the drift §10 describes. Each arm
 **Not a device's numbers.** These are writes to a page cache on macOS, the same limit `FileStore`'s reads are
 under (§16): what is priced is the syscall path and the round-sharing, not a volume. What a volume adds is the
 85 seconds above, and the throttle is what spreads it.
+
+### The throttle retaken, and the trade it was is gone
+
+§20 moved the chunk onto the store, which changed what the number means before it changed what it costs.
+**The store's unit is a block, so `--snapshot-bytes` no longer sets the size of a write — it sets how many
+4096-byte writes a round does.** Both halves of the trade above were about one big syscall: the
+amortisation that made a large chunk cheaper per byte, and the single long stall that made it cost a
+percentile. Neither survives the move, and the retake says so.
+
+`partial-settle` at 1M/s for three seconds, continuous dumping, arms alternated, seven pairs:
+
+| bytes a round | p50, write lane off | p50, write lane on |
+|---|---|---|
+| no dump | 1.34ms | 1.35ms |
+| 4096 | 1.51ms | 1.40ms |
+| 65536 | 1.55ms | 1.41ms |
+| 262144 | 1.73ms | 1.40ms |
+
+**Off the lane the shape survives and the slope does not.** The median still climbs with the count, which
+is the same reason as before — those writes are on the thread every lookup passes through — but sixty-four
+times the bytes costs 15% of the median where sixteen times used to cost 313%. The old figure was one
+`write_all` of 64KB; this is sixteen of 4096.
+
+**On the lane it is flat**, which is the answer this was retaken for: 1.40ms at every size against 1.35ms
+with no dump at all. And the dump itself goes faster — 2.1GB in three seconds against 1.65GB — because the
+worker is no longer doing its writes.
+
+**So the number stays at one block and the reason is a different one.** It is no longer the cheaper end of
+a trade: on the lane there is no trade, because a larger chunk costs nothing *and* buys nothing (the dump
+is bounded by the rounds it gets, not by the bytes it is allowed), and off the lane smaller is simply
+better. What would change it is a dump that cannot keep up with its cadence, which shows as `abandoned`
+climbing — and that is a reason to raise it against a measurement rather than against this table.
 
 ### The shadow needed a ceiling, and it had none
 
@@ -2805,14 +2837,22 @@ removed (rule 12).
 
 ### What this invalidates, so nothing reads as settled that is not
 
-| number | why it moves |
-|---|---|
-| §19's throttle, 4096 bytes a round | chosen entirely because the chunk holds the worker's thread |
-| the closed decision *How often should the engine make its blocks durable?* | its evidence is `--store-write 50` costing 29% of throughput, which is a worker-thread cost |
-| §16's *a device's cost is charged where it lands* | `LatencyStore` charges writes and syncs to the thread (`busy_until`); they become a queue's cost |
-| §18's read-pool curve | it is a count of spare cores, and a write queue competes for the same ones |
-| `--store-queue-depth`, `--store-read-threads` | they are a volume's properties, and there is no volume today — only a store |
-| `--store-write` / `--store-sync` | they model thread occupancy |
+| number | why it moves | retaken |
+|---|---|---|
+| §19's throttle, 4096 bytes a round | chosen entirely because the chunk holds the worker's thread | **yes** — the number stays and the reason changed, §19 |
+| the closed decision *How often should the engine make its blocks durable?* | its evidence is `--store-write 50` costing 29% of throughput, which is a worker-thread cost | **no, and the attempt is the finding** — see below |
+| §16's *a device's cost is charged where it lands* | `LatencyStore` charges writes and syncs to the thread (`busy_until`); they become a queue's cost | not yet, and it is what blocks the row above |
+| §18's read-pool curve | it is a count of spare cores, and a write queue competes for the same ones | **yes** — same peak, steeper fall, `status.md` |
+| `--store-queue-depth`, `--store-read-threads` | they are a volume's properties, and there is no volume today — only a store | a volume exists now where a deployment declares one directory for both |
+| `--store-write` / `--store-sync` | they model thread occupancy | still true, and now measured to be |
+
+**The sync cadence cannot be retaken with this tool, and that is worth stating as a result.** Measured
+saturated on a workload whose holds survive, `--store-write 100` costs 63% of throughput with the lane off
+and 70% with it on — the same bite on a path where the `pwrite` has demonstrably left the worker's thread.
+The model charges the caller at submit, so it prices thread occupancy whatever the backing does with the
+write. What is missing is the write side of what `LatencyStore` already does for reads: hold the write with
+a deadline and answer it later, so a slow device shows up as a queue that fills and refuses rather than as a
+thread that is busy. Until then a number from `--store-write` on a laned path is a number about the model.
 
 ### What is built, and what is left
 

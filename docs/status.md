@@ -806,9 +806,15 @@ unanswered, and **when that default stops being safe**. The source design's own 
 
 - **How many threads should issue the store's reads in a deployment?**
   *Default:* none, and that is a refusal to pick rather than a measurement. The curve on this machine peaks at
-  two threads (9% over synchronous) and is 43% below synchronous at sixteen, because what bounds the count is
-  the cores left after the reactor, the pending worker and the client — a deployment's property, not a
-  constant. The design says sixteen, which is Little's law at half a millisecond a read.
+  two threads and falls away after, because what bounds the count is the cores left after the reactor, the
+  pending worker and the client — a deployment's property, not a constant. The design says sixteen, which is
+  Little's law at half a millisecond a read.
+  *Retaken with the write lane, which was the ⚠ on it:* the shape survives and the fall is steeper, which is
+  the competition for cores showing up as predicted. Two pairs, saturated, every read a store read —
+  **lane off: 1.03M tx/s at zero threads, 1.05M at two (+2%), 0.90M at four, 0.82M at eight, 0.72M at
+  sixteen (−30%). Lane on: 1.67M, 1.72M (+3%), 1.37M, 1.04M, 0.90M (−46%).** The peak is in the same place
+  and worth less, and past it a thread costs more than it did, because the write lane is one of the things
+  it is now competing with. Nothing about the default changes; what changes is that the ⚠ is discharged.
   *Stops being safe:* the moment `O_DIRECT` is in play, and then zero is not merely suboptimal but the ceiling:
   the synchronous read happens *inside* `poll` on the worker's own thread, so a 100µs device read caps store
   reads at 10k a second and stalls the whole component for each of them. **The measured curve does not transfer
@@ -868,11 +874,16 @@ An entry that vanishes reads as a question nobody ever asked.
   exactly. It is declared in buckets now and a breach abandons the dump, which costs the work and nothing
   else.
 
-  ⚠ **This number is answered against an arrangement that has since changed, and it does not survive it.**
-  The whole argument for 4096 is that a chunk holds the worker's thread. The chunk now goes through the
-  store, so with `--store-write-lane 1` it does not hold that thread at all, the tail argument is gone and
-  the cheaper large chunk wins. The throttle also has to be a whole number of blocks now, which is what the
-  retaking would move between. It stays here as closed because it was genuinely measured and it is the right number
+  **Retaken after §20, and the number survives with a different reason behind it.** Moving the chunk onto
+  the store changed what the flag means: the store's unit is a block, so it now sets how many 4096-byte
+  writes a round does rather than the size of one write — and both halves of the trade above were about one
+  big syscall. Seven alternated pairs, `partial-settle` at 1M/s, continuous dumping: off the write lane the
+  median is 1.51ms at 4KB, 1.55ms at 64KB and 1.73ms at 256KB against 1.34ms with no dump, so the shape
+  holds and the slope does not — sixty-four times the bytes now costs 15% where sixteen times used to cost
+  313%. **On the lane it is flat**: 1.40ms at every size against 1.35ms with no dump, and the dump runs
+  2.1GB in three seconds against 1.65GB. So one block a round stays, because on the lane a larger chunk
+  costs nothing and buys nothing — the dump is bounded by the rounds it gets — and off the lane smaller is
+  simply better. Design notes §19. It stays here as closed because it was genuinely measured and it is the right number
   for the code that exists — but it has to be taken again with the lane, and the same is true of the block
   durability entry below. Left as a note rather than reopened, because reopening a question that *was*
   answered would lose the measurement with it.
@@ -897,11 +908,21 @@ An entry that vanishes reads as a question nobody ever asked.
   them. Design notes §16 has both curves, the read curve beside them, and why 1M is the rate they were taken
   at.
 
-  ⚠ **Its evidence is a worker-thread cost, so §20 moves it too.** "One thread divided by the block seal
-  rate" is a budget for a thread that is doing the `pwrite`. On a write lane the same device time is a
-  queue's, and what the budget divides is no longer one thread. The answer may well survive — a sync every
-  round is cheap for reasons that have nothing to do with which thread runs it — but the number behind it
-  has to be taken again.
+  **Retaken, and the retake says the tool cannot answer it.** The shape reproduces on the default path:
+  `hold-settle --resolve-after 900000` saturated, three alternated pairs, `--store-write 50` costs 42% of
+  throughput and `--store-write 100` costs 63% — the same knee, a little steeper than the 29% and 56%
+  recorded above, on a machine that has drifted and a ledger that has changed since. What it does *not*
+  do is change when the write lane is on: 53% and 70%, which is the same bite on a path where the `pwrite`
+  demonstrably left the worker's thread. **That is the model being blind to the lane, not the lane being
+  worthless** — `LatencyStore` charges a write to `busy_until` at submit, which prices thread occupancy by
+  construction, and §20's own table said this would happen. So the question stays open for the laned path
+  until the model prices a write as a queue's cost the way it already prices a read. Recorded as a blocked
+  measurement rather than an answer, because a number taken with this tool would be a number about the
+  tool.
+
+  **One number did come out of it and it is the lane's own worth at saturation**: 1.26M tx/s against 1.72M
+  with real files on that workload, three pairs, +37%. §20 records +7 to +9% for the same lane, which was a
+  rate-limited run — this is the ceiling, where the thread the writes left is the thing in short supply.
 - **Where does the writeback buffer's drain run?** In the worker's round, on a declared budget — not on a
   thread of its own. A drain asks the index what is still alive and repoints the survivors, and four ways of
   moving that off the worker all fail or collapse: a lock is forbidden on that path (rule 10), a drain that

@@ -173,8 +173,10 @@ decides what the prediction is worth:
   4096-byte blocks, because a block is what the store takes — anything else is refused at start-up rather
   than rounded into a number nobody declared. The chunk is written inside one worker round, so with the
   write lane off it is a stall on the thread every lookup passes through, which is why the default is one
-  block even though a larger chunk is cheaper per byte. ⚠ that argument is the lane's to undo, and the
-  number has not been retaken with `--store-write-lane 1`. The shadow is the buckets the
+  block. **It no longer sets the size of a write** — the store takes blocks, so it sets how many 4096-byte
+  writes a round does, and the per-byte amortisation a larger chunk used to buy went with that. Retaken:
+  off the lane the median is 1.51ms at 4KB and 1.73ms at 256KB; on the lane it is 1.40ms at both. Design
+  notes §19 has the table. The shadow is the buckets the
   stable read holds aside, and a dump that breaches the budget is abandoned rather than allowed to grow; the
   report prints the peak beside the ceiling, so a throttle too slow for its cadence reads as `abandoned`
   climbing while `written` stays at zero. Design notes §19 has both curves.
