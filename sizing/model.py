@@ -728,6 +728,15 @@ def gigabytes(value):
     return value / 1_000_000_000
 
 
+def size(value):
+    """Bytes at whatever scale reads: these span six orders of magnitude in one table, and a raw byte
+    count wide enough for the largest runs into its neighbour for every other row."""
+    for unit, at in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("KB", 1e3)):
+        if value >= at:
+            return f"{value / at:,.2f} {unit}"
+    return f"{value:,.0f} B"
+
+
 def report(sizing):
     """The whole answer as text, overrides and dial breaches included rather than in a footnote."""
     out = []
@@ -744,15 +753,20 @@ def report(sizing):
         )
     out.append(f"unit costs from {sizing.units['source']} at {sizing.units['commit'][:12]}")
     out.append("")
-    out.append(
-        f"{'structure':<28}{'count':>14}{'B/unit':>8}{'bytes':>14}  where the count comes from"
-    )
+    out.append(f"{'structure':<26}{'count':>16}{'B/unit':>9}{'size':>13}  where the count comes from")
     for line in sizing.lines:
         flag = "  << OVER DIAL" if line.over_dial else ""
         out.append(
-            f"{line.name:<28}{line.count:>14,}{line.unit_bytes:>8}{line.bytes:>14,}"
+            f"{line.name:<26}{line.count:>16,}{line.unit_bytes:>9,}{size(line.bytes):>13}"
             f"  {line.kind}: {line.why}{flag}"
         )
+    out.append(
+        f"{'':<26}{'':>16}{'':>9}{'-' * 13}"
+    )
+    out.append(
+        f"{'memory + disk':<26}{'':>16}{'':>9}"
+        f"{size(sizing.memory_bytes + sizing.disk_bytes):>13}"
+    )
     out.append("")
     out.append("what the lifetime curve says, read at the three windows that matter")
     out.append(
@@ -779,18 +793,41 @@ def report(sizing):
     out.append("memory by component")
     for owner, total in sizing.memory_by_component:
         share = total / sizing.memory_bytes * 100 if sizing.memory_bytes else 0
-        out.append(f"  {owner:<26}{gigabytes(total):>8.2f} GB{share:>7.0f}%")
-    out.append(f"  {'total':<26}{gigabytes(sizing.memory_bytes):>8.2f} GB")
-    out.append("")
+        out.append(f"  {owner:<26}{size(total):>13}{share:>7.0f}%")
+    out.append(f"  {'':<26}{'-' * 13}")
+    out.append(f"  {'memory':<26}{size(sizing.memory_bytes):>13}")
     out.append(
-        f"disk {gigabytes(sizing.disk_bytes):.2f} GB in segment files "
-        f"({sizing.stored_records:,} records at {sizing.unit_bytes('pending record')}B, "
-        f"{sizing.records_per_block} to a {sizing.units['block_bytes']}B block)"
+        f"  {'disk (segment files)':<26}{size(sizing.disk_bytes):>13}"
+        f"   {sizing.stored_records:,} records at "
+        f"{sizing.unit_bytes('pending record')}B, {sizing.records_per_block} to a "
+        f"{sizing.units['block_bytes']}B block"
     )
     out.append(f"live holds {sizing.live_holds:,}, requests in flight {sizing.requests_in_flight:,}")
     for breach in sizing.breaches:
         out.append(f"!! {breach}")
     return "\n".join(out)
+
+
+def print_unit_costs(units=None, overrides=None):
+    """Every published unit cost, with any override beside it. Printed rather than buried, because a
+    number nobody can see is one nobody questions -- and these are the numbers a reader would want to
+    ask "what if this were smaller" about."""
+    units = units or load_units()
+    overrides = overrides or {}
+    print(f"{'structure':<28}{'owner':<16}{'unit':<9}{'measured':>10}{'used':>10}")
+    for part in units["parts"]:
+        used = overrides.get(part["name"], part["bytes"])
+        mark = "  <-- overridden" if used != part["bytes"] else ""
+        print(
+            f"{part['name']:<28}{part['owner']:<16}{part['unit']:<9}"
+            f"{part['bytes']:>10,}{used:>10,}{mark}"
+        )
+    print()
+    print(
+        f"a bucket is next_pow2(entries * 8/7) of them; "
+        f"{units['records_per_block']} records fit a {units['block_bytes']}B block "
+        f"(derived from the record size, so overriding it moves the disk figure)"
+    )
 
 
 def residency_curve(demand, policy, hours, dials=None, units=None):
