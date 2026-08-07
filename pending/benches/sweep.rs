@@ -235,7 +235,7 @@ fn empty_one_day_timed(
         // existing in one call, so there is nothing left to keep out of the measurement.
         let started = Instant::now();
         engine.reclaim();
-        engine.propose_expiry(black_box(blocks), voids);
+        engine.propose_expiry(black_box(blocks), 0, voids);
         let elapsed = started.elapsed();
         day.rounds += 1;
         day.voids += voids.len() as u64;

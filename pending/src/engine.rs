@@ -2,7 +2,8 @@ use ledger_base::ports::{ApplyIndex, HoldData, PendingEffect};
 use ledger_base::{Amount, BudgetGroup, FxHashMap, MapGauge, Transfer, TransferFlags, TxId};
 
 use crate::block::{
-    DurableStore, LogTraffic, MemoryStore, RecordAddr, RecordLog, StoreFault, VolumeStats, SEGMENTS,
+    DurableStore, LogTraffic, MemoryStore, RecordAddr, RecordLog, StoreFault, VolumeStats, Walked,
+    SEGMENTS,
 };
 use crate::index::{Candidates, HoldTable};
 use crate::snapshot::SnapshotWriter;
@@ -51,6 +52,9 @@ pub struct PendingEngine {
     /// match a removal against this list as it is applied, and that puts the cost on the path that applies
     /// committed decisions in order. Background work is the right place to pay, so it pays there.
     outstanding: Vec<(RecordAddr, Transfer)>,
+    /// Voids built from blocks the sweep asked for and has now been given, waiting to be handed over.
+    /// The read is on the queue, so a slice arrives a round or more after it was asked for.
+    arrived: Vec<Transfer>,
     /// Voids the sequencer handed back, to be offered again. **Only these**: a void that is neither here
     /// nor gone is one still on its way through consensus, and offering it again costs a lookup and buys
     /// nothing.
@@ -105,18 +109,6 @@ struct Sweep {
     /// what every day did. The index scan this replaces cost 2.2 seconds a pass at the design's table, on
     /// this same thread, ahead of the lookups it would otherwise be answering.
     at_block: u64,
-    /// The first block of the day that still had something live, and so where the next pass starts.
-    ///
-    /// **A day's records only ever leave**, because a closed day is written to no more — so a block that
-    /// yields nothing live will never yield anything again, and reading it on the next pass is a read for
-    /// no reason. That is where the sweep's cost was going: a day is walked from its start again whenever
-    /// the walk reaches the end, and a day finishes only as fast as its voids land, so a few stubborn
-    /// holds made every pass re-read the whole day. Measured before this: twenty to forty reads per hold
-    /// released, 75,000 to 125,000 of them a second.
-    ///
-    /// It does not replace the re-walk, which is still what finds a hold a pass had not reached. It makes
-    /// the re-walk cost the live part of the day instead of all of it.
-    from_block: u64,
 }
 
 /// Whether an effect is arriving for the first time or again.
@@ -165,6 +157,25 @@ impl BudgetState {
     /// that the numbers came from a stream rather than from applies the engine counted.
     pub fn restored(members: u32, remaining: Amount) -> Self {
         Self { members, remaining }
+    }
+}
+
+/// The one place an expiry void is built. Its id is derived from the hold, which is what makes it a
+/// `TransferKind::VoidExpiry` everywhere downstream — the void flags alone would make it a client's.
+///
+/// A free function because the sweep now has two entry points into it: the walk, when a day's block is
+/// still in memory, and a completion, when it had to be read. One rule, one place (rule 1).
+fn expiry_void_for(key: TxId, hold: &HoldData) -> Transfer {
+    Transfer {
+        id: TxId::expiry_void_of(key),
+        pending_ref: key,
+        debit_account: hold.debit_account,
+        credit_account: hold.credit_account,
+        // A void releases whatever is left, so it names no amount — which is also what makes it safe to
+        // offer twice: the second is judged against a hold that is already gone.
+        amount: 0,
+        ledger: hold.ledger,
+        flags: TransferFlags::VOID_PENDING,
     }
 }
 
@@ -229,7 +240,30 @@ impl PendingEngine {
     /// The next lookup the store has finished, if its record turns out to be the key that was asked
     /// for. When it does not, the walk continues and this answers nothing yet.
     pub fn harvest(&mut self, now: u64) -> Option<(u64, Option<HoldData>)> {
-        while let Some((handle, _, found, hold)) = self.records.harvest(now) {
+        // The sweep's block reads come back on the same queue, so this is where they land too. What they
+        // produce is voids, which nobody is waiting on synchronously — they go in the pile the next
+        // `propose_expiry` hands over.
+        loop {
+            // The closure lives only for the call, because everything after it needs the engine back.
+            let harvested = {
+                let Self {
+                    index,
+                    outstanding,
+                    arrived,
+                    records,
+                    ..
+                } = self;
+                let mut sweep = |key: TxId, hold: HoldData, addr: RecordAddr| {
+                    if !index.points_at(key, addr) {
+                        return;
+                    }
+                    let void = expiry_void_for(key, &hold);
+                    outstanding.push((addr, void));
+                    arrived.push(void);
+                };
+                records.harvest(now, &mut sweep)
+            };
+            let (handle, _, found, hold) = harvested?;
             let Some(fetch) = self.fetches.remove(&handle) else {
                 continue;
             };
@@ -242,7 +276,6 @@ impl PendingEngine {
                 Started::Fetching | Started::Busy => continue,
             }
         }
-        None
     }
 
     /// Fetches asked of the store and not yet answered.
@@ -724,7 +757,7 @@ impl PendingEngine {
     /// **The day is done when the index has nothing left in it**, which `live_in_segment` answers in
     /// constant time. That is what the whole-index pass was being used to find out, and it is the reason
     /// the count exists.
-    pub fn propose_expiry(&mut self, blocks: usize, into: &mut Vec<Transfer>) {
+    pub fn propose_expiry(&mut self, blocks: usize, now: u64, into: &mut Vec<Transfer>) {
         let Some(segment) = self.expiring_segment() else {
             return;
         };
@@ -734,7 +767,6 @@ impl PendingEngine {
             self.sweep = Sweep {
                 day: self.sweep.day.map(|day| day + 1),
                 at_block: 0,
-                from_block: 0,
             };
             return;
         }
@@ -749,6 +781,12 @@ impl PendingEngine {
         let index = &self.index;
         self.outstanding
             .retain(|(addr, void)| index.points_at(void.pending_ref, *addr));
+        // Blocks the walk asked for and has since been given. The read is on the queue like every other
+        // one, so a slice arrives a round or more after it was asked for.
+        if !self.arrived.is_empty() {
+            into.append(&mut self.arrived);
+            return;
+        }
         // **Offered again only if the sequencer said it would not take it.** This used to re-offer the
         // whole outstanding slice every round, because a void that had not landed was indistinguishable
         // from one that had been refused — and a re-offer is judged like any resolution, so it costs a
@@ -766,6 +804,11 @@ impl PendingEngine {
         if !self.outstanding.is_empty() {
             return;
         }
+        // A block already on its way. Asking for more would walk the day at the queue's rate rather than
+        // at the rate its voids land.
+        if self.records.sweeping_blocks() > 0 {
+            return;
+        }
         let index = &self.index;
         let outstanding = &mut self.outstanding;
         // Read by the loop below while the closure still holds the queue, which is what a `Cell` is for.
@@ -774,44 +817,32 @@ impl PendingEngine {
             if !index.points_at(key, addr) {
                 return;
             }
-            // The one place an expiry void is built. Its id is derived from the hold, which is what makes
-            // it a `TransferKind::VoidExpiry` everywhere downstream — the void flags alone would make it a
-            // client's.
-            let void = Transfer {
-                id: TxId::expiry_void_of(key),
-                pending_ref: key,
-                debit_account: hold.debit_account,
-                credit_account: hold.credit_account,
-                // A void releases whatever is left, so it names no amount — which is also what makes it
-                // safe to offer twice: the second is judged against a hold that is already gone.
-                amount: 0,
-                ledger: hold.ledger,
-                flags: TransferFlags::VOID_PENDING,
-            };
+            let void = expiry_void_for(key, &hold);
             found.set(found.get() + 1);
             outstanding.push((addr, void));
             into.push(void);
         };
         for _ in 0..blocks.max(1) {
-            let offered = found.get();
-            if !self
+            match self
                 .records
-                .each_record_in_day(segment, self.sweep.at_block, &mut visit)
+                .walk_day_block(segment, self.sweep.at_block, now, &mut visit)
             {
                 // The end of the day's blocks with holds still in it. Those holds are either behind a void
-                // in flight — which `outstanding` is now holding, so the next round offers it again rather
-                // than walking — or they were never reached because the walk stopped short. Either way the
-                // walk starts over, and the day stays open, which is late rather than wrong.
-                self.sweep.at_block = self.sweep.from_block;
-                return;
+                // in flight — which `outstanding` is now holding, so nothing is offered again until the
+                // sequencer says it refused one — or they were never reached because the walk stopped
+                // short. Either way the walk starts over, and the day stays open, which is late rather
+                // than wrong.
+                Walked::End => {
+                    self.sweep.at_block = 0;
+                    return;
+                }
+                // The volume would not take another read. Nothing was asked, so nothing advances.
+                Walked::Busy => return,
+                Walked::Asked | Walked::Visited => {
+                    self.sweep.at_block += 1;
+                    self.swept_blocks += 1;
+                }
             }
-            // A block at the front of the walk with nothing live in it is one no later pass need read: a
-            // closed day is written to no more, so what it has now is the most it will ever have.
-            if found.get() == offered && self.sweep.at_block == self.sweep.from_block {
-                self.sweep.from_block += 1;
-            }
-            self.sweep.at_block += 1;
-            self.swept_blocks += 1;
         }
     }
 
@@ -1613,7 +1644,7 @@ mod expiry_tests {
 
     fn offered(engine: &mut PendingEngine, blocks: usize) -> Vec<Transfer> {
         let mut voids = Vec::new();
-        engine.propose_expiry(blocks, &mut voids);
+        engine.propose_expiry(blocks, 0, &mut voids);
         voids
     }
 
@@ -1845,7 +1876,7 @@ mod expiry_tests {
             day += 1;
             engine.open_day(day, LIFETIME);
             let mut voids = Vec::new();
-            engine.propose_expiry(1, &mut voids);
+            engine.propose_expiry(1, 0, &mut voids);
             for void in &voids {
                 engine.expiry_declined(void.pending_ref);
             }

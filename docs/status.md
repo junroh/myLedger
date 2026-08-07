@@ -540,11 +540,12 @@ neither is outstanding work.
   barrier's completion clears only the first. Folding them would let a snapshot carry slots naming a block a
   restart cannot read.
 
-- **Some IO still runs on the thread that answers lookups, and it is no longer the interesting IO.** Design
-  notes §20 has the decision and the responsibility split; this is the gap it names. What is left on that
-  thread: the `unlink`, **the expiry sweep's block reads**, the apply-path fallback read (measured at zero),
-  and the snapshot's chunk write and restore read — which go through the store now but are synchronous
-  there unless the lane is on. Reads have a pool and it is off by default; writes have a lane and it is off
+- **One read still runs on the thread that answers lookups, and it is the one that has a reason to.** The
+  apply-path fallback is in order and cannot park a decision half way, and it is measured at zero: the
+  record it wants was appended moments ago and the buffer is an hour wide. Everything else submits. The
+  expiry sweep's block reads were the last that did not, and they went to the queue **for consistency
+  rather than for a number** — after the read cache they were 464 device reads in three seconds. A run
+  reports `+ 0 inline` on its volume line now, which is the claim in one figure. Reads have a pool and it is off by default; writes have a lane and it is off
   by default, and both defaults are the synchronous baseline every number is compared against rather than a
   recommendation.
 

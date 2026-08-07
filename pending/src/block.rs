@@ -262,6 +262,9 @@ pub const OBJECT_VALUES: usize = SEGMENT_VALUES + 2;
 pub enum IoOwner {
     Blocks,
     Snapshot,
+    /// The expiry sweep's block reads. Its own tag because they share the read queue with the lookups and
+    /// a completion has to be told apart from theirs — the same reason the write side has two.
+    Sweep,
 }
 
 const OWNER_SHIFT: u32 = 56;
@@ -1521,6 +1524,14 @@ pub struct RecordLog {
     /// Reads asked of the store and not yet answered, by handle, because a block carries several
     /// records and only the address says which one was wanted.
     fetching: FxHashMap<u64, RecordAddr>,
+    /// The expiry sweep's block reads, by handle: which day's block each is for.
+    ///
+    /// **The sweep submits like everything else now.** It used to read inline, on the thread that answers
+    /// lookups, and that was the last read here that did so without a reason — the apply path's fallback
+    /// has one (it is in order and cannot park a decision half way) and this had none beyond being older
+    /// than the queue. Synchronous IO is the exception, not the shape.
+    sweeping_blocks: FxHashMap<u64, (u8, u64)>,
+    sweep_handles: u64,
     appended: u64,
     died_in_buffer: u64,
     carried_on: u64,
@@ -1589,6 +1600,8 @@ impl RecordLog {
             unsynced: None,
             scratch: Block::zeroed(),
             fetching: FxHashMap::default(),
+            sweeping_blocks: FxHashMap::default(),
+            sweep_handles: 0,
             appended: 0,
             died_in_buffer: 0,
             carried_on: 0,
@@ -1793,14 +1806,15 @@ impl RecordLog {
     /// so nothing is allocated per record or per block. The address goes with each record because that is
     /// what the caller checks the index against — a record is alive exactly when the index still points at
     /// it, which is the same test compaction makes.
-    pub fn each_record_in_day(
+    pub fn walk_day_block(
         &mut self,
         segment: u8,
         at: u64,
+        now: u64,
         visit: &mut dyn FnMut(TxId, HoldData, RecordAddr),
-    ) -> bool {
+    ) -> Walked {
         let Some(block) = self.days[segment as usize].block_at(at) else {
-            return false;
+            return Walked::End;
         };
         if let Some(held) = block
             .checked_sub(self.oldest_resident)
@@ -1812,27 +1826,33 @@ impl RecordLog {
                     visit(key, hold, addr);
                 }
             }
-            return true;
+            return Walked::Visited;
         }
-        // Where an address with its record field zeroed used to be built, which was the distinction between
-        // a block and a record being made by convention rather than by the seam.
-        let offset = block * BLOCK_BYTES as u64;
-        if self
-            .store
-            .read_at(ObjectId::segment(segment), offset, &mut self.scratch)
-            .is_err()
-        {
-            // The range says this block was written, so the store not having it is this node's own
-            // bookkeeping disagreeing with itself. Nothing here can repair it; the walk goes on and the
-            // day's count is what refuses to reach zero.
-            return true;
+        // **Submitted like every other read.** It used to happen right here, on the thread that answers
+        // lookups, and it was the last read in this file doing so without a reason: the apply path's
+        // fallback has one — it is in order and cannot park a decision half way — and this had none beyond
+        // being older than the queue. Synchronous IO is the exception, not the shape.
+        let handle = IoOwner::Sweep.handle(self.sweep_handles + 1);
+        if !self.store.submit(
+            handle,
+            ObjectId::segment(segment),
+            block * BLOCK_BYTES as u64,
+            now,
+        ) {
+            return Walked::Busy;
         }
-        if !self.scratch_intact() {
-            // Offering a void built from bytes that changed would release money against a record nobody
-            // wrote. The day stays unfinished, which is the safe direction, and the seal stops the rest.
-            return true;
-        }
-        self.store_reads += 1;
+        self.sweep_handles += 1;
+        self.sweeping_blocks.insert(handle, (segment, block));
+        Walked::Asked
+    }
+
+    /// Every record on the block the last completion brought back, for the sweep that asked for it.
+    fn visit_scratch(
+        &self,
+        segment: u8,
+        block: u64,
+        visit: &mut dyn FnMut(TxId, HoldData, RecordAddr),
+    ) {
         for index in 0..RECORDS_PER_BLOCK {
             let addr = RecordAddr::new(segment, block, index as u8);
             let from = index * RECORD_BYTES;
@@ -1841,7 +1861,6 @@ impl RecordLog {
                 visit(key, hold, addr);
             }
         }
-        true
     }
 
     /// Moves to a new day. The open store block is sealed first: it was promised addresses in the old
@@ -1979,23 +1998,42 @@ impl RecordLog {
 
     /// The next fetch finished by `now`. Completions may arrive in an order the reads were not asked
     /// in, which is what the orderer exists for.
-    pub fn harvest(&mut self, now: u64) -> Option<(u64, RecordAddr, TxId, HoldData)> {
+    pub fn harvest(
+        &mut self,
+        now: u64,
+        sweep: &mut dyn FnMut(TxId, HoldData, RecordAddr),
+    ) -> Option<(u64, RecordAddr, TxId, HoldData)> {
         let completed = self.store.poll(now, &mut self.scratch)?;
         let Ok(handle) = completed else {
             // The lookup that asked will never be answered, and that is the honest outcome rather than a
             // gap: its lane stalls, the seal below stops anything more being applied, and a drain that
             // never completes is what says to replace this leader (rule 19).
             self.note_fault();
+            self.sweeping_blocks.clear();
             return None;
         };
         if !self.scratch_intact() {
+            self.sweeping_blocks.remove(&handle);
+            return None;
+        }
+        self.store_reads += 1;
+        // The sweep's, and it is told apart by the tag rather than by failing to find it among the
+        // lookups: one queue answers both, so a completion has to say whose it is (rule 18).
+        if IoOwner::Sweep.owns(handle) {
+            if let Some((segment, block)) = self.sweeping_blocks.remove(&handle) {
+                self.visit_scratch(segment, block, sweep);
+            }
             return None;
         }
         let addr = self.fetching.remove(&handle)?;
-        self.store_reads += 1;
         let at = addr.index() as usize * RECORD_BYTES;
         let (key, hold) = decode(&self.scratch[at..at + RECORD_BYTES], addr);
         Some((handle, addr, key, hold))
+    }
+
+    /// Blocks the sweep has asked for and not been given yet.
+    pub fn sweeping_blocks(&self) -> usize {
+        self.sweeping_blocks.len()
     }
 
     /// Records appended, records that never left the buffer because they were resolved first, records
@@ -2316,6 +2354,22 @@ impl RecordLog {
             self.spare.push(dropped);
         }
     }
+}
+
+/// What asking for one of a day's blocks did.
+///
+/// `Asked` is the ordinary answer once a day is older than residency, which it always is by the time it
+/// expires: the read is on the queue and the records arrive with its completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Walked {
+    /// Visited now, from memory.
+    Visited,
+    /// Submitted. The completion carries the block, through `harvest`.
+    Asked,
+    /// The volume would not take another read, so nothing was asked and nothing moves this round.
+    Busy,
+    /// The day has no block there, which is how a walk knows it has reached the end.
+    End,
 }
 
 /// What the log has done, for a report that has to say where the reads went.

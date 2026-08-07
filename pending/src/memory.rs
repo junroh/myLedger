@@ -1079,7 +1079,7 @@ impl PendingWorker {
             // instant — a store that models a device is handed this the way it already was for reads.
             let now = self.now();
             let progress = self.hand_over_notices()
-                | self.sweep_expiry()
+                | self.sweep_expiry(now)
                 | self.drain_commands()
                 | self.harvest()
                 // Writes and barriers the store has answered: blocks reach residency and a completed
@@ -1174,7 +1174,7 @@ impl PendingWorker {
     /// Wall time, not the monotonic clock the rest of this file runs on: retention is a promise in calendar
     /// terms and has to survive a restart, which an origin-relative clock cannot do. Read once a round and
     /// only to the day, so the cost is nothing and a jump forward is absorbed by `grace_days`.
-    fn sweep_expiry(&mut self) -> bool {
+    fn sweep_expiry(&mut self, now: u64) -> bool {
         let day = self.days.today();
         let opened = self.engine.open_day(day, self.lifetime_days);
         let reclaimed = self.engine.reclaim() > 0;
@@ -1196,7 +1196,7 @@ impl PendingWorker {
         self.expiring.clear();
         let mut found = std::mem::take(&mut self.expiring);
         self.engine
-            .propose_expiry(self.expiry_blocks_per_round, &mut found);
+            .propose_expiry(self.expiry_blocks_per_round, now, &mut found);
         for void in &found {
             self.owed
                 .push_back(PendingNotice::HoldExpired { void: *void });

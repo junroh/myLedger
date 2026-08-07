@@ -2650,6 +2650,28 @@ submitting, and one completion answers all of them. It saves the queue slots as 
 the half a cache cannot reach — and those slots are what the 1,592 refusals are made of. `status.md` carries
 it as the open question, with the numbers.
 
+### The sweep submits, and the reason is consistency rather than a number
+
+The expiry sweep's block reads were the last in this crate done inline on the thread that answers lookups
+without a reason to be. The apply-path fallback has one — applying is in order and cannot park a decision
+half way — and it is measured at zero besides. This had none beyond being older than the read queue.
+
+By the time it was moved it was worth almost nothing: the read cache had already taken the expiry path's
+device reads from 92,000 to 464, and 464 of anything in three seconds is not a tail. It was moved anyway.
+**Synchronous IO has to be the exception, and an exception needs a reason each time** — a path that is
+synchronous because nobody revisited it is how the `unlink` and the `rename` came to be doing an `fsync` on
+the wrong thread, and how the write lane's arrival left them behind.
+
+What it took was the same shape the write side already had: reads share one completion queue, so a
+completion has to say whose it is. `IoOwner::Sweep` beside `Blocks` and `Snapshot`, and a walk that answers
+`Visited` when the block is in memory and `Asked` when it is on its way. The voids a block produces then
+arrive with its completion rather than with the call that asked, so `propose_expiry` hands over what has
+landed since the last round.
+
+The low-water mark went with it. It was built for a cost that turned out to be somewhere else, measured at
+nothing, and it does not survive a walk whose blocks arrive later — keeping it would have been machinery
+with neither a measurement nor a fit.
+
 ### What is left on the worker's thread, and the one that turned out not to be a threading problem
 
 Two reads are still synchronous on the pending worker's thread. One is the apply-path fallback and it

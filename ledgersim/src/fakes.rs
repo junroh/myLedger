@@ -428,7 +428,10 @@ impl PendingFake {
         }
         let mut found = std::mem::take(&mut state.expiring);
         found.clear();
-        state.store.propose_expiry(blocks_per_round, &mut found);
+        let now = state.now;
+        state
+            .store
+            .propose_expiry(blocks_per_round, now, &mut found);
         state.expiries_offered += found.len() as u64;
         for void in &found {
             state
