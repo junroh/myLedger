@@ -475,6 +475,37 @@ class Sizing:
             self.records_per_day * self.written_share * self.policy.lifetime_days
         )
 
+    @property
+    def live_records_on_disk(self):
+        """Records in the segment files that the index still points at.
+
+        **One per live hold, not `records_per_hold` per live hold**: append-only means a partial settle
+        writes a new version, and the moment it does the old one is dead. A hold has exactly one live
+        record however many it has appended.
+
+        Minus the live holds young enough that their record has not been flushed yet -- those are in
+        the buffer, counted there, and would be counted twice here.
+        """
+        in_buffer = self.demand.holds_in_busiest(self.policy.flush_window_hours)
+        return max(0.0, self.live_holds - in_buffer)
+
+    @property
+    def dead_records_on_disk(self):
+        """What the segment files hold that nothing points at any more, and **it is most of them**.
+
+        A segment is a day, and a day is freed whole -- so the few holds that live out their retention
+        keep their whole day's file alive, dead records and all. That is the price of the property §12
+        bought: a block once written is never rewritten, which is what lets an index slot hold an
+        address and nothing else, and lets compaction, the expiry walk and the sweep all decide by
+        comparing addresses.
+
+        It also says where the disk figure is *not* sensitive. Making segments finer than a day does
+        not help: the surviving share is in every slice equally, so an hour-wide segment is just as
+        unfreeable as a day-wide one. The two levers that do move it are the flush window (what reaches
+        the disk at all) and retention (how long a day's file is kept).
+        """
+        return max(0.0, self.stored_records - self.live_records_on_disk)
+
     # --- the device, which the curve is what makes computable ---
 
     @property
@@ -802,6 +833,23 @@ def report(sizing):
         f"{sizing.unit_bytes('pending record')}B, {sizing.records_per_block} to a "
         f"{sizing.units['block_bytes']}B block"
     )
+    dead_share = (
+        sizing.dead_records_on_disk / sizing.stored_records if sizing.stored_records else 0
+    )
+    per_record = sizing.disk_bytes / sizing.stored_records if sizing.stored_records else 0
+    out.append(
+        f"  {'  of which still live':<26}"
+        f"{size(sizing.live_records_on_disk * per_record):>13}"
+        f"   {sizing.live_records_on_disk:,.0f} records the index still points at"
+    )
+    out.append(
+        f"  {'  of which dead':<26}"
+        f"{size(sizing.dead_records_on_disk * per_record):>13}"
+        f"   {dead_share:.0%} -- a segment is a day and is freed whole, so the few holds that"
+    )
+    out.append(
+        f"  {'':<26}{'':>13}   live out their retention keep the whole day's file alive"
+    )
     out.append(f"live holds {sizing.live_holds:,}, requests in flight {sizing.requests_in_flight:,}")
     for breach in sizing.breaches:
         out.append(f"!! {breach}")
@@ -899,18 +947,24 @@ def flush_window_curve(demand, policy, hours, dials=None, units=None):
                 "buffer_bytes": buffer.bytes,
                 "disk_bytes": one.disk_bytes,
                 "memory_bytes": one.memory_bytes,
+                "dead_share": (
+                    one.dead_records_on_disk / one.stored_records if one.stored_records else 0
+                ),
             }
         )
     return rows
 
 
 def print_flush_window_curve(rows):
-    print(f"{'flush window':>13}{'reaches disk':>14}{'buffer GB':>12}{'memory GB':>12}{'disk GB':>10}")
+    print(
+        f"{'flush window':>13}{'reaches disk':>14}{'buffer GB':>12}{'memory GB':>12}"
+        f"{'disk GB':>10}{'of it dead':>12}"
+    )
     for row in rows:
         print(
             f"{row['hours']:>12}h{row['written_share']:>14.0%}"
             f"{gigabytes(row['buffer_bytes']):>12.2f}{gigabytes(row['memory_bytes']):>12.2f}"
-            f"{gigabytes(row['disk_bytes']):>10.1f}"
+            f"{gigabytes(row['disk_bytes']):>10.1f}{row['dead_share']:>12.0%}"
         )
 
 

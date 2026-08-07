@@ -52,6 +52,16 @@ fences in one order.
   cascade cap 128, load target 0.90, and it never grows. Correctness is detection, not probability:
   a shared fingerprint is found at insert and marked, and only marked slots read a record. Design
   notes §11.
+- **What the segment files hold is mostly dead, and that is bought rather than wasted.** Sized at the
+  reference deployment, 92% of the records on disk are ones the index no longer points at. A segment is
+  a day and is freed whole, so the few holds that live out their retention keep their whole day's file
+  alive — the price of §12's *a block once written is never rewritten*, which is what lets an index slot
+  carry an address and nothing else. Two levers move it and a third does not: the flush window decides
+  what reaches the disk at all (an hour discards half, four hours discards seventy percent) and
+  retention decides how long a day is kept, while **finer segments buy nothing** — the surviving share
+  is in every slice equally, so an hour-wide segment is as unfreeable as a day-wide one. `sizing/`
+  reports live and dead apart for this reason: the disk total on its own reads as live data.
+
 - **Records on blocks.** 4KB blocks, 68-byte records, sixty to a block, little-endian by declaration,
   append-only — a changed remainder is a new version at a new address. A record carries which budget
   group a hold belongs to and **not** that group's totals: those are the group's and change whenever any
