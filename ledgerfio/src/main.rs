@@ -173,6 +173,7 @@ fn print_help() {
     println!(
         "  --store-read-depth <n>      (128) reads the volume holds at once; past it reads are refused"
     );
+    println!("  --store-read-cache <n>      (64) blocks kept from answered reads; 0 for none");
     println!(
         "  --store-write-depth <n>     (128) writes and barriers its lane holds; its own arithmetic"
     );

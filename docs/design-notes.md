@@ -2737,15 +2737,15 @@ touches apply. One queue cannot express two reactions, so it does not try to.
 | `open_with` / `append` | `seal_block` ← `keep` ← `compact` ← `put` ← **`apply_effect`** | every 51 survivors |
 | `open_with` / `append` | `seal_block` ← **`open_day`** ← `sweep_expiry`, in the worker's round | once a day, closing a partial block so one block never spans two days |
 | `fsync` | `RecordLog::sync` ← the worker's round | every round |
-| `unlink` | `free_segment` ← `reclaim` ← `sweep_expiry` | when a day empties |
-| `read_at` | **the expiry sweep**, `each_record_in_day` ← `propose_expiry` | `expiry_blocks_per_round` a round while a day is being emptied |
-| `read_at` | the apply-path fallback, `RecordLog::read` | measured at **zero** — the record it wants was appended moments ago and the buffer is an hour wide |
-| `submit` / `poll` | a lookup that missed both memory windows | the only one with a lane, and it is off by default |
-| `submit_write` / `submit_barrier` / `rename` | `Snapshots::step`, in the worker's round | §19's throttle, and one barrier and one rename per dump |
+| `submit_remove` | `free_segment` ← `reclaim` ← `sweep_expiry` | when a day empties, on the write queue with the blocks it follows |
+| `submit` / `poll` | **the expiry sweep**, `walk_day_block` ← `propose_expiry` | `expiry_blocks_per_round` a round while a day is being emptied |
+| `read_at` | the apply-path fallback, `RecordLog::read` | measured at **zero** — the record it wants was appended moments ago and the buffer is an hour wide, and it is the only read left that does not submit |
+| `submit` / `poll` | a lookup that missed both memory windows | answered from the volume's read cache when the sweep has just read its block, which for expiry is all of them |
+| `submit_write` / `submit_barrier` / `submit_rename` | `Snapshots::step`, in the worker's round | §19's throttle, and one barrier and one rename per dump |
 
-Two rows are easy to miss and both were missed once here. The **day rollover** already issues a device write
-outside apply. The **expiry sweep** already issues device reads on the worker's thread, and unlike the apply
-fallback it is not zero — `swept_blocks` counts it.
+Two rows were easy to miss and both were missed once here. The **day rollover** issues a device write
+outside apply. The **expiry sweep** issued device reads on the worker's thread, and unlike the apply
+fallback it was not zero — that is the row that has since moved to the queue.
 
 The apply-path cost is neither absent nor amortised, which is the worst shape for a tail. `hold-settle` at
 100k/s for two seconds appends 100,032 records, 58% die in the buffer, and **nothing reaches the store** —
@@ -3006,7 +3006,7 @@ implementation, one declared input, no assumption held below the layer that has 
 | the drain out of apply, on a declared budget, with the stall it needs | **built** |
 | closing a block and writing it as two calls | **built** |
 | writes submitted and completed, with the barrier's bookkeeping | **built** |
-| a write lane: one thread, ordered, synchronous baseline kept | **built** |
+| a write lane: one thread, ordered, synchronous baseline kept | **built**, and the default since — every measurement of it is one-sided |
 | the snapshot on the store — object ids, `rename`, a padded stream | **built** |
 | one store instance per volume, where the volume can be told | **built** for the same directory; the declaration that would let two directories say they are one disk is left, behind a configuration question |
 | the watchdog | left, deliberately — see below |

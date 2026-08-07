@@ -149,6 +149,7 @@ impl Runner {
                     corrupt_every: options.store_corrupt_every,
                 },
                 capacity: options.capacity,
+                read_cache_blocks: options.store_read_cache,
                 index_budget_bytes: options.index_budget as usize,
                 expiry_blocks_per_round: options.expiry_blocks_per_round,
                 snapshot: SnapshotPolicy {

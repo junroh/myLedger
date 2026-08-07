@@ -222,8 +222,9 @@ test asserts the store was reached.
 
 `DurableStore` is a filesystem's vocabulary: an **object** is a file, brought into being by its first block
 (a write that says it is creating), appended to at an offset, read at an offset, made durable by a **barrier**,
-renamed, removed whole, and able to fail. Writes and barriers are submitted and answered for, the way reads already
-were (§20). `MemoryStore` backs it today and `LatencyStore` prices a device in front of any backend. Design notes
+renamed, removed whole, asked how far it extends, and able to fail. Everything that changes it — writes,
+barriers, removals, renames — is submitted and answered for, the way reads already were (§20), and the one
+read that still answers inline says so in the figures. `MemoryStore` backs it today and `LatencyStore` prices a device in front of any backend. Design notes
 §16.
 
 - **An object is a day's blocks or one of the snapshot's two files**, in one namespace because they are on
@@ -545,9 +546,13 @@ neither is outstanding work.
   record it wants was appended moments ago and the buffer is an hour wide. Everything else submits. The
   expiry sweep's block reads were the last that did not, and they went to the queue **for consistency
   rather than for a number** — after the read cache they were 464 device reads in three seconds. A run
-  reports `+ 0 inline` on its volume line now, which is the claim in one figure. Reads have a pool and it is off by default; writes have a lane and it is off
-  by default, and both defaults are the synchronous baseline every number is compared against rather than a
-  recommendation.
+  reports `+ 0 inline` on its volume line now, which is the claim in one figure.
+
+  **The two defaults are not symmetric, and the asymmetry is measured rather than accidental.** The write
+  lane is on, because every measurement of it is one-sided — the tail by thirty-one times, throughput at
+  saturation by 37%. The read pool is off, because its curve peaks at two threads and 2–3% here and the
+  count that is right follows from the cores a deployment has spare, which no constant knows. Zero threads
+  and `--store-write-lane 0` are both still the synchronous baseline the older numbers were taken against.
 
   **The snapshot goes through the store now**, so its writes are counted, queued and bounded rather than
   being a `File::write_all` beside it, invisible to every IO figure the tools print. §20's answer was not a
@@ -750,9 +755,11 @@ unanswered, and **when that default stops being safe**. The source design's own 
   device and a hit never reached one.
 
   Coalescing is in the same type — a read for a block already on its way down waits on it instead of asking
-  again — and it **measures zero on this workload**, because the sweep's own read populates the cache before
-  any lookup asks. It is kept as the cache-miss path's only protection; a reader who wants it gone has the
-  number.
+  again — and with the cache on it **measures zero on this workload**, because the sweep's own read populates
+  the cache before any lookup asks. That reading was one-sided, and `--store-read-cache` is what made the
+  other side visible: with the cache off, coalescing catches **54,551** of those same reads and the device
+  sees 2,391 instead of 812. They are one saving taken at two moments — a hit for a block that has landed, a
+  waiter for one still on its way — and the flag is why that is a measurement rather than an argument.
 
 - **The old question, for the record:** they were not coalesced, and fifty-one lookups for records on one
   block became fifty-one store reads of that block and fifty-one queue slots.

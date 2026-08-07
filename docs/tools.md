@@ -198,6 +198,21 @@ decides what the prediction is worth:
   engine keeps the command. At 40,000 store reads a second, 5ms reads need about two hundred outstanding — at
   128 the run reports p50 212ms and that number is the depth rather than the device, at 512 it is p99.9 9.7ms
   with throughput intact. A `--store-read` number is only about the device once the depth is not the limit.
+- **The read cache is a flag because its worth is entirely how much a workload re-reads.**
+  `--store-read-cache` (64 blocks, 0 for none) keeps what the volume has already answered. A sealed block's
+  bytes never change and a block number is never reused, so a hit cannot be stale unless the object goes,
+  and the store forgets an object it removes or renames. On the expiry run above:
+
+  ```
+  --store-read-cache 0     reads 2391 queued (0 from cache, 54551 joined a read) + 54551 inline
+  --store-read-cache 64    reads  812 queued (41310 from cache, 0 joined)
+  ```
+
+  Both columns are worth reading, because they are the same saving taken twice. The cache turns a re-read
+  into a hit; coalescing turns a re-read that arrives *before the first one lands* into a waiter. With the
+  cache on, the sweep's own read fills it before any judgement asks and coalescing measures zero — the line
+  people quote. With it off, coalescing catches fifty-four thousand of the same reads. Neither is dead code
+  and the flag is what shows it.
 - **`--store-fault-every` makes the store refuse** and **`--store-corrupt-every` makes it answer wrongly**,
   which are the only ways to reach the seals those produce: `MemoryStore` neither fails nor lies. The run says
   `SEALED` with the two counts apart, and `fail-stop=true`. The second needs a run that actually reads the

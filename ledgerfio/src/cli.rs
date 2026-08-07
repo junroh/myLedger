@@ -77,9 +77,9 @@ pub struct Options {
     /// only where the missing device would be. Zero is the exact store, which every other answer is
     /// measured against.
     pub store_read: LatencyRange,
-    /// What sealing one block costs. With `--store-write-lane 0` — the default — a write is on the engine's
-    /// own thread, so this is time no lookup gets, which is why it shows up in the tail rather than only in
-    /// throughput. The lane moves the real write off that thread; this charge does not follow it yet, so the
+    /// What sealing one block costs. With `--store-write-lane 0` a write is on the engine's own thread, so
+    /// this is time no lookup gets, which is why it shows up in the tail rather than only in throughput. The
+    /// lane — the default — moves the real write off that thread; this charge does not follow it yet, so the
     /// two together price something that is not there (design notes §20).
     pub store_write: LatencyRange,
     /// What making the written blocks durable costs. The knob the sync cadence turns on: an `fsync` is the
@@ -91,6 +91,14 @@ pub struct Options {
     /// more outstanding than this, the store refuses reads and the run reports the depth rather than the
     /// device. 40,000 reads a second at 5ms needs about two hundred.
     pub store_read_depth: usize,
+    /// Blocks the volume keeps from the reads it has answered, zero for none. Sealed blocks never change and
+    /// a block number is never reused, so what is cached can only be stale by the object being removed, and
+    /// the store forgets an object it removes or renames.
+    ///
+    /// Its worth is entirely how much a workload re-reads: the expiry sweep reads a block and the re-offers
+    /// it produces read it again, which took 92,000 device reads down to 464. A workload that does not
+    /// re-read pays a hash per read for nothing, so this is a flag rather than a constant.
+    pub store_read_cache: usize,
     /// Writes and barriers the volume's lane will hold at once. Its own number because the arithmetic is
     /// its own: a read side wants Little's law on the read rate, a write side wants the block seal rate
     /// against one ordered thread.
@@ -196,6 +204,7 @@ impl Default for Options {
             store_sync: LatencyRange::fixed(Duration::ZERO),
             store_iops: 0,
             store_read_depth: 128,
+            store_read_cache: MemoryPendingConfig::default().read_cache_blocks,
             store_write_depth: 128,
             store_fault_every: 0,
             store_corrupt_every: 0,
@@ -342,6 +351,7 @@ impl Cli {
             "store-sync" => options.store_sync = Self::latency(value)?,
             "store-iops" => options.store_iops = Self::count(value)?,
             "store-read-depth" => options.store_read_depth = Self::count(value)?.max(1) as usize,
+            "store-read-cache" => options.store_read_cache = Self::count(value)? as usize,
             "store-write-depth" => options.store_write_depth = Self::count(value)?.max(1) as usize,
             "store-fault-every" => options.store_fault_every = Self::count(value)? as u32,
             "store-corrupt-every" => options.store_corrupt_every = Self::count(value)? as u32,
