@@ -9,7 +9,7 @@ use std::sync::Mutex;
 use ledger_base::ports::{ApplyIndex, RaftCommit, RaftOutcome, RaftPort, RaftProposal};
 use ledger_base::Effect;
 use ledger_base::{channel, Consumer, Footprint, MapGauge, Prng, Producer, StagedProducer};
-use ledger_stubkit::{IdleBackoff, LatencyRange, WorkerThread};
+use ledger_stubkit::{AnswerGate, IdleBackoff, LatencyRange, WorkerThread};
 
 #[derive(Debug, Clone, Copy)]
 pub struct EchoRaftConfig {
@@ -47,6 +47,8 @@ pub struct EchoRaft {
     /// Proposals the worker is holding, and the effects inside them. Published by the worker because
     /// they live on its thread, and they are real memory: a batch waits here for its whole round trip.
     inflight: Arc<InflightGauge>,
+    /// A test's hold on the commits — see `AnswerGate`. Open unless somebody closed it.
+    commits_gate: AnswerGate,
     _thread: WorkerThread,
 }
 
@@ -64,6 +66,8 @@ impl EchoRaft {
         let worker_log = Arc::clone(&log);
         let inflight = Arc::new(InflightGauge::default());
         let worker_inflight = Arc::clone(&inflight);
+        let commits_gate = AnswerGate::default();
+        let worker_gate = commits_gate.clone();
         let thread = WorkerThread::spawn("raft", move |shutdown| {
             RaftWorker {
                 log: worker_log,
@@ -78,6 +82,7 @@ impl EchoRaft {
                 reorder_every: config.reorder_every,
                 proposals_seen: 0,
                 next_index: 0,
+                gate: worker_gate,
             }
             .run(shutdown)
         });
@@ -86,8 +91,15 @@ impl EchoRaft {
             commits,
             log,
             inflight,
+            commits_gate,
             _thread: thread,
         }
+    }
+
+    /// A hold on the commits, for a test that has to see a batch still in flight — see `AnswerGate`.
+    /// What it replaces is a round trip long enough that the test hoped consensus had not answered yet.
+    pub fn commits(&self) -> AnswerGate {
+        self.commits_gate.clone()
     }
 
     /// What consensus is holding. The log is only kept when a run asked for it, so an empty log here is
@@ -148,6 +160,7 @@ struct RaftWorker {
     fail_every: u64,
     reorder_every: u64,
     proposals_seen: u64,
+    gate: AnswerGate,
     /// The log position the next committed batch takes. A real log would have this durably; here it is a
     /// counter, which is enough to give the sequencer a position to record and is the point of it existing
     /// before consensus does — see `ApplyIndex`.
@@ -204,12 +217,18 @@ impl RaftWorker {
     }
 
     fn deliver(&mut self) -> bool {
+        // A test holding the commits back. The worker keeps taking proposals and timing them; only what
+        // would leave is kept, which is what makes "still in flight" a state a test can wait on rather
+        // than a round trip it has to hope was long enough.
+        if !self.gate.is_open() {
+            self.gate.note_waiting(self.inflight.len());
+        }
         if !self.commits.flush() {
             return false;
         }
         let now = Instant::now();
         let mut progress = false;
-        while !self.commits.is_stuck() {
+        while !self.commits.is_stuck() && self.gate.may_send() {
             let ready = self.inflight.front().is_some_and(|(due, _, _)| *due <= now);
             if !ready {
                 break;
@@ -226,6 +245,7 @@ impl RaftWorker {
                 if outcome == RaftOutcome::Committed {
                     self.next_index += 1;
                 }
+                self.gate.spend();
                 self.commits.send(RaftCommit {
                     batch_id: proposal.batch_id,
                     index: ApplyIndex(self.next_index),

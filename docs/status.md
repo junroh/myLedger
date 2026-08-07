@@ -162,15 +162,32 @@ with latency and an IOPS ceiling. `ledgersim` runs the real reactor on a virtual
 modes: `check` (invariants under fault injection), `capacity` and `require`. `ledgerd` assembles a
 node and drains on a signal.
 
-**A test that has to see a request waiting holds the reply rather than timing it.** `ReplyGate` stops the
-pending stub sending, says how many replies are queued, and lets a declared number through — so an
-interleaving a test depends on is a state it waits for instead of a delay it hopes was long enough. Three
-assertions in `lane_ordering` rested on a five-millisecond stub latency and failed a few times in every
-hundred concurrent runs; the same file now passes 480 of 480, and the whole suite 1,000 of 1,000 with every
-binary running at once. Two of the three needed the reply held until both were queued; the third needed the
-reordered one sent *alone*, because two replies handed over together are judged in whatever order the tick
-takes them. A fourth, in `ledger_invariants`, was the opposite shape — a loop waiting for a batch that a
-seal had already made impossible — and now ends on the seal.
+**A test that has to see a request waiting holds the answer rather than timing it.** `AnswerGate` stops a
+stand-in sending, says how many answers are queued, and lets a declared number through — so an interleaving
+a test depends on is a state it waits for instead of a delay it hopes was long enough. It lives in
+`stubkit` and both stand-ins that need it use it: `MemoryPending::replies` and `EchoRaft::commits`.
+
+**Six tests were fixed by it and by one review, and the review is the part worth keeping.** Every test that
+touches real time was read and sorted into three. A *deadline* (the harness's five seconds, `allocation`'s
+thirty) is a failure bound rather than a subject, and safe. A latency whose waited-on state only the
+reactor can move — `backpressure`'s slot pool, `linked_chains`' in-flight hold — is safe, because the
+reactor is the test thread. What is **not** safe is a latency arranging an interleaving against a component
+that answers on its own thread, and there were four of those:
+
+- three in `lane_ordering`, on a five-millisecond pending latency. Two needed both replies queued before
+  either left; the third needed the reordered one sent *alone*, because two answers handed over together
+  are judged in whatever order the tick takes them — found by measuring, since the swap fired in the
+  failing runs too.
+- one in `pipeline_stages`, asserting `committed == 0` after a two-hundred-millisecond round trip, which is
+  a claim about the clock. Consensus is held now and the test costs no time at all.
+
+Two more were a different shape and are in the same family. `ledger_invariants` waited for a sixth batch
+that a seal had already made impossible, and ends on the seal now. `hold_not_stored` waited for records to
+be *written* and then expected a read to reach the device — but a written block is still in residency, and
+on a busy machine all 512 lookups were answered from memory. It waits for a record to have left memory,
+which is the state it meant.
+
+Measured after: every test binary in the workspace running at once, sixty rounds, 1,500 executions, clean.
 
 Both tools can now reach the read path for honest reasons: `--resolve-after` gives a hold an age, so
 a resolution reads a record at a declared age rather than one written moments ago. `check` draws

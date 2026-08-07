@@ -5,21 +5,22 @@ use std::time::Duration;
 use ledger_base::{AckOutcome, LedgerError, ManualClock, TransferFlags};
 use ledger_raft::EchoRaftConfig;
 use ledger_sequencer::{BatchPolicy, ReactorConfig};
-use ledger_stubkit::LatencyRange;
 
 use harness::*;
 
 /// Path separation: judging must not wait behind consensus. Everything submitted is judged while
 /// the first proposal is still in flight.
+///
+/// **Consensus is held rather than slowed.** This was a two-hundred-millisecond round trip and an
+/// assertion that nothing had committed yet — which is a claim about the clock, and the same shape as
+/// three flakes in `lane_ordering`: a test thread descheduled past the round trip would find the commits
+/// already in. Held, "still in flight" is a state rather than a hope, and the test costs no time at all.
 #[test]
 fn a_slow_consensus_path_does_not_delay_judging() {
-    let mut harness = Harness::with_stubs(
-        NoLatency::pending(),
-        EchoRaftConfig {
-            round_trip: LatencyRange::fixed(Duration::from_millis(200)),
-            ..EchoRaftConfig::default()
-        },
-    );
+    let mut harness = Harness::with_stubs(NoLatency::pending(), NoLatency::raft());
+    let commits = harness.reactor.raft().commits();
+    commits.hold();
+
     let requests = 32;
     let fund = harness.transfer(EXTERNAL, ALICE, FUNDING * 100);
     harness.submit(fund);
@@ -36,6 +37,15 @@ fn a_slow_consensus_path_does_not_delay_judging() {
         0,
         "consensus was still in flight"
     );
+
+    // And the same requests commit once it answers, so what was measured was the separation and not a
+    // pipeline that had simply stopped.
+    commits.release();
+    harness.drain_acks(
+        requests as usize,
+        "nothing committed once consensus answered",
+    );
+    harness.assert_consistent();
 }
 
 /// A commit that consensus refuses rejects the request and leaves the ledger exactly as it was.

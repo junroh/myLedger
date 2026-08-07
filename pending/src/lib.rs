@@ -25,9 +25,7 @@ pub use engine::{NotStored, PendingEngine, Started};
 /// Exported for this crate's own bench: what the index costs as it fills is the number an analytic
 /// estimate of it was guessing, and it can only be measured from outside.
 pub use index::{Candidates, HoldTable, Homeless, DEFAULT_SLOTS, LOAD_TARGET, SLOT_BYTES};
-pub use memory::{
-    DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity, PendingStorage, ReplyGate,
-};
+pub use memory::{DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity, PendingStorage};
 /// Contract 1 is the engine's own work, so the structure that keeps it lives here. Exported for a
 /// simulation that drives the engine and wants to see what ordering cost it.
 pub use orderer::{OrderWait, Orderer};

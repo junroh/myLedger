@@ -138,9 +138,12 @@ fn a_store_that_answers_with_changed_bytes_seals_the_apply_path() {
         holds.push(tx.id);
         harness.submit(tx);
     }
-    // Only once compaction has carried survivors out of the writeback buffer: a hold still in it is
-    // answered without the store being asked, so the resolutions would read nothing.
-    harness.tick_until_written(408);
+    // **Only once a record is on the store and nowhere else.** Carried out of the writeback buffer is
+    // not enough — the block is then in residency, and a lookup answered from there never asks the
+    // device. This waited on the wrong one of the two, and on a busy machine every resolution was
+    // answered from memory: 512 lookups, no store read, and a test that spun until its deadline waiting
+    // for a corruption that could not happen.
+    harness.tick_until_left_memory(51);
     for hold in holds {
         let mut tx = harness.transfer(ALICE, BOB, 1);
         tx.flags = TransferFlags::POST_PENDING;

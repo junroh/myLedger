@@ -289,6 +289,15 @@ impl<C: Clock> Harness<C> {
         });
     }
 
+    /// Until a record is on the store and **nowhere else**, which is a different state from written: a
+    /// block that has left the writeback buffer is still in residency, and a lookup answered from there
+    /// never asks the device at all. A test about what the store answers has to wait for this one.
+    pub fn tick_until_left_memory(&mut self, records: u64) {
+        self.tick_until("no record ever left memory for the store", |reactor| {
+            reactor.pending().traffic().left_memory >= records
+        });
+    }
+
     /// What one account still has reserved, readable from inside a `tick_until` predicate — which is where
     /// a test about expiry has to wait, because there is no ack to wait for.
     pub fn pending_column(reactor: &TestReactor<C>) -> Amount {
