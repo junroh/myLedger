@@ -355,7 +355,7 @@ class Sizing:
                 "answers a client that stopped reading can leave behind before intake pauses",
             ),
             self._line(
-                "queued engine writes",
+                "queued pending writes",
                 dials.engine_write_backlog,
                 "dial",
                 "committed decisions the engine has not taken; the bound is what makes it backpressure",
@@ -381,37 +381,37 @@ class Sizing:
                 "the busiest hour's transactions -- the window is an hour, and nothing enforces it yet",
             ),
             self._line(
-                "engine index",
+                "pending index",
                 index_slots_for(self.live_holds),
                 "derived",
                 "live holds at the 0.90 load target; the table never grows, so this is a ceiling",
             ),
             self._line(
-                "engine budget groups",
+                "pending budget groups",
                 buckets_for(0),
                 "derived",
                 "live budget groups; zero unless the workload declares them",
             ),
             self._line(
-                "overlay entries",
+                "pending overlay",
                 buckets_for(dials.overlay_soft_limit),
                 "dial",
                 "the overlay's own soft limit; it evicts down to this rather than growing",
             ),
             self._line(
-                "engine writeback buffer",
+                "pending writeback buffer",
                 self.blocks_for(self.unwritten_records),
                 "derived",
                 "the flush window's records: a recovery bound, so it follows the busiest hour",
             ),
             self._line(
-                "engine resident blocks",
+                "pending resident blocks",
                 self.blocks_for(self.resident_records),
                 "derived",
                 "survivors inside the residency window: a latency bound",
             ),
             self._line(
-                "engine record blocks",
+                "pending stored blocks",
                 self.blocks_for(self.stored_records),
                 "derived",
                 "every day's survivors still inside retention + grace -- this is the disk figure",
@@ -450,14 +450,36 @@ class Sizing:
 
     # --- answers ---
 
+    #: The one structure that becomes disk rather than memory once the store is a directory. Named
+    #: once, because two places deciding which side of the line it falls on is how a total stops adding
+    #: up.
+    DISK_PART = "pending stored blocks"
+
     @property
     def memory_bytes(self):
-        """Everything but the segment files, which are the disk tier once the store is a directory."""
-        return sum(line.bytes for line in self.lines if line.name != "engine record blocks")
+        return sum(line.bytes for line in self.lines if line.name != self.DISK_PART)
 
     @property
     def disk_bytes(self):
-        return dict(self.lines_by_name)["engine record blocks"].bytes
+        return dict(self.lines_by_name)[self.DISK_PART].bytes
+
+    @property
+    def memory_by_component(self):
+        """Memory per owning component, in the order a request meets them.
+
+        Worth its own answer rather than a total: which component is large decides what a deployment
+        can do about it. Accounts are the working set and cannot be traded away; the pending engine is
+        a rate and a retention, both of which are policy.
+        """
+        order, totals = [], {}
+        for line in self.lines:
+            if line.name == self.DISK_PART:
+                continue
+            if line.owner not in totals:
+                order.append(line.owner)
+                totals[line.owner] = 0
+            totals[line.owner] += line.bytes
+        return [(owner, totals[owner]) for owner in order]
 
     @property
     def lines_by_name(self):
@@ -472,7 +494,7 @@ class Sizing:
             for line in self.lines
             if line.over_dial
         ]
-        index = dict(self.lines_by_name)["engine index"]
+        index = dict(self.lines_by_name)["pending index"]
         if index.bytes > self.dials.index_budget_bytes:
             found.append(
                 f"engine index needs {gigabytes(index.bytes):.2f} GB but the declared budget is "
@@ -511,8 +533,17 @@ def report(sizing):
             f"  {line.kind}: {line.why}{flag}"
         )
     out.append("")
-    out.append(f"memory {gigabytes(sizing.memory_bytes):.2f} GB")
-    out.append(f"disk   {gigabytes(sizing.disk_bytes):.2f} GB (segment files)")
+    out.append("memory by component")
+    for owner, total in sizing.memory_by_component:
+        share = total / sizing.memory_bytes * 100 if sizing.memory_bytes else 0
+        out.append(f"  {owner:<26}{gigabytes(total):>8.2f} GB{share:>7.0f}%")
+    out.append(f"  {'total':<26}{gigabytes(sizing.memory_bytes):>8.2f} GB")
+    out.append("")
+    out.append(
+        f"disk {gigabytes(sizing.disk_bytes):.2f} GB in segment files "
+        f"({sizing.stored_records:,} records at {sizing.unit_bytes('pending record')}B, "
+        f"{sizing.units['records_per_block']} to a {sizing.units['block_bytes']}B block)"
+    )
     out.append(f"live holds {sizing.live_holds:,}, requests in flight {sizing.requests_in_flight:,}")
     for breach in sizing.breaches:
         out.append(f"!! {breach}")

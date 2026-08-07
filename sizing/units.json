@@ -2,7 +2,7 @@
   "block_bytes": 4096,
   "bucket_rule": "next_power_of_two(entries * 8 / 7)",
   "cache_line": 128,
-  "commit": "e0767ebad7f1ad90627de28beb340f875949215f",
+  "commit": "39617ec61bef3f26d7680f2906f47790fd499037",
   "parts": [
     {
       "bytes": 228,
@@ -48,7 +48,7 @@
     },
     {
       "bytes": 80,
-      "name": "queued engine writes",
+      "name": "queued pending writes",
       "owner": "sequencer",
       "unit": "effect"
     },
@@ -72,62 +72,62 @@
     },
     {
       "bytes": 8,
-      "name": "engine index",
-      "owner": "pending",
+      "name": "pending index",
+      "owner": "pending engine",
       "unit": "slot"
     },
     {
       "bytes": 33,
-      "name": "engine budget groups",
-      "owner": "pending",
+      "name": "pending budget groups",
+      "owner": "pending engine",
       "unit": "bucket"
     },
     {
       "bytes": 49,
-      "name": "overlay entries",
-      "owner": "pending",
+      "name": "pending overlay",
+      "owner": "pending engine",
       "unit": "bucket"
     },
     {
       "bytes": 4096,
-      "name": "engine writeback buffer",
-      "owner": "pending",
+      "name": "pending writeback buffer",
+      "owner": "pending engine",
       "unit": "block"
     },
     {
       "bytes": 4096,
-      "name": "engine resident blocks",
-      "owner": "pending",
+      "name": "pending resident blocks",
+      "owner": "pending engine",
       "unit": "block"
     },
     {
       "bytes": 4096,
-      "name": "engine record blocks",
-      "owner": "pending",
+      "name": "pending stored blocks",
+      "owner": "pending engine",
       "unit": "block"
     },
     {
       "bytes": 4096,
       "name": "volume read cache",
-      "owner": "pending",
+      "owner": "pending engine",
       "unit": "block"
     },
     {
       "bytes": 4096,
       "name": "volume write lane",
-      "owner": "pending",
+      "owner": "pending engine",
       "unit": "block"
     },
     {
       "bytes": 4096,
       "name": "volume read pool",
-      "owner": "pending",
+      "owner": "pending engine",
       "unit": "block"
     },
     {
       "bytes": 80,
       "name": "pending record",
-      "owner": "pending",
+      "owner": "pending engine",
       "unit": "record"
     },
     {

@@ -62,32 +62,36 @@ const _: () = assert!(
 /// told and nothing more. A bucket is a staircase — a hash table rounds up to a power of two, so one
 /// percent more entries can double it. A block is 4KB whether or not the records in it are live.
 ///
-/// One part is disk rather than memory and its unit says so: `pending record` is what a hold costs in a
-/// segment file, and it is the only entry here with no counterpart in `MemoryPending::footprint`. It
-/// belongs in the list anyway — a sizing answer that reported memory and left the disk to a second
-/// source is how the two drift apart.
+/// The three block counts are the engine's own three words for one set of records, and they answer
+/// three questions: `writeback buffer` is what a restart would have to replay, `resident blocks` is what
+/// memory keeps so a resolution need not read a device, and `stored blocks` is what the store holds —
+/// the only one that becomes a disk figure once the store is a directory.
+///
+/// `pending record` is the odd one: it is the eighty bytes a hold costs inside a block, so it is a unit
+/// rather than a structure and no footprint reports it. It belongs here anyway — a sizing answer that
+/// reported memory and left the record size to a second source is how the two drift apart.
 pub const SIZING: &[ledger_base::SizedPart] = &[
-    ledger_base::SizedPart::new("engine index", ledger_base::Unit::Slot, index::SLOT_BYTES),
+    ledger_base::SizedPart::new("pending index", ledger_base::Unit::Slot, index::SLOT_BYTES),
     ledger_base::SizedPart::table::<ledger_base::BudgetGroup, engine::BudgetState>(
-        "engine budget groups",
+        "pending budget groups",
     ),
     ledger_base::SizedPart::new(
-        "overlay entries",
+        "pending overlay",
         ledger_base::Unit::Bucket,
         overlay::ENTRY_BUCKET_BYTES,
     ),
     ledger_base::SizedPart::new(
-        "engine writeback buffer",
+        "pending writeback buffer",
         ledger_base::Unit::Block,
         block::BLOCK_BYTES,
     ),
     ledger_base::SizedPart::new(
-        "engine resident blocks",
+        "pending resident blocks",
         ledger_base::Unit::Block,
         block::BLOCK_BYTES,
     ),
     ledger_base::SizedPart::new(
-        "engine record blocks",
+        "pending stored blocks",
         ledger_base::Unit::Block,
         block::BLOCK_BYTES,
     ),

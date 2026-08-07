@@ -74,7 +74,7 @@ pub const SIZING: &[SizedPart] = &[
     ),
     SizedPart::new("ack backlog", Unit::Entry, state::outbox::ACK_BYTES),
     SizedPart::new(
-        "queued engine writes",
+        "queued pending writes",
         Unit::Effect,
         state::pending::PENDING_EFFECT_BYTES,
     ),

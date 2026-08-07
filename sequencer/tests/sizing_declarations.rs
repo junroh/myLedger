@@ -90,7 +90,7 @@ fn the_hold_index_is_priced_by_its_slots_and_not_as_a_hash_table() {
     let index = footprint
         .parts()
         .iter()
-        .find(|part| part.name == "engine index")
+        .find(|part| part.name == "pending index")
         .expect("the engine reports its index");
 
     assert_eq!(

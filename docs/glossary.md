@@ -170,3 +170,19 @@ neither mentions any of these.
 | **compaction** | carrying a block's survivors on and dropping the rest. A record is alive exactly when the index points at it. | `PendingEngine::compact`, `HoldTable::points_at` |
 | **orderer** | the engine's side of contract 1: replies leave in the order their commands arrived, however they finished. | `Orderer`, `OrderWait` |
 | **place** | a reply's spot in its lane, reserved when the command is dequeued and filled when the work finishes. | `Orderer::expect`, `Orderer::fill` |
+
+## Sizing
+
+What one structure costs and how many of it there are — two different owners, and naming them apart is
+what keeps a sizing answer from being half remembered. `sizing/`, and design notes §10 for why only one
+half of it is arithmetic.
+
+| term | means | in code |
+|---|---|---|
+| **sized part** | one structure a sizing answer prices, named the same by the component that reports it and the crate that declares it. A component's `Footprint` says how many it holds now; its `SIZING` says what one costs. Matching by name is the whole mechanism, so the names are a vocabulary rather than labels. | `SizedPart`, `Footprint::parts`, each crate's `SIZING` |
+| **unit** | what the count is counted in, because each reaches bytes by a different route: a **slot** is linear, a **bucket** is a staircase, a **block** is 4KB whether or not its records are live, an **account** is the working set, and an **effect**, **batch** or **entry** is one item in a buffer. | `Unit` |
+| **bucket** | one `hashbrown` slot-and-control-byte, and the count is `next_pow2(entries x 8/7)` — so one percent more entries can double a table. Not the cuckoo index's bucket, which is four eight-byte slots and steps four times more coarsely. | `bucket_bytes`, `buckets_for`, `index_slots_for` |
+| **derived** | a count that follows from demand — a rate, a lifetime, a retention, a working set. | `Line.kind` |
+| **dial** | a count that is a configured ceiling. **An output of a sizing exercise, not an input**: a dial below what demand requires is where the node refuses work. | `Dials` |
+| **writeback buffer / resident blocks / stored blocks** | the engine's three words for one set of records, answering three questions: what a restart would replay, what memory keeps so a resolution need not read a device, and what the store holds — the last being the disk figure. | `RecordLog::blocks`, `MemoryPending::footprint` |
+| **peak / busiest hour / daily volume** | the three rates a deployment brings, and they are not one rate. The peak sizes what is held in flight, the busiest hour sizes the hour-wide windows, and the day sizes retention. A deployment whose peak is eighty-six times its mean is sized eighty-six times wrong by whichever one it picks. | `Demand` |

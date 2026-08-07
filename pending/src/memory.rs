@@ -877,14 +877,14 @@ impl MemoryPending {
         // index asserts that a bucket is still exactly its slots.
         let slots = self.occupancy.holds.capacity();
         footprint.other(
-            "engine index",
+            "pending index",
             self.occupancy.holds.entries(),
             self.occupancy.holds.peak(),
             slots,
             slots * SLOT_BYTES,
         );
         footprint.gauged_table::<BudgetGroup, BudgetState>(
-            "engine budget groups",
+            "pending budget groups",
             &self.occupancy.budgets,
         );
         // Three figures for one set of records, because they answer three different questions: what a
@@ -893,7 +893,7 @@ impl MemoryPending {
         // a disk.
         let buffered = self.occupancy.buffer.entries();
         footprint.other(
-            "engine writeback buffer",
+            "pending writeback buffer",
             buffered,
             self.occupancy.buffer.peak(),
             self.occupancy.buffer.capacity(),
@@ -901,7 +901,7 @@ impl MemoryPending {
         );
         let resident = self.occupancy.resident.entries();
         footprint.other(
-            "engine resident blocks",
+            "pending resident blocks",
             resident,
             self.occupancy.resident.peak(),
             self.occupancy.resident.capacity(),
@@ -909,7 +909,7 @@ impl MemoryPending {
         );
         let blocks = self.occupancy.blocks.entries();
         footprint.other(
-            "engine record blocks",
+            "pending stored blocks",
             blocks,
             self.occupancy.blocks.peak(),
             0,

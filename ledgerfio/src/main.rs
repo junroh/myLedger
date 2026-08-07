@@ -99,7 +99,7 @@ fn sizing() -> Vec<(&'static str, &'static ledger_base::SizedPart)> {
         ("sequencer", ledger_sequencer::SIZING),
         ("accounts", ledger_account::SIZING),
         ("idem", ledger_idempotency::SIZING),
-        ("pending", ledger_pending::SIZING),
+        ("pending engine", ledger_pending::SIZING),
         ("consensus", ledger_raft::SIZING),
     ]
     .into_iter()
@@ -140,12 +140,12 @@ fn print_layout(json: bool) {
     );
     println!();
     println!(
-        "{:<28} {:<10} {:>10}  unit",
+        "{:<26} {:<15} {:>10}  unit",
         "sizing part", "owner", "bytes/unit"
     );
     for (owner, part) in sizing() {
         println!(
-            "{:<28} {:<10} {:>10}  {}",
+            "{:<26} {:<15} {:>10}  {}",
             part.name,
             owner,
             part.bytes,

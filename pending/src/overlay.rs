@@ -315,7 +315,7 @@ impl HoldOverlay {
         let mut footprint = Footprint::new();
         let mut sized = Footprint::new();
         sized.hash_table::<TxId, Entry>(
-            "overlay entries",
+            "pending overlay",
             self.entries.len(),
             self.entries.capacity(),
             self.peak.entries(),

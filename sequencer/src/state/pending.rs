@@ -113,7 +113,7 @@ impl<P: PendingPort> PendingChannel<P> {
     /// than the reactor commits, which is why its peak belongs beside the engine's own latency.
     pub fn footprint(&self, footprint: &mut Footprint) {
         footprint.buffer::<PendingEffect>(
-            "queued engine writes",
+            "queued pending writes",
             self.writes.len(),
             self.writes.capacity(),
             self.peak.entries(),
