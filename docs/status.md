@@ -761,6 +761,11 @@ unanswered, and **when that default stops being safe**. The source design's own 
   sees 2,391 instead of 812. They are one saving taken at two moments — a hit for a block that has landed, a
   waiter for one still on its way — and the flag is why that is a measurement rather than an argument.
 
+  `make verify` runs both arms, and adding the second one found that the first was not reaching the device
+  at all: at the default residency every record the sweep's judgements want is still in memory, so the
+  expiry line reported `reads 0 queued` and nothing below the engine was covered. `--residency 1` is what
+  pushes the reads down to the volume, and the cache-off arm is where the read path is exercised.
+
 - **The old question, for the record:** they were not coalesced, and fifty-one lookups for records on one
   block became fifty-one store reads of that block and fifty-one queue slots.
   *Where it showed:* expiry, by construction. A block holds fifty-one records, the sweep turns them into

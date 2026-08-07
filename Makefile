@@ -29,6 +29,16 @@ help:
 # expires — the sweep then frees each one without reading a block, and reports nothing. So the rate is held
 # down and the holds are given an age longer than the run, which leaves them alive to be found.
 #
+# The same run again with `--residency 1 --store-read-cache 0`, and it covers two things the line above
+# does not reach. **The first is the device at all**: at the default residency every record the sweep's
+# judgements want is still in memory, so that run reports `reads 0 queued` and the whole read path below
+# the engine is untouched by it. An hour of residency is what pushes the reads down to the volume.
+#
+# **The second is the cache-off arm.** With the cache on, the sweep's own read fills it before any judgement
+# asks and coalescing measures zero — so the only protection the miss path has is, on every line here, code
+# that nothing runs. Off, it carries fifty-four thousand reads. The two arms are one saving taken at two
+# moments and each hides the other; running only the default arm is running only the half that works.
+#
 # The one run with directories under it is here for the same reason the `--expiry-days` one is: no other
 # line reaches those paths. Real files, the write lane and a snapshot destination are all off unless asked
 # for, so without this they would be code that only their own unit tests ever run — and the last thing to
@@ -55,6 +65,7 @@ verify:
 	cargo build --release --workspace --all-targets
 	cargo run --release -p ledgerfio -- run --sweep workload=all --duration 1s
 	cargo run --release -p ledgerfio -- run --workload void-heavy --duration 2s --rate 100k --resolve-after 900000 --expiry-days 6
+	cargo run --release -p ledgerfio -- run --workload void-heavy --duration 2s --rate 100k --resolve-after 900000 --expiry-days 6 --residency 1 --store-read-cache 0
 	blk=$$(mktemp -d); snap=$$(mktemp -d); cargo run --release -p ledgerfio -- run --workload hold-settle --duration 2s --rate 100k --resolve-after 900000 --store-dir $$blk --store-write-lane 0 --snapshot-dir $$snap --snapshot-every 200; status=$$?; rm -rf $$blk $$snap; exit $$status
 	one=$$(mktemp -d); cargo run --release -p ledgerfio -- run --workload hold-settle --duration 2s --rate 100k --resolve-after 900000 --store-dir $$one --store-write-lane 1 --snapshot-dir $$one --snapshot-every 200; status=$$?; rm -rf $$one; exit $$status
 	cargo run --release -p ledgerfio -- layout
