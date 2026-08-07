@@ -307,6 +307,12 @@ pub struct VolumeStats {
     pub reads_answered: u64,
     /// Reads done on the calling thread instead: the apply-path fallback and the expiry sweep.
     pub reads_inline: u64,
+    /// Reads answered from blocks already in hand rather than from the device, and reads that waited on
+    /// one already on its way down instead of asking for the same block again — see `Cached`. Counted
+    /// apart because they are the only numbers that can justify either on a machine whose page cache makes
+    /// the reads they remove cheap anyway.
+    pub reads_cached: u64,
+    pub reads_joined: u64,
     pub writes: u64,
     pub barriers: u64,
     pub removes: u64,
@@ -360,6 +366,8 @@ impl VolumeStats {
             reads_submitted: self.reads_submitted + other.reads_submitted,
             reads_answered: self.reads_answered + other.reads_answered,
             reads_inline: self.reads_inline + other.reads_inline,
+            reads_cached: self.reads_cached + other.reads_cached,
+            reads_joined: self.reads_joined + other.reads_joined,
             writes: self.writes + other.writes,
             barriers: self.barriers + other.barriers,
             removes: self.removes + other.removes,
@@ -678,11 +686,12 @@ impl DurableStore for MemoryStore {
         offset: u64,
         into: &mut Block,
     ) -> Result<(), StoreFault> {
-        into.copy_from_slice(self.block_at(object, offset)?);
-        Ok(())
+        self.stats.reads_inline += 1;
+        self.read_block(object, offset, into)
     }
 
     fn submit(&mut self, handle: u64, object: ObjectId, offset: u64, _now: u64) -> bool {
+        self.stats.took_read(self.submitted.len() + 1);
         self.submitted.push_back((handle, object, offset));
         true
     }

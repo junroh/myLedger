@@ -667,10 +667,13 @@ impl RunReport {
             return;
         }
         println!(
-            "  volume {name:<8} reads {} queued ({} answered, peak {}) + {} inline | writes {} ({:.1}MB), \
-             {} barriers, {} removes, {} renames, peak {} | refused {}r {}w | faults {}",
+            "  volume {name:<8} reads {} queued ({} answered, {} from cache, {} joined a read, peak {}) \
+             + {} inline | writes {} ({:.1}MB), {} barriers, {} removes, {} renames, peak {} | \
+             refused {}r {}w | faults {}",
             v.reads_submitted,
             v.reads_answered,
+            v.reads_cached,
+            v.reads_joined,
             v.read_depth_peak,
             v.reads_inline,
             v.writes,

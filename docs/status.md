@@ -729,10 +729,33 @@ unanswered, and **when that default stops being safe**. The source design's own 
   is 149 per million if the cap drops to 32. That is `SE-OQ-2`, answered. What is missing is the operational
   half.
 
-- **Should reads for one block be coalesced, and where does the read path learn that they can be?**
-  *Default:* they are not. Fifty-one lookups for records on one block become fifty-one store reads of that
-  block, and fifty-one queue slots.
-  *Where it shows:* expiry, by construction. A block holds fifty-one records, the sweep turns them into
+- ~~**Should reads for one block be coalesced, and where does the read path learn that they can be?**~~
+  Answered by building it, and the answer to "where" is what took three attempts. **A volume keeps a cold
+  read cache** (`Cached`, a `DurableStore` of its own), and the expiry path's device reads go from **92,000
+  to 464** in the same run — the sweep reads a day's block once and every one of the fifty-one lookups that
+  judge its voids is answered from it.
+
+  Three things had to be right and two of them were got wrong first.
+
+  **Where.** At the requester it buys nothing: the fifty-one lookups are all *submitted* before any
+  completes, so at submit time the block has not been read. Measured at zero, twice, before that sank in.
+  It has to be where the read happens.
+
+  **How big.** One block is not enough even though the burst is one block, because the lookups' own
+  completions evict it between the sweep's read and the judgements. Sixty-four blocks, 256KB, declared.
+
+  **Which layer.** A store of its own rather than something inside a backing, so its position says what it
+  caches: above `LatencyStore`, a hit costs no modelled device time, which is correct — the model prices a
+  device and a hit never reached one.
+
+  Coalescing is in the same type — a read for a block already on its way down waits on it instead of asking
+  again — and it **measures zero on this workload**, because the sweep's own read populates the cache before
+  any lookup asks. It is kept as the cache-miss path's only protection; a reader who wants it gone has the
+  number.
+
+- **The old question, for the record:** they were not coalesced, and fifty-one lookups for records on one
+  block became fifty-one store reads of that block and fifty-one queue slots.
+  *Where it showed:* expiry, by construction. A block holds fifty-one records, the sweep turns them into
   fifty-one voids in one slice, and each of those is judged with a lookup of a record on that same block.
   The day being emptied is `retention + grace` old and residency is a day wide, so every one of those
   reads misses memory and reaches the device. Measured: **92,000 store reads for 92,000 holds released**,

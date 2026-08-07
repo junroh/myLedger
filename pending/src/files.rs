@@ -607,8 +607,8 @@ impl FileStore {
             .file_of(object)?
             .read_at(into, offset)
             .map_err(|_| StoreFault::Device)?;
-        // A short read is the offset being past what the file holds, which is this node's own record of where
-        // blocks are disagreeing with the store rather than the device refusing.
+        // A short read is the offset being past what the file holds, which is this node's own record of
+        // where blocks are disagreeing with the store rather than the device refusing.
         if read == into.len() {
             Ok(())
         } else {
@@ -782,17 +782,8 @@ impl DurableStore for FileStore {
         offset: u64,
         into: &mut Block,
     ) -> Result<(), StoreFault> {
-        let read = self
-            .file_of(object)?
-            .read_at(into, offset)
-            .map_err(|_| StoreFault::Device)?;
-        // A short read is the offset being past what the file holds, which is this node's own record of where
-        // blocks are disagreeing with the store rather than the device refusing.
-        if read == into.len() {
-            Ok(())
-        } else {
-            Err(StoreFault::Missing)
-        }
+        self.stats.reads_inline += 1;
+        self.read_block(object, offset, into)
     }
 
     fn submit(&mut self, handle: u64, object: ObjectId, offset: u64, _now: u64) -> bool {

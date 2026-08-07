@@ -19,6 +19,7 @@ use crate::block::{
     LogTraffic, OpenBacking, RecordAddr, StoreModel, VolumeStats, BLOCK_BYTES, RECORDS_PER_BLOCK,
     SEGMENTS,
 };
+use crate::cache::Cached;
 use crate::engine::{BudgetState, PendingEngine, Started};
 use crate::index::{LOAD_TARGET, SLOT_BYTES};
 use crate::orderer::OrderWait;
@@ -65,6 +66,16 @@ pub struct MemoryPendingConfig {
     /// `RECORDS_PER_BLOCK`, which is also what the notice queue has to absorb before the sweep is asked
     /// again.
     pub expiry_blocks_per_round: usize,
+
+    /// Blocks of a volume's cold read cache — see `Cached`. **Zero is no cache**, which is the baseline
+    /// any number here is compared against.
+    ///
+    /// A count rather than a share of anything, because what it has to cover is a burst of reads into one
+    /// block and that is a property of the traffic rather than of the ledger's declared sizes. Sixty-four
+    /// blocks is 256KB, which is small enough not to be a tier and large enough that other traffic does
+    /// not evict an expiry slice out from under itself.
+    pub read_cache_blocks: usize,
+
     /// How often a snapshot is written, how fast, and how much the stable read may hold aside while it
     /// is. `every: 0` writes none, which is the default: where one goes is a directory the caller opens,
     /// so a configuration alone can never make a node write files nobody asked for.
@@ -347,6 +358,7 @@ impl Default for MemoryPendingConfig {
             // Two blocks, so a round offers at most a hundred-odd voids — about what the sixty-four of the
             // scan it replaces did, and the notice queue is sized against that rather than against a
             // number chosen for its own sake.
+            read_cache_blocks: 64,
             expiry_blocks_per_round: 2,
             store: StoreModel {
                 queue_depth: 128,
@@ -483,6 +495,8 @@ struct VolumeGauge {
     reads_submitted: AtomicU64,
     reads_answered: AtomicU64,
     reads_inline: AtomicU64,
+    reads_cached: AtomicU64,
+    reads_joined: AtomicU64,
     writes: AtomicU64,
     barriers: AtomicU64,
     removes: AtomicU64,
@@ -507,6 +521,10 @@ impl VolumeGauge {
             .store(stats.reads_answered, Ordering::Relaxed);
         self.reads_inline
             .store(stats.reads_inline, Ordering::Relaxed);
+        self.reads_cached
+            .store(stats.reads_cached, Ordering::Relaxed);
+        self.reads_joined
+            .store(stats.reads_joined, Ordering::Relaxed);
         self.writes.store(stats.writes, Ordering::Relaxed);
         self.barriers.store(stats.barriers, Ordering::Relaxed);
         self.removes.store(stats.removes, Ordering::Relaxed);
@@ -532,6 +550,8 @@ impl VolumeGauge {
             reads_submitted: self.reads_submitted.load(Ordering::Relaxed),
             reads_answered: self.reads_answered.load(Ordering::Relaxed),
             reads_inline: self.reads_inline.load(Ordering::Relaxed),
+            reads_cached: self.reads_cached.load(Ordering::Relaxed),
+            reads_joined: self.reads_joined.load(Ordering::Relaxed),
             writes: self.writes.load(Ordering::Relaxed),
             barriers: self.barriers.load(Ordering::Relaxed),
             removes: self.removes.load(Ordering::Relaxed),
@@ -720,7 +740,13 @@ impl MemoryPending {
                     config.capacity.slots(),
                     config.capacity.flush_blocks(),
                     config.capacity.resident_blocks(),
-                    config.store.build(blocks, config.seed ^ 0xb10c),
+                    // **Above the model, and that is the point of it being a store of its own.** A hit
+                    // never reached a device, so it must not be charged as one; below the model it would
+                    // be. `Cached::new(.., 0)` is the baseline and costs one indirection.
+                    Box::new(Cached::new(
+                        config.store.build(blocks, config.seed ^ 0xb10c),
+                        config.read_cache_blocks,
+                    )),
                 ),
                 // A volume of its own is opened exact, with no device modelled in front of it: the
                 // `--store-*` knobs describe the blocks' device, and pricing a second disk with the first
