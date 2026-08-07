@@ -2581,6 +2581,26 @@ volumes and get two instances — and a snapshot on a volume of its own is opene
 modelled in front of it, because the `--store-*` knobs describe the blocks' device and pricing a second
 disk with the first one's numbers would be the same guess in the other direction.
 
+### What is left on the worker's thread, and the one that turned out not to be a threading problem
+
+Two reads are still synchronous on the pending worker's thread. One is the apply-path fallback and it
+belongs there: applying is in order and cannot park a decision half way, and it is measured at zero
+because the record it wants was appended moments ago. The other is the expiry sweep's block read, and the
+plan was to give it the read pool — until it was measured.
+
+**The sweep issues 75,000 to 125,000 synchronous reads a second here.** Measured where no resolution lands,
+so every store read is the sweep's: 225,068 reads released 5,100 holds. Twenty to forty reads per hold.
+
+Two things make it that many. `expiry_blocks_per_round` is a budget **per round**, and a round is cheap, so
+its real rate is two times the round rate rather than the thirty-four blocks a second a design day needs —
+the headroom argument sized the requirement and never the cost. And a day is re-walked from its first block
+whenever the walk reaches the end, so blocks whose holds have all gone are read again to find nothing.
+
+So the pool is the wrong first move: it would parallelise the waste. The read count is the thing to fix, and
+fixing it needs a decision rather than a patch — the re-walk is what a declined void used to depend on, and
+`outstanding` now does that job, so whether the re-walk still earns its reads is a question about which of
+its two jobs is still needed. `status.md` carries it.
+
 ### Everything that changes the volume is on the one queue
 
 `unlink` and `rename` were left synchronous when the lane arrived, for no reason beyond that they were

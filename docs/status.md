@@ -696,12 +696,22 @@ unanswered, and **when that default stops being safe**. The source design's own 
   is 149 per million if the cap drops to 32. That is `SE-OQ-2`, answered. What is missing is the operational
   half.
 
-- **Where does `expiry_blocks_per_round` come from in a deployment?**
-  *Default:* a constant, two. It has three orders of headroom against a design day, so nothing is wrong
-  today.
-  *Stops being safe:* if a day's blocks ever grow faster than the rounds available to read them —
-  a much larger `daily_arrivals`, or a store whose reads are slow enough that a round no longer fits
-  beside the lookups.
+- **Where does `expiry_blocks_per_round` come from, and should it be a budget per round at all?**
+  *Default:* a constant, two blocks a round. The headroom argument for it measured the **requirement** — a
+  design day's survivors against a day — and never measured the **cost**, which is the other side of the
+  same number and is now measured.
+  *What the cost is:* a round is cheap, so two blocks a round is two blocks times the round rate. On this
+  machine that is **75,000 to 125,000 synchronous reads a second**, on the thread that answers lookups.
+  Measured with `void-heavy --residency 1 --overlay-limit 10000 --resolve-after 900000 --expiry-days 6`,
+  where no resolution lands, so every store read is the sweep's: 225,068 reads to release 5,100 holds, and
+  552,108 to release 23,766 in a longer one. **Twenty to forty reads per hold released.**
+  *Why so many:* a day is walked from block zero again whenever the walk reaches the end, and a block whose
+  holds have all gone is read again to find nothing. That re-walk is deliberate and it fixed a real bug —
+  gating it on the day's live count moving left a declined void's day unfinished for ever — but `outstanding`
+  now re-offers a declined void by itself, so the two jobs the re-walk was doing may not both still need it.
+  *Stops being safe:* on a device. Here the reads are page-cache hits; at 100µs each, 80,000 a second is
+  eight thread-seconds a second, which is not a throttle at all. Moving these reads to the read pool would
+  parallelise the waste rather than remove it, which is why that work is not the first thing to do.
 
 - **When does the idem engine get its rotating generations?**
   *Default:* a map that only grows, which owns the worst tail of any long run (see above).
