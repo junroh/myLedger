@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use ledger_base::{AckOutcome, LedgerError};
 use ledger_raft::EchoRaftConfig;
-use ledger_sequencer::{Capacity, ReactorConfig};
+use ledger_sequencer::{Capacity, PauseCause, ReactorConfig};
 use ledger_stubkit::LatencyRange;
 
 use harness::*;
@@ -55,6 +55,11 @@ fn a_full_slot_pool_refuses_new_requests() {
 
 /// A client that stops reading its acks must become backpressure, not unbounded memory: the ack
 /// backlog fills, intake stops admitting, and everything is answered once the client resumes.
+///
+/// **And the pause says which backlog it was**, which is the whole of what a refused client can learn. A
+/// full request queue is the same symptom whatever caused it — a slow store, a slow consensus, or this
+/// client not collecting its own acks — and the three want different reactions. Here it is the third, and
+/// the published cause has to say so rather than say "full".
 #[test]
 fn a_client_that_stops_reading_pauses_intake() {
     let queue = 8;
@@ -84,6 +89,11 @@ fn a_client_that_stops_reading_pauses_intake() {
     harness.tick_until("the ack backlog never filled", |reactor| {
         reactor.metrics().intake_pauses > 0
     });
+    assert_eq!(
+        harness.reactor.pressure().cause(),
+        PauseCause::AcksUnread,
+        "intake paused without saying which backlog stopped it"
+    );
 
     let acks = harness.drain_acks(queue * 2, "acks stalled once the client resumed");
     assert!(

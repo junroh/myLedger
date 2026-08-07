@@ -261,6 +261,16 @@ impl MemoryPendingConfig {
         self.queue_capacity.div_ceil(RECORDS_PER_BLOCK).max(1)
     }
 
+    /// Blocks of the store's queue a snapshot dump may hold at once.
+    ///
+    /// Half, and the half is what the blocks are guaranteed: the ledger can always place a queue's worth
+    /// less the dump's share without waiting for a background job's completion. Derived rather than
+    /// configured beside the depth, because a share set next to the number it is a share of is a pair
+    /// that can disagree — and the consequence of it disagreeing is a client refused for a snapshot.
+    pub fn snapshot_queue_share(&self) -> usize {
+        (self.store.queue_depth.max(1) / 2).max(1)
+    }
+
     /// Blocks the writeback buffer may hold before applying stops.
     ///
     /// The window plus one round's drain: the window is what recovery is sized for, and the slack is what
@@ -625,6 +635,7 @@ impl MemoryPending {
         let dumps = snapshots.is_some();
         let apart = snapshots.filter(|backing| !backing.same_volume(&blocks));
         let queue_depth = config.store.queue_depth.max(1);
+        let share = config.snapshot_queue_share();
         let thread = WorkerThread::spawn("pending", move |shutdown| {
             PendingWorker {
                 commands: command_rx,
@@ -643,6 +654,7 @@ impl MemoryPending {
                     Snapshots::new(
                         apart.map(|backing| backing.open(queue_depth)),
                         config.snapshot,
+                        share,
                     )
                 }),
                 occupancy: worker_occupancy,

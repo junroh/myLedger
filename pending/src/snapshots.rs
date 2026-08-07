@@ -152,6 +152,16 @@ pub struct Snapshots {
     /// Sequence numbers for this writer's submissions. Its own counter, tagged `IoOwner::Snapshot`, so a
     /// shared volume can hand each completion back to the writer that asked for it.
     handles: u64,
+    /// Blocks of the volume's queue this dump may hold at once.
+    ///
+    /// **The blocks' priority is declared here rather than left to the order of two lines.** Within a
+    /// round the drain submits before this stage does, so the dump already takes only what the blocks did
+    /// not want — but a slot it takes it holds until the device answers, and on a device that has stalled
+    /// while the ledger happens to have nothing to write, a chunk a round is enough for the dump to end up
+    /// holding the whole queue. The blocks then wait for a dump's completions, applies stop at the
+    /// buffer's ceiling and backpressure reaches a client, for a background job. Rule 18: the invariant
+    /// held by a coincidence of how the pieces behave, so it is decided once and in one place.
+    share: usize,
     /// The position the next dump is measured from. Moved by an attempt rather than by a success, so a
     /// destination that keeps refusing backs off to the cadence instead of retrying every round — it is
     /// not a claim about what is on disk, and `stats.covered` is.
@@ -192,7 +202,7 @@ impl Snapshots {
     /// `own` is the volume this writes to, and `None` says the deployment declared the blocks' disk for
     /// both. Handed in rather than opened here: which volume a directory is on is a declaration, and the
     /// one thing this stage must not do is decide it (§20).
-    pub fn new(own: Option<Box<dyn DurableStore>>, policy: SnapshotPolicy) -> Self {
+    pub fn new(own: Option<Box<dyn DurableStore>>, policy: SnapshotPolicy, share: usize) -> Self {
         Self {
             own,
             policy,
@@ -200,6 +210,7 @@ impl Snapshots {
             unsubmitted: false,
             inflight: None,
             handles: 0,
+            share: share.max(1),
             next_from: ApplyIndex::default(),
             stats: SnapshotStats::default(),
         }
@@ -360,6 +371,11 @@ impl Snapshots {
     /// same block cannot be produced a second time.
     fn fill(&mut self, run: &mut InFlight, engine: &mut PendingEngine) {
         for _ in 0..(self.policy.bytes_per_round / BLOCK_BYTES).max(1) {
+            // The share, before the throttle and before the queue: what this stage may hold of the
+            // volume is its own bound, not whatever the queue happens to have free when it asks.
+            if run.outstanding >= self.share {
+                return;
+            }
             if !self.unsubmitted {
                 let produced = engine.next_snapshot_chunk(&mut run.writer, &mut self.chunk[..]);
                 if produced == 0 {
@@ -567,9 +583,10 @@ mod tests {
         PendingEngine::sized(slots, 1, 1024, Box::new(MemoryStore::default()))
     }
 
-    /// A stage on a volume of its own, which is what two directories mean.
+    /// A stage on a volume of its own, which is what two directories mean. The share is the whole of the
+    /// test store's queue unless a test says otherwise: what these cover is the dump, not the sharing.
     fn apart(store: Box<dyn DurableStore>, policy: SnapshotPolicy) -> Snapshots {
-        Snapshots::new(Some(store), policy)
+        Snapshots::new(Some(store), policy, 32)
     }
 
     fn fill(engine: &mut PendingEngine, holds: u64) {
@@ -684,6 +701,7 @@ mod tests {
                 bytes_per_round: BLOCK_BYTES,
                 ..SnapshotPolicy::default()
             },
+            32,
         );
         drive(&mut snapshots, &mut source, 100_000);
         assert_eq!(
@@ -700,7 +718,7 @@ mod tests {
 
         let mut restored = PendingEngine::sized(slots, 1, 0, scratch.volume("one"));
         assert!(
-            Snapshots::new(None, SnapshotPolicy::default())
+            Snapshots::new(None, SnapshotPolicy::default(), 32)
                 .read_into(&mut restored)
                 .expect("a snapshot this table can take"),
             "the shared volume had no snapshot on it"
@@ -750,6 +768,45 @@ mod tests {
         drive(&mut snapshots, &mut source, 10_000);
         assert_eq!(snapshots.stats().written, 1);
         assert!(held.holds(ObjectId::SNAPSHOT_CURRENT));
+    }
+
+    /// **A dump may hold only its declared share of the volume's queue.** Within a round the blocks
+    /// already ask first, so the dump takes what they did not want — but a slot it takes it holds until
+    /// the device answers, and a device that has stalled while the ledger has nothing to write would
+    /// otherwise let a chunk a round grow into the whole queue. The blocks would then wait on a
+    /// background job's completions, and a client would be refused for a snapshot (rule 18).
+    ///
+    /// The store here answers nothing, which is that stalled device, and the throttle asks for four times
+    /// the share so the bound is the share rather than the throttle.
+    #[test]
+    fn a_dump_holds_only_its_share_of_the_volume() {
+        let mut source = engine(1 << 12);
+        fill(&mut source, RECORDS_PER_BLOCK as u64 * 3);
+        let held = HoldingStore::default();
+        let share = 2;
+        let mut snapshots = Snapshots::new(
+            Some(Box::new(held.clone())),
+            SnapshotPolicy {
+                every: 1,
+                bytes_per_round: BLOCK_BYTES * 8,
+                ..SnapshotPolicy::default()
+            },
+            share,
+        );
+
+        for _ in 0..64 {
+            snapshots.round(&mut source);
+            assert!(
+                held.writes_inflight() <= share,
+                "the dump held {} of a {share}-block share",
+                held.writes_inflight()
+            );
+        }
+        assert_eq!(
+            held.writes_inflight(),
+            share,
+            "the dump never reached its share, so the bound was never the thing being tested"
+        );
     }
 
     /// A volume with no snapshot on it is the ordinary state of a node that has not written one, so it

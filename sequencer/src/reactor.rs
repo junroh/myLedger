@@ -10,6 +10,9 @@ use ledger_base::{
     LedgerError, LogSink, LogStream, Producer, Request, SystemClock, TxId,
 };
 
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
+
 use crate::config::ReactorConfig;
 use crate::log_kind::LogKind;
 use crate::metrics::{Metrics, StageTimes};
@@ -31,11 +34,93 @@ pub struct Transport {
     pub acks: Producer<Ack>,
 }
 
+/// Why intake is paused, which is the reason a client's submission was refused.
+///
+/// **The refusal is a full client queue, and that says nothing.** A client whose push comes back learns
+/// only that the sequencer stopped taking requests; which backlog stopped it is known here and nowhere
+/// else, and it is the difference between a slow disk, a slow consensus and a client that is not reading
+/// its own acks. Published rather than logged, because the party that has to act on it is outside the
+/// process (rule 13 keeps the hot path clear: this is one relaxed store on a transition, beside the log
+/// event already written there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PauseCause {
+    /// Intake has never had to stop. A refusal seen with this is a client outrunning a sequencer that
+    /// nothing is holding back.
+    None = 0,
+    /// Acks the client has not collected. The backlog is the answer path, so the client is the slow one.
+    AcksUnread = 1,
+    /// Committed decisions the pending engine has not taken. A slow store shows up here.
+    PendingEngine = 2,
+    /// Judged effects waiting on consensus.
+    Consensus = 3,
+    /// A dispatch an external component's queue refused, still waiting to be retried.
+    ComponentQueue = 4,
+}
+
+impl PauseCause {
+    fn from_raw(raw: u8) -> Self {
+        match raw {
+            1 => Self::AcksUnread,
+            2 => Self::PendingEngine,
+            3 => Self::Consensus,
+            4 => Self::ComponentQueue,
+            _ => Self::None,
+        }
+    }
+
+    pub fn is_paused(self) -> bool {
+        self != Self::None
+    }
+}
+
+/// Where the pause is currently on, in the same cell as the cause. One store publishes both, so a reader
+/// cannot see one without the other.
+const PAUSED_NOW: u8 = 0x80;
+
+/// The published cause, readable from another thread — the client's, which is where a refusal happens.
+///
+/// One cell rather than a copy per reader: the cause has one owner, the reactor, and a reader derives
+/// (rule 18). Cloning hands out another view of the same cell.
+///
+/// **The cause is the last one and not the current one, and that is what makes it worth reading.** At the
+/// ceiling intake stops and starts thousands of times a second, and a client's queue stays full across
+/// both — so an instantaneous answer is `None` about half the time it is asked, which was measured before
+/// this was written: 53,372 pauses in a run whose every refusal reported "still admitting". What a refused
+/// client wants is what has been stopping intake, with whether it is stopped *right now* beside it rather
+/// than instead of it.
+#[derive(Clone, Default)]
+pub struct PressureView(Arc<AtomicU8>);
+
+impl PressureView {
+    /// The last backlog to stop intake. `None` means it has never stopped.
+    pub fn cause(&self) -> PauseCause {
+        PauseCause::from_raw(self.0.load(Ordering::Relaxed) & !PAUSED_NOW)
+    }
+
+    /// Whether intake is stopped as this is read.
+    pub fn paused_now(&self) -> bool {
+        self.0.load(Ordering::Relaxed) & PAUSED_NOW != 0
+    }
+
+    /// Pausing carries its cause; resuming clears the bit and **keeps** the cause, which is the whole of
+    /// what makes it readable — see the type's note.
+    fn publish(&self, cause: PauseCause) {
+        let kept = match cause {
+            PauseCause::None => self.0.load(Ordering::Relaxed) & !PAUSED_NOW,
+            paused => paused as u8 | PAUSED_NOW,
+        };
+        self.0.store(kept, Ordering::Relaxed);
+    }
+}
+
 /// What a rate limiter in front of the sequencer needs to see.
 #[derive(Debug, Clone, Copy)]
 pub struct Backpressure {
     /// True while a backlog is full and no new request is being admitted.
     pub intake_paused: bool,
+    /// Which backlog stopped it, and so what a refused client should be told.
+    pub paused_by: PauseCause,
     /// Acks the client has not taken yet.
     pub acks_queued: usize,
     /// Committed hold decisions the pending engine has not taken yet.
@@ -107,6 +192,8 @@ pub struct Reactor<A: AccountPort, P: PendingPort, I: IdempotencyPort, R: RaftPo
     applied_through: ApplyIndex,
     /// Kept so a pause is logged on the edge, not every tick.
     intake_paused: bool,
+    /// Why, published for the client's own thread. The reactor is the only writer.
+    pressure: PressureView,
     /// Set on shutdown: nothing new is admitted, everything in flight finishes.
     intake_closed: bool,
     metrics: Metrics,
@@ -189,6 +276,7 @@ where
             log,
             applied_through: ApplyIndex::default(),
             intake_paused: false,
+            pressure: PressureView::default(),
             intake_closed: false,
             metrics: Metrics::default(),
             stages: StageTimes::default(),
@@ -408,9 +496,16 @@ where
         self.applied_through
     }
 
+    /// A view of why intake is paused, for whoever holds the client's end of the queue. Cloneable and
+    /// readable from that thread; the reactor is the only writer.
+    pub fn pressure(&self) -> PressureView {
+        self.pressure.clone()
+    }
+
     pub fn backpressure(&self) -> Backpressure {
         Backpressure {
             intake_paused: self.intake_paused,
+            paused_by: self.pressure.cause(),
             acks_queued: self.outbox.depth(),
             pending_writes: self.pending.depth(),
             batches_in_flight: self.batcher.in_flight_len(),
@@ -553,11 +648,16 @@ where
         }
     }
 
-    pub fn track_intake_pause(&mut self, paused: bool) {
+    pub fn track_intake_pause(&mut self, cause: PauseCause) {
+        let paused = cause.is_paused();
         if paused == self.intake_paused {
             return;
         }
         self.intake_paused = paused;
+        // Published on the transition and nowhere else, so a steady state costs nothing. What a reader
+        // sees while intake is running is `None`, which is the honest answer to "why was I refused" when
+        // nothing was refusing.
+        self.pressure.publish(cause);
         if paused {
             self.metrics.intake_pauses += 1;
             let acks = self.outbox.depth() as u64;

@@ -2533,6 +2533,15 @@ of two on a machine with four performance cores. `status.md` has the command and
 question, which this does not answer — it says what sharing costs, not whether a barrier should have been
 per-writer.
 
+**And the dump's share of that queue is declared rather than left to two line orderings.** Within a round
+the drain submits before the snapshot stage, so the blocks already have first pick — but that ordering is
+there for a coverage reason (a dump may carry only what a crash would find, so it runs after the sync), and
+a slot the dump takes it holds until the device answers. On a device that has stalled while the ledger
+happens to have nothing to write, a chunk a round grows into the whole queue; the blocks then wait on a
+background job, applies stop at the buffer's ceiling, and a client is refused for a snapshot. Half the
+depth, derived from it rather than set beside it, and a test with a store that answers nothing says the
+dump stops at its share.
+
 **What decides that two directories are one volume is a declaration, and it does not exist yet.**
 `same_volume` answers only the case it cannot be wrong about: the same directory, canonicalised. `st_dev`
 is refused above, for being wrong in both directions. Until the declaration lands, two directories are two

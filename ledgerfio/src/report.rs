@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use ledger_base::ports::LedgerTotals;
 use ledger_base::{Amount, Effect, Footprint};
-use ledger_sequencer::{Metrics, StageTimes};
+use ledger_sequencer::{Metrics, PauseCause, StageTimes};
 use serde::Serialize;
 
 use crate::histogram::Histogram;
@@ -88,6 +88,45 @@ impl From<&LatencySummary> for JsonLatency {
     }
 }
 
+/// Submissions the ledger would not take at once, by what it was waiting on.
+///
+/// **Counted once per submission, not once per retry**: a busy driver spins, and a count of spins says
+/// how fast this loop is rather than how often the ledger was full. What it answers is the question a
+/// refusal now carries a reason for — when a client is held up, which backlog held it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClientWaits {
+    pub component: u64,
+    pub pending: u64,
+    pub consensus: u64,
+    pub acks: u64,
+    /// Refused with nothing ever having stopped intake: this client outran a sequencer that is keeping up.
+    pub outran: u64,
+    /// Of those, the ones refused while intake was stopped as they asked. The rest met a queue that had
+    /// not drained since the last stop, which is the ordinary shape at the ceiling — so this is what says
+    /// whether the causes above are current or historical.
+    pub while_paused: u64,
+}
+
+impl ClientWaits {
+    pub fn saw(&mut self, cause: PauseCause, paused_now: bool) {
+        if paused_now {
+            self.while_paused += 1;
+        }
+        let counter = match cause {
+            PauseCause::ComponentQueue => &mut self.component,
+            PauseCause::PendingEngine => &mut self.pending,
+            PauseCause::Consensus => &mut self.consensus,
+            PauseCause::AcksUnread => &mut self.acks,
+            PauseCause::None => &mut self.outran,
+        };
+        *counter += 1;
+    }
+
+    pub fn total(&self) -> u64 {
+        self.component + self.pending + self.consensus + self.acks + self.outran
+    }
+}
+
 pub struct RunReport {
     pub workload: &'static str,
     pub accounts: u64,
@@ -103,6 +142,9 @@ pub struct RunReport {
     pub rejected: u64,
     /// Rejections by category, which is usually the first thing to read when a run looks wrong.
     pub reject_kinds: BTreeMap<&'static str, u64>,
+    /// Submissions the ledger would not take at once, by which backlog it was waiting on — the reason
+    /// a refusal now carries. Counted once per submission rather than once per retry.
+    pub waits: ClientWaits,
     pub latency: LatencySummary,
     /// Completion of a whole client submission run, which is what a deadline batch is judged on.
     pub batch_latency: Option<LatencySummary>,
@@ -589,6 +631,19 @@ impl RunReport {
             self.metrics.slot_exhaustion,
             self.metrics.commit_failures
         );
+        let waits = &self.waits;
+        if waits.total() > 0 {
+            println!(
+                "  client waited {} submissions were refused and retried ({} of them with intake stopped as they asked), by what last stopped it: component queue={} pending engine={} consensus={} acks unread={}, and {} with intake never stopped (this client outran it)",
+                waits.total(),
+                waits.while_paused,
+                waits.component,
+                waits.pending,
+                waits.consensus,
+                waits.acks,
+                waits.outran
+            );
+        }
     }
 
     /// Whether the run is one anyone should believe, and why it might not be.
@@ -716,6 +771,7 @@ mod tests {
             histogram.record(value * 1_000);
         }
         RunReport {
+            waits: ClientWaits::default(),
             workload: "hold-settle",
             accounts: 100_000,
             elapsed: Duration::from_millis(2_500),

@@ -18,7 +18,7 @@ use ledger_service::{ClientEndpoint, LedgerService, ServiceConfig};
 use crate::cli::Options;
 use crate::client::Client;
 use crate::histogram::Histogram;
-use crate::report::{LatencySummary, RunReport};
+use crate::report::{ClientWaits, LatencySummary, RunReport};
 use crate::workload::{Shape, Workload, CLEARING_ACCOUNT, EXTERNAL_ACCOUNT};
 use ledger_base::Signals;
 
@@ -50,7 +50,7 @@ impl Runner {
         Signals::install();
         let stop = service.stop_token();
         let mut driver = Driver::new(
-            Client::new(endpoint.requests, endpoint.acks),
+            Client::new(endpoint.requests, endpoint.acks, endpoint.pressure),
             options.client_batch,
         );
         driver.fund(&mut workload);
@@ -75,6 +75,7 @@ impl Runner {
             duplicates: driver.duplicates,
             rejected: driver.rejected,
             reject_kinds: driver.reject_kinds,
+            waits: driver.waits,
             latency: LatencySummary::from(&driver.histogram),
             batch_latency: driver.batches.summary(),
             metrics: stopped.reactor.metrics(),
@@ -383,6 +384,7 @@ struct Driver {
     duplicates: u64,
     rejected: u64,
     reject_kinds: BTreeMap<&'static str, u64>,
+    waits: ClientWaits,
     /// The ledger has answered a request with `FailStop`, which is it saying it will answer nothing
     /// more. What the drain below exits on, because a request outstanding across a seal is waiting for
     /// a commit that is never coming.
@@ -402,6 +404,7 @@ impl Driver {
             duplicates: 0,
             rejected: 0,
             reject_kinds: BTreeMap::new(),
+            waits: ClientWaits::default(),
             sealed: false,
         }
     }
@@ -460,8 +463,17 @@ impl Driver {
             self.batch.push(workload.next());
         }
         let mut offset = 0;
+        let mut waited = false;
         while offset < self.batch.len() {
             let taken = self.client.submit_batch(&self.batch[offset..]);
+            // A partial take is a refusal of the rest, not a success: the queue filled part way through.
+            // Counting only the zero case is what made this read 24 waits in a run with fifty thousand
+            // intake pauses, which is the counter measuring the driver rather than the ledger.
+            if taken < self.batch.len() - offset && !waited {
+                let pressure = self.client.pressure();
+                self.waits.saw(pressure.cause(), pressure.paused_now());
+                waited = true;
+            }
             if taken == 0 {
                 if self.collect(workload, false) == 0 {
                     std::hint::spin_loop();
@@ -475,14 +487,21 @@ impl Driver {
 
     fn push_one(&mut self, transfer: Transfer, workload: &mut Workload) {
         let mut transfer = transfer;
+        let mut waited = false;
         loop {
             match self.client.submit(transfer) {
                 Ok(()) => {
                     self.submitted += 1;
                     return;
                 }
-                Err(rejected) => {
-                    transfer = rejected;
+                Err(refused) => {
+                    transfer = refused.tx;
+                    // Once per submission rather than once per spin: what a report wants is how many
+                    // submissions had to wait and on what, not how many times a busy loop went round.
+                    if !waited {
+                        self.waits.saw(refused.cause, refused.paused_now);
+                        waited = true;
+                    }
                     if self.collect(workload, false) == 0 {
                         std::hint::spin_loop();
                     }
@@ -542,5 +561,8 @@ impl Driver {
         self.duplicates = 0;
         self.rejected = 0;
         self.reject_kinds.clear();
+        // The funding burst refuses thousands before the reactor has taken a tick, and none of that is
+        // the measured phase. Everything else here is reset for the same reason.
+        self.waits = ClientWaits::default();
     }
 }

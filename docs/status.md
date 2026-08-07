@@ -20,6 +20,21 @@ outbox. Contract-1 detection with quarantine and its recovery, fail-stop on enou
 the apply-path seal for a commit that cannot be applied. Both accounting identities are asserted by
 every test that moves money and by every simulator seed.
 
+**A refusal carries its reason.** A client whose submission comes back sees a full queue, and that symptom
+is the same whether the store is behind, consensus is behind, or the client is not collecting its own acks
+— three causes wanting three different reactions. The sequencer publishes which backlog stopped intake
+(`PauseCause`, on a transition only, so a steady state costs nothing), the client's endpoint carries a view
+of it across the thread boundary, and `submit` returns the transfer *and* the cause. `PauseCause::None`
+beside a refusal is its own answer: the client outran a sequencer that was still admitting. `ledgerfio`
+counts refused submissions by cause — once per submission rather than once per retry, and only in the
+measured phase, since the funding burst refuses thousands before the reactor has taken a tick — and prints
+the line only when there were any. At the default client queue there usually are none: intake pauses tens
+of thousands of times in a saturated run and the request ring still drains before the driver's next push.
+At `--client-queue 64` the same run reports 68,881, of which 437 met intake actually stopped and the rest
+met a ring that had not drained since it last was. **That gap is why the published cause is the last one
+rather than the current one** — an instantaneous answer is `None` for most refusals at the ceiling, which
+the first version of this did and which said nothing.
+
 **Order exemption is one clause:** a request whose debit account is unconstrained keeps no place in
 its lane — no seq, no continuity check, no fence, and nothing queues behind it. Resolutions
 included. What that gives up in contract-1 coverage is replaced by a data check: the reply carries
@@ -468,6 +483,14 @@ neither is outstanding work.
   **object id** rather than `segment: u8`, so the days and the snapshot's two files live in one namespace.
   **`rename` beside `remove`**, because publishing is a namespace change and the directory sync belongs
   inside it. And the **stream padded to whole blocks** (version 4), because a block is what the store takes.
+
+  **A dump may hold only half the volume's queue**, derived from the depth rather than configured beside
+  it. Within a round the blocks already ask first, so the dump takes what they did not want — but a slot it
+  takes it holds until the device answers, and on a device that has stalled while the ledger happens to
+  have nothing to write, a chunk a round is enough for the dump to end up holding the whole queue. The
+  blocks would then wait on a background job's completions, applies would stop at the buffer's ceiling and
+  a client would be refused for a snapshot. Rule 18: it held by a coincidence of two line orderings, so it
+  is decided once and in one place.
 
   **One instance per volume is what makes "the same disk" mean something, and half of it is built.** The
   same directory for both is one store, which is the case a path cannot be wrong about; two different

@@ -27,7 +27,7 @@ mod state;
 pub use config::{BatchPolicy, Capacity, LinkedPolicy, ReactorConfig, SafetyPolicy};
 pub use log_kind::LogKind;
 pub use metrics::{Metrics, StageTimes};
-pub use reactor::{Backpressure, Broken, Reactor, Transport};
+pub use reactor::{Backpressure, Broken, PauseCause, PressureView, Reactor, Transport};
 pub use state::lane::{LaneState, LaneTable};
 
 use ledger_base::{layouts_are_sound, TypeLayout};

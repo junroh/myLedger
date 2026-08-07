@@ -61,6 +61,7 @@ group. The two meet only where a chain resolves a group, which is the coverage c
 | **drain** | the whole job of emptying the writeback buffer: compaction, then packing the survivors, closing a full block and submitting it. **Compaction is one step of it**, and today one function is both — which is part of what §20 separates. Today the drain is the last thing apply does; §20 moves it to the worker's round on a declared budget | `PendingEngine::compact`, for now |
 | **volume** | a disk, as a deployment **declares** it — not as `st_dev` reports it, which is wrong in both directions (two partitions of one NVMe have different ids and one queue; LVM and network volumes have one id across several devices). One `DurableStore` instance per volume, so whatever shares a volume shares its queue, whoever asked for the IO. ⚠ the declaration is not built: what exists is the case that cannot be wrong, the same directory. Design notes §20 | `OpenBacking::same_volume` |
 | **compaction** | the survivor test alone: dropping what the index no longer points at, on a block's way out of the writeback buffer. A record is alive exactly when the index points at it, so this reads nothing | inside `PendingEngine::compact` |
+| **queue share** | blocks of a volume's queue a snapshot dump may hold at once. Half, derived from the depth rather than set beside it. Within a round the blocks already ask first, but a slot the dump takes it holds until the device answers — so on a stalled device a chunk a round would grow into the whole queue, and the ledger would wait on a background job. | `MemoryPendingConfig::snapshot_queue_share` |
 | **shadow** | the buckets a snapshot in progress holds aside so its read is stable while the engine keeps writing — copy-on-write, and the kick cascade rather than the effects is why it has to exist. Declared in buckets, and a dump that breaches its budget is abandoned. | `HoldTable::begin_snapshot`, `SnapshotPolicy::shadow_budget` |
 
 **One name for the third one, and it took a rename to get there.** The crate, the port and every message
@@ -106,6 +107,7 @@ already speaks; `checkpoint` survives in this file only in the sentence you are 
 | term | means | in code |
 |---|---|---|
 | **intake** | S1: take a request, resolve accounts, issue its seq. | `Reactor::intake`, `admit`, `prepare` |
+| **pause cause** | which backlog stopped intake, published for the client's own thread. A refused submission sees a full queue and nothing else, and that symptom is the same whether the store, consensus or the client's own unread acks caused it — so the refusal carries the reason with it. Read after a refusal; `None` beside one means the client outran a sequencer that was still admitting. | `PauseCause`, `PressureView`, `Refused`, `Backpressure::paused_by` |
 | **dispatch** | S2: throw the external calls without waiting. | `Reactor::dispatch` |
 | **judge** | S3: check the seq, decide, build the effect. Draining replies is not judging. | `Reactor::judge`, `judge_chain`, `drain_replies` |
 | **propose** | S4: hand a batch to consensus. | `Reactor::propose`, `Batcher` |

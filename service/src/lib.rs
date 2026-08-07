@@ -7,7 +7,7 @@ use ledger_base::ports::{AccountPort, IdempotencyPort, PendingPort, RaftPort};
 use ledger_base::{
     channel, Ack, Consumer, LedgerError, LogStream, Producer, Request, ThreadPolicy,
 };
-use ledger_sequencer::{LogKind, Reactor, ReactorConfig, Transport};
+use ledger_sequencer::{LogKind, PressureView, Reactor, ReactorConfig, Transport};
 
 #[derive(Debug, Clone, Copy)]
 pub struct ServiceConfig {
@@ -46,6 +46,10 @@ impl Default for ServiceConfig {
 pub struct ClientEndpoint {
     pub requests: Producer<Request>,
     pub acks: Consumer<Ack>,
+    /// Why the sequencer stopped admitting, when it has. A full request queue is all a refused submission
+    /// can see by itself, and that says nothing about which backlog caused it — this is where the reason
+    /// crosses the thread boundary.
+    pub pressure: PressureView,
 }
 
 /// Asks the service to stop, from anywhere — a signal handler, an admin endpoint, another thread.
@@ -108,6 +112,7 @@ where
             raft,
         )?;
 
+        let pressure = reactor.pressure();
         let stop = Arc::new(AtomicBool::new(false));
         let log_thread = Self::spawn_log_drain(log, Arc::clone(&stop), config.log_to_stderr);
         let reactor_stop = Arc::clone(&stop);
@@ -126,6 +131,7 @@ where
             ClientEndpoint {
                 requests: request_tx,
                 acks: ack_rx,
+                pressure,
             },
         ))
     }

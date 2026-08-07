@@ -1,7 +1,7 @@
 use ledger_base::ports::{AccountPort, IdempotencyPort, PendingPort, RaftPort};
 use ledger_base::Clock;
 
-use super::Reactor;
+use super::{PauseCause, Reactor};
 use ledger_base::ports::{IdemAsk, IdemRequest, PendingFence, PendingLookup};
 use ledger_base::{LedgerError, LinkedChainId, Request, Transfer, TransferFlags, UNORDERED};
 
@@ -46,14 +46,25 @@ where
         if self.intake_closed {
             return false;
         }
-        let paused = self.pipeline.has_deferred()
-            || self.outbox.is_saturated()
-            || self.pending.is_saturated()
-            // Judged effects waiting for consensus are a backlog like any other: bounded, and reaching
-            // the bound slows the client down instead of growing memory here.
-            || self.batcher.is_saturated();
-        self.track_intake_pause(paused);
-        if paused {
+        // Ordered rather than or-ed, because what is published is *which* backlog stopped intake and a
+        // boolean cannot say. First match wins, and a refused client is told that one — with several full
+        // at once the order is which one to fix, and a component's own queue comes before the backlogs
+        // that fill because of it.
+        let cause = if self.pipeline.has_deferred() {
+            PauseCause::ComponentQueue
+        } else if self.pending.is_saturated() {
+            PauseCause::PendingEngine
+        // Judged effects waiting for consensus are a backlog like any other: bounded, and reaching
+        // the bound slows the client down instead of growing memory here.
+        } else if self.batcher.is_saturated() {
+            PauseCause::Consensus
+        } else if self.outbox.is_saturated() {
+            PauseCause::AcksUnread
+        } else {
+            PauseCause::None
+        };
+        self.track_intake_pause(cause);
+        if cause.is_paused() {
             return false;
         }
 
