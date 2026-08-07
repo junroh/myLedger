@@ -22,7 +22,7 @@ pub fn prediction(plan: &Plan, prediction: &Prediction, verdict: Option<Verdict>
         plan.pending_tail_nanos / 1_000,
         plan.pending_rate,
         plan.raft_nanos / 1_000,
-        plan.queue_depth,
+        plan.read_queue_depth,
         load
     );
     if plan.cost_percent != 100 {
@@ -332,9 +332,9 @@ fn limit(plan: &Plan, prediction: &Prediction) {
             "  limit          the client, not the ledger: at qd {} and a {:.1}ms mean the client cannot \
              have more than {:.0} tx/s outstanding, so the core sat idle {:.0}% of the time. This run \
              says nothing about the ledger's ceiling — raise --qd to ask about that.",
-            plan.queue_depth,
+            plan.read_queue_depth,
             prediction.mean_us / 1_000.0,
-            plan.queue_depth as f64 * 1e6 / prediction.mean_us.max(1.0),
+            plan.read_queue_depth as f64 * 1e6 / prediction.mean_us.max(1.0),
             (1.0 - prediction.core_used()) * 100.0
         );
     }

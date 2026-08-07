@@ -196,8 +196,8 @@ struct Depths {
 }
 
 impl Depths {
-    fn for_queue_depth(queue_depth: u64) -> Self {
-        let depth = queue_depth as usize;
+    fn for_queue_depth(read_queue_depth: u64) -> Self {
+        let depth = read_queue_depth as usize;
         Self {
             slots: (depth * 2).next_power_of_two(),
             ack_backlog: depth,
@@ -216,7 +216,7 @@ pub struct Plan {
     /// The client's queue depth: requests it has sent and not had answered, the same quantity `fio`
     /// calls `iodepth`. Saturated, this is what decides throughput — depth over latency — and it is a
     /// ceiling on what the client can ask for, not on what the ledger can do.
-    pub queue_depth: u64,
+    pub read_queue_depth: u64,
     pub accounts: u64,
     pub costs: Costs,
     /// The pending engine as a black box: what it answers a command in. A lookup it cannot serve from
@@ -430,7 +430,7 @@ struct Shape {
     burst: u64,
     queue: usize,
     /// Requests the client keeps unanswered.
-    queue_depth: u64,
+    read_queue_depth: u64,
     /// How old a hold is when it is resolved, in holds committed since.
     resolve_after: usize,
     /// A client that only resolves holds it was told committed.
@@ -465,7 +465,7 @@ impl Counts {
 struct Sim {
     reactor: SimReactor,
     mode: Mode,
-    queue_depth: u64,
+    read_queue_depth: u64,
     linger_nanos: u64,
     poisson: bool,
     prng: Prng,
@@ -548,7 +548,7 @@ pub fn explore(
             batches_in_flight,
             burst,
             queue: 256,
-            queue_depth: burst * 64,
+            read_queue_depth: burst * 64,
             strict: false,
             // A run of two thousand steps cannot age a hold by much, and `check`'s question is the
             // mechanism rather than the age: what puts its seeds on the store path is the narrow windows
@@ -641,7 +641,7 @@ pub fn explore(
 pub fn capacity(plan: Plan) -> Result<Prediction, Box<Failure>> {
     let mut prng = Prng::new(0x5ca1_ab1e);
     let timings = Timings::from(&plan);
-    let depths = Depths::for_queue_depth(plan.queue_depth);
+    let depths = Depths::for_queue_depth(plan.read_queue_depth);
     let faults = Faults::none(depths.inbox);
     let mut sim = Sim::new(
         &mut prng,
@@ -653,7 +653,7 @@ pub fn capacity(plan: Plan) -> Result<Prediction, Box<Failure>> {
             batches_in_flight: plan.batches_in_flight,
             burst: 32,
             queue: 1 << 12,
-            queue_depth: plan.queue_depth,
+            read_queue_depth: plan.read_queue_depth,
             strict: true,
             mode: Mode::Predict(plan.costs.scaled(plan.cost_percent)),
             linger_nanos: plan.linger_nanos,
@@ -755,7 +755,7 @@ impl Sim {
             batches_in_flight,
             burst,
             queue,
-            queue_depth,
+            read_queue_depth,
             strict,
             mode,
             capacity,
@@ -805,7 +805,7 @@ impl Sim {
         Self {
             reactor,
             mode,
-            queue_depth,
+            read_queue_depth,
             linger_nanos,
             poisson,
             prng: Prng::new(prng.next_u64()),
@@ -825,7 +825,7 @@ impl Sim {
                 burst,
                 accounts,
                 strict,
-                queue_depth as usize,
+                read_queue_depth as usize,
                 skew,
                 resolve_after,
             ),
@@ -865,7 +865,7 @@ impl Sim {
             }
             // In batches the ledger can hold: the whole set at once would be refused as overload,
             // retried, and refused again.
-            while sent.len() < self.queue_depth as usize {
+            while sent.len() < self.read_queue_depth as usize {
                 let Some(account) = owed.pop() else { break };
                 let transfer = self.traffic.funding(account, FUNDING);
                 if self
@@ -1047,7 +1047,7 @@ impl Sim {
     /// Bounded, because the traffic generator is allowed to offer nothing on a turn: without a bound
     /// a saturated run would spin here forever waiting for it to offer something.
     fn offer(&mut self, rate: u64) {
-        let depth = self.queue_depth;
+        let depth = self.read_queue_depth;
         // Bounded, but generously: a step can cover many arrival gaps when the clock jumps to the next
         // component event, and those arrivals are owed rather than lost.
         for _ in 0..256 {

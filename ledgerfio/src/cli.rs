@@ -90,7 +90,7 @@ pub struct Options {
     /// Reads the store will hold at once. It bounds what a slow read can hide behind: at a rate that needs
     /// more outstanding than this, the store refuses reads and the run reports the depth rather than the
     /// device. 40,000 reads a second at 5ms needs about two hundred.
-    pub store_queue_depth: usize,
+    pub store_read_depth: usize,
     /// Writes and barriers the volume's lane will hold at once. Its own number because the arithmetic is
     /// its own: a read side wants Little's law on the read rate, a write side wants the block seal rate
     /// against one ordered thread.
@@ -195,7 +195,7 @@ impl Default for Options {
             store_write: LatencyRange::fixed(Duration::ZERO),
             store_sync: LatencyRange::fixed(Duration::ZERO),
             store_iops: 0,
-            store_queue_depth: 128,
+            store_read_depth: 128,
             store_write_depth: 128,
             store_fault_every: 0,
             store_corrupt_every: 0,
@@ -341,7 +341,7 @@ impl Cli {
             "store-write" => options.store_write = Self::latency(value)?,
             "store-sync" => options.store_sync = Self::latency(value)?,
             "store-iops" => options.store_iops = Self::count(value)?,
-            "store-queue-depth" => options.store_queue_depth = Self::count(value)?.max(1) as usize,
+            "store-read-depth" => options.store_read_depth = Self::count(value)?.max(1) as usize,
             "store-write-depth" => options.store_write_depth = Self::count(value)?.max(1) as usize,
             "store-fault-every" => options.store_fault_every = Self::count(value)? as u32,
             "store-corrupt-every" => options.store_corrupt_every = Self::count(value)? as u32,

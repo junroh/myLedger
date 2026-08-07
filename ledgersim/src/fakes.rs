@@ -147,7 +147,7 @@ impl Timings {
                     read_tail_nanos: pick(3) * step_nanos,
                     write_base_nanos: pick(1) * step_nanos,
                     sync_base_nanos: pick(1) * step_nanos,
-                    queue_depth: 8 + pick(120) as usize,
+                    read_queue_depth: 8 + pick(120) as usize,
                     ..StoreModel::default()
                 }
             },

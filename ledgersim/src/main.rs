@@ -81,7 +81,7 @@ fn default_plan() -> Plan {
     Plan {
         duration_nanos: 1_000_000_000,
         rate: 0,
-        queue_depth: 20_000,
+        read_queue_depth: 20_000,
         accounts: 100_000,
         costs: Costs::default(),
         // The pending engine as a black box: what it answers a command in, its tail, and how many a
@@ -133,7 +133,7 @@ fn apply(options: &mut Options, key: &str, value: &str) -> Result<(), String> {
         "duration-ms" => plan.duration_nanos = number(key, value)? * 1_000_000,
         "rate" => plan.rate = number(key, value)?,
         // Queue depth, which `fio` calls iodepth: requests outstanding, not a ledger setting.
-        "qd" => plan.queue_depth = number(key, value)?.max(1),
+        "qd" => plan.read_queue_depth = number(key, value)?.max(1),
         "accounts" => plan.accounts = number(key, value)?.max(2),
         "pending-us" => plan.pending_nanos = micros(value)?,
         "pending-tail-us" => plan.pending_tail_nanos = micros(value)?,
@@ -436,7 +436,7 @@ impl Solve {
             plan.pending_rate,
             latency(matches!(self, Self::Raft), plan.raft_nanos),
             latency(matches!(self, Self::Idem), plan.idem_nanos),
-            plan.queue_depth
+            plan.read_queue_depth
         )
     }
 }
@@ -781,7 +781,7 @@ mod tests {
     fn quick_plan() -> super::Plan {
         super::Plan {
             duration_nanos: 20_000_000,
-            queue_depth: 4_096,
+            read_queue_depth: 4_096,
             accounts: 64,
             pending_nanos: 100_000,
             pending_tail_nanos: 0,
@@ -834,7 +834,7 @@ mod tests {
     #[test]
     fn a_chain_reaches_the_ledger_whole_or_waits() {
         let plan = super::Plan {
-            queue_depth: 20_000,
+            read_queue_depth: 20_000,
             ..quick_plan()
         };
         let prediction = super::capacity(plan).expect("no invariant broke");

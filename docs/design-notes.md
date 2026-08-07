@@ -2977,7 +2977,7 @@ removed (rule 12).
 | the closed decision *How often should the engine make its blocks durable?* | its evidence is `--store-write 50` costing 29% of throughput, which is a worker-thread cost | **yes**, after the model was fixed — the answer holds, `status.md` |
 | §16's *a device's cost is charged where it lands* | `LatencyStore` charges writes and syncs to the thread (`busy_until`); they become a queue's cost | **built** — the backing is asked, and a queued write gets a deadline |
 | §18's read-pool curve | it is a count of spare cores, and a write queue competes for the same ones | **yes** — same peak, steeper fall, `status.md` |
-| `--store-queue-depth`, `--store-read-threads` | they are a volume's properties, and there is no volume today — only a store | a volume exists now where a deployment declares one directory for both |
+| `--store-read-depth`, `--store-read-threads` | they are a volume's properties, and there is no volume today — only a store | a volume exists now where a deployment declares one directory for both |
 | `--store-write` / `--store-sync` | they model thread occupancy | fixed: they model whichever the backing does |
 
 ### The model had two implementations of one thing, and that is why a lane priced as no lane

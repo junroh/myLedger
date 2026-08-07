@@ -500,9 +500,9 @@ pub struct FileStore {
     /// anywhere else: it owns the descriptors and issues the reads itself, so a decorator over a synchronous
     /// `read_at` could never become one.
     pool: Option<ReadPool>,
-    queue_depth: usize,
+    read_queue_depth: usize,
     write_depth: usize,
-    /// Writes and barriers taken and not yet collected, when there is no lane. Bounded by `queue_depth`,
+    /// Writes and barriers taken and not yet collected, when there is no lane. Bounded by `read_queue_depth`,
     /// which is what turns a backing that cannot keep up into backpressure rather than a queue that grows
     /// (rule 12).
     written: VecDeque<(u64, Result<(), StoreFault>)>,
@@ -525,7 +525,7 @@ impl FileStore {
         read_threads: usize,
         write_lane: bool,
     ) -> Self {
-        let queue_depth = depths.read.max(1);
+        let read_queue_depth = depths.read.max(1);
         let write_depth = depths.write.max(1);
         let lane = write_lane.then(|| {
             let owned = File::open(&path).expect("the directory this store was opened on");
@@ -538,8 +538,8 @@ impl FileStore {
             dirty: 0,
             created: false,
             submitted: VecDeque::new(),
-            pool: (read_threads > 0).then(|| ReadPool::new(read_threads, queue_depth)),
-            queue_depth,
+            pool: (read_threads > 0).then(|| ReadPool::new(read_threads, read_queue_depth)),
+            read_queue_depth,
             write_depth,
             written: VecDeque::new(),
             lane,
@@ -808,7 +808,7 @@ impl DurableStore for FileStore {
             }
             return taken;
         }
-        if self.submitted.len() >= self.queue_depth {
+        if self.submitted.len() >= self.read_queue_depth {
             self.stats.reads_refused += 1;
             return false;
         }

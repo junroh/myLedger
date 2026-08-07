@@ -280,7 +280,7 @@ impl MemoryPendingConfig {
     /// configured beside the depth, because a share set next to the number it is a share of is a pair
     /// that can disagree — and the consequence of it disagreeing is a client refused for a snapshot.
     pub fn snapshot_queue_share(&self) -> usize {
-        (self.store.queue_depth.max(1) / 2).max(1)
+        (self.store.read_queue_depth.max(1) / 2).max(1)
     }
 
     /// Blocks the writeback buffer may hold before applying stops.
@@ -361,7 +361,7 @@ impl Default for MemoryPendingConfig {
             read_cache_blocks: 64,
             expiry_blocks_per_round: 2,
             store: StoreModel {
-                queue_depth: 128,
+                read_queue_depth: 128,
                 ..StoreModel::default()
             },
             snapshot: SnapshotPolicy::default(),

@@ -900,7 +900,7 @@ pub struct StoreModel {
     /// on the read rate — reads a second times the latency of one — and the depth a write side wants is
     /// the block seal rate against one ordered thread. Two arithmetics, and one number could only be
     /// right for one of them.
-    pub queue_depth: usize,
+    pub read_queue_depth: usize,
     /// Writes and barriers the lane will hold at once. Past this the caller keeps the block and offers it
     /// again, which is how a device slower than the ledger becomes backpressure rather than memory.
     pub write_queue_depth: usize,
@@ -1004,7 +1004,7 @@ impl StoreModel {
     /// The two depths, each at least one.
     pub fn depths(&self) -> QueueDepths {
         QueueDepths {
-            read: self.queue_depth.max(1),
+            read: self.read_queue_depth.max(1),
             write: self.write_queue_depth.max(1),
         }
     }
@@ -1084,12 +1084,12 @@ pub struct LatencyStore {
     ///
     /// The bytes have to be held, and there is no way around it: the store below answers in its order and
     /// this model releases in its own, so a completion that arrives early has to be kept somewhere. Bounded
-    /// by `queue_depth` — half a megabyte at the default and eight at 2048 — which is a measurement tool's
+    /// by `read_queue_depth` — half a megabyte at the default and eight at 2048 — which is a measurement tool's
     /// cost and is stated rather than hidden.
     completed: Vec<(u64, u64, Box<Block>)>,
     /// Buffers of completions already released, so the steady state allocates nothing.
     spare: Vec<Box<Block>>,
-    queue_depth: usize,
+    read_queue_depth: usize,
     write_queue_depth: usize,
     /// Device time charged by synchronous calls and not yet handed to whoever has a clock.
     charged_nanos: u64,
@@ -1116,7 +1116,7 @@ pub struct LatencyStore {
 
 impl LatencyStore {
     pub fn new(inner: Box<dyn DurableStore>, model: StoreModel, seed: u64) -> Self {
-        let queue_depth = model.queue_depth.max(1);
+        let read_queue_depth = model.read_queue_depth.max(1);
         let write_queue_depth = model.write_queue_depth.max(1);
         Self {
             inner,
@@ -1134,10 +1134,10 @@ impl LatencyStore {
                 tail_nanos: model.sync_tail_nanos,
             },
             prng: Prng::new(seed),
-            inflight: Vec::with_capacity(queue_depth),
-            completed: Vec::with_capacity(queue_depth),
+            inflight: Vec::with_capacity(read_queue_depth),
+            completed: Vec::with_capacity(read_queue_depth),
             spare: Vec::new(),
-            queue_depth,
+            read_queue_depth,
             write_queue_depth,
             charged_nanos: 0,
             refused: VecDeque::new(),
@@ -1369,7 +1369,7 @@ impl DurableStore for LatencyStore {
     /// The queue depth is this model's, and it counts what is held either side of the store below: refusing
     /// here is what a device with a full queue does.
     fn submit(&mut self, handle: u64, object: ObjectId, offset: u64, now: u64) -> bool {
-        if self.inflight.len() + self.completed.len() >= self.queue_depth {
+        if self.inflight.len() + self.completed.len() >= self.read_queue_depth {
             self.invented.reads_refused += 1;
             return false;
         }
@@ -2482,7 +2482,7 @@ mod tests {
         let model = StoreModel {
             // Every read, so the test does not depend on how many the log happens to issue.
             corrupt_every: 1,
-            queue_depth: 8,
+            read_queue_depth: 8,
             ..StoreModel::default()
         };
         let mut log = RecordLog::new(model.build(OpenBacking::Memory, 7), 1, 0);
@@ -2528,7 +2528,7 @@ mod tests {
     fn a_modelled_read_waits_for_the_later_of_the_two_times() {
         let slow_model = StoreModel {
             read_base_nanos: 1_000,
-            queue_depth: 4,
+            read_queue_depth: 4,
             ..StoreModel::default()
         };
         let mut modelled = LatencyStore::new(Box::new(MemoryStore::default()), slow_model, 1);
@@ -2552,7 +2552,7 @@ mod tests {
             2,
         ));
         let free = StoreModel {
-            queue_depth: 4,
+            read_queue_depth: 4,
             // Not `default()`: every field zero is the exact store and would not be wrapped at all.
             iops: 1_000_000_000,
             ..StoreModel::default()
@@ -2584,7 +2584,7 @@ mod tests {
         let model = StoreModel {
             // Every other call, so refusals land among writes the store below has taken.
             fault_every: 2,
-            queue_depth: 8,
+            read_queue_depth: 8,
             ..StoreModel::default()
         };
         // Residency wide enough to hold every block, so what is asserted is where they sit in it.

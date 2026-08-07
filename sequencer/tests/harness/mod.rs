@@ -71,7 +71,7 @@ impl NoLatency {
             },
             store: StoreModel {
                 fault_every: 1,
-                queue_depth: 8,
+                read_queue_depth: 8,
                 ..StoreModel::default()
             },
             ..Self::pending()
