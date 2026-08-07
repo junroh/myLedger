@@ -18,9 +18,12 @@ const DEFAULT_ACCOUNTS: u64 = 1_000;
 /// law on the store read rate; design notes §16 has the numbers and why the design's sixteen is not the
 /// default here.
 const READ_THREADS: usize = 0;
-/// Whether `pwrite` and `fsync` go to a thread of their own. False is the synchronous baseline, and what
-/// every number in the documents was taken against; a deployment on a device turns it on. Design notes §20.
-const WRITE_LANE: bool = false;
+/// Whether `pwrite` and `fsync` go to a thread of their own. **On**, because every measurement of it is
+/// one-sided: p99.9 goes from 103–124ms to 3.4–3.7ms, throughput at saturation is +37%, and a snapshot's
+/// cost to the median falls from 13–29% to 4%. One thread, and it has to be one — writes do not commute.
+/// `--store-write-lane 0` is still the synchronous baseline, which is what the older numbers in the
+/// documents were taken against. Design notes §20.
+const WRITE_LANE: bool = true;
 /// Log positions between snapshots when a directory was named and no distance was. Small enough that a
 /// local run writes several, which is what makes the flag observable at all; a deployment says its own,
 /// and what it should be is arithmetic on the log it means to retain — see design notes §19.

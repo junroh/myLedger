@@ -111,8 +111,9 @@ pub struct Options {
     /// read* rate: threads ≈ reads a second × the latency of one. Design notes §16.
     pub store_read_threads: usize,
     /// Whether the store's `pwrite` and `fsync` go to a thread of their own when `--store-dir` is set.
-    /// Off by default, which is the synchronous baseline every number is compared against — the same role
-    /// zero read threads plays. Design notes §20.
+    /// **On**, because every measurement of it is one-sided — the tail by thirty-one times, throughput at
+    /// saturation by 37%. Zero is the synchronous baseline the older numbers were taken against, and it is
+    /// still there to be asked for. Design notes §20.
     pub store_write_lane: bool,
     /// A directory to put the engine's snapshots in. Its own flag rather than the store's, because the two
     /// may be separate volumes and which they are is a provisioning decision (design notes §19).
@@ -195,7 +196,7 @@ impl Default for Options {
             store_corrupt_every: 0,
             store_dir: None,
             store_read_threads: 0,
-            store_write_lane: false,
+            store_write_lane: true,
             snapshot_dir: None,
             snapshot_every: 0,
             snapshot_bytes: ledger_pending::DEFAULT_SNAPSHOT_BYTES_PER_ROUND,

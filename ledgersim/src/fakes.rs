@@ -414,11 +414,12 @@ impl PendingFake {
         // the fault seeds drive, so without it a store that refuses on a write is never asked to.
         // Unbounded because the simulator has no budget to spread: what a seed is exploring is the
         // engine's behaviour, not how many rounds it took.
-        state.store.drain(usize::MAX);
+        let now = state.now;
+        state.store.drain(usize::MAX, now);
         // And the store's answers, which is what puts a written block in residency and what moves coverage
         // when a barrier completes. The worker's round has it beside `harvest`; here the whole round is one
         // method, so it sits next to the drain that submitted them.
-        state.store.collect_writes();
+        state.store.collect_writes(now);
         // Every node reclaims for itself, leader or not: a segment the index has no entry in holds only
         // dead records. Driven here as well as in the real worker, so the seeds see the same split.
         state.store.reclaim();
@@ -529,7 +530,8 @@ impl PendingFake {
         state.order_wait.deepest = state.order_wait.deepest.max(deepest);
         // Last in the round, so one sync covers everything it sealed — the cadence `PendingWorker` uses, and
         // the seeds should see the same one.
-        state.store.sync();
+        let now = state.now;
+        state.store.sync(now);
         if state.store.take_store_fault() {
             state.notices.push_back(PendingNotice::StoreFailed);
         }

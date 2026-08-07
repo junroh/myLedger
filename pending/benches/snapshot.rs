@@ -55,7 +55,7 @@ fn filled(holds: u64, slots: usize) -> PendingEngine {
     let mut engine = PendingEngine::sized(slots, 8, 1 << 20, Box::new(MemoryStore::default()));
     for at in 1..=holds {
         let _ = engine.write(create(at), ApplyIndex(at));
-        engine.drain(usize::MAX);
+        engine.drain(usize::MAX, 0);
     }
     engine
 }

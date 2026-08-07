@@ -377,18 +377,19 @@ mod tests {
             offset: u64,
             block: &Block,
             creating: bool,
+            now: u64,
         ) -> bool {
             self.0
                 .borrow_mut()
-                .submit_write(handle, object, offset, block, creating)
+                .submit_write(handle, object, offset, block, creating, now)
         }
 
-        fn submit_barrier(&mut self, handle: u64) -> bool {
-            self.0.borrow_mut().submit_barrier(handle)
+        fn submit_barrier(&mut self, handle: u64, now: u64) -> bool {
+            self.0.borrow_mut().submit_barrier(handle, now)
         }
 
-        fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
-            self.0.borrow_mut().poll_written()
+        fn poll_written(&mut self, now: u64) -> Option<(u64, Result<(), StoreFault>)> {
+            self.0.borrow_mut().poll_written(now)
         }
 
         fn writes_inflight(&self) -> usize {
@@ -483,13 +484,13 @@ mod tests {
             engine
                 .write(create(id as u128, group), ApplyIndex(id as u64))
                 .expect("the index took the hold");
-            engine.drain(usize::MAX);
+            engine.drain(usize::MAX, 0);
         }
 
         // What the worker's round ends with, and it has to happen for a slot to be carried at all: a block
         // handed to the store is written, not durable, and a snapshot may only keep what a crash would find.
-        engine.sync();
-        engine.collect_writes();
+        engine.sync(0);
+        engine.collect_writes(0);
         round_trip(&mut engine, &mut restored).expect("a snapshot of this engine");
 
         let mut carried = 0;
@@ -547,7 +548,7 @@ mod tests {
                     ApplyIndex(id as u64),
                 )
                 .expect("the index took the hold");
-            engine.drain(usize::MAX);
+            engine.drain(usize::MAX, 0);
         }
 
         assert_eq!(
@@ -561,8 +562,8 @@ mod tests {
             "a slot was carried for a block a crash would not have found"
         );
 
-        assert!(engine.sync(), "there were sealed blocks to make durable");
-        engine.collect_writes();
+        assert!(engine.sync(0), "there were sealed blocks to make durable");
+        engine.collect_writes(0);
         assert!(
             engine.coverage().raw() > 0,
             "everything sealed is durable and coverage still covers nothing"
@@ -572,7 +573,7 @@ mod tests {
             (1..=holds).any(|id| after.lookup(TxId(id as u128)).is_some()),
             "the sync made blocks durable and the snapshot still carried no slot for them"
         );
-        assert!(!engine.sync(), "a second sync had something to do");
+        assert!(!engine.sync(0), "a second sync had something to do");
     }
 
     /// A hold whose record has not reached a block is not carried, and that is the point rather than a gap.
@@ -586,7 +587,7 @@ mod tests {
         engine
             .write(create(1, BudgetGroup::ABSENT), ApplyIndex(1))
             .expect("the index took the hold");
-        engine.drain(usize::MAX);
+        engine.drain(usize::MAX, 0);
         assert!(
             engine.lookup(TxId(1)).is_some(),
             "the hold is not there to begin with"
@@ -626,7 +627,7 @@ mod tests {
                     ApplyIndex(id as u64),
                 )
                 .expect("the index took the hold");
-            engine.drain(usize::MAX);
+            engine.drain(usize::MAX, 0);
         }
         assert_eq!(
             engine.coverage(),
@@ -643,12 +644,12 @@ mod tests {
                     ApplyIndex(id as u64),
                 )
                 .expect("the index took the hold");
-            engine.drain(usize::MAX);
+            engine.drain(usize::MAX, 0);
         }
         // What the worker's round ends with. Durability is a claim of its own and has a test of its own; here
         // it only has to have happened, or coverage could not move at all.
-        engine.sync();
-        engine.collect_writes();
+        engine.sync(0);
+        engine.collect_writes(0);
         let covered = engine.coverage();
         assert!(
             covered.raw() > 0,
@@ -703,7 +704,7 @@ mod tests {
             let at = ApplyIndex(id);
             let effect = create(id as u128, group);
             engine.write(effect, at).expect("the index took the hold");
-            engine.drain(usize::MAX);
+            engine.drain(usize::MAX, 0);
             log.push((effect, at));
         }
         // A settle of one member in full, which is the only way a group member may be resolved, and a
@@ -717,7 +718,7 @@ mod tests {
                 released: 100,
             };
             engine.write(effect, at).expect("a removal frees a slot");
-            engine.drain(usize::MAX);
+            engine.drain(usize::MAX, 0);
             log.push((effect, at));
             next += 1;
         }
@@ -736,14 +737,14 @@ mod tests {
         ] {
             let at = ApplyIndex(next);
             engine.write(effect, at).expect("applied");
-            engine.drain(usize::MAX);
+            engine.drain(usize::MAX, 0);
             log.push((effect, at));
             next += 1;
         }
 
-        engine.sync();
+        engine.sync(0);
 
-        engine.collect_writes();
+        engine.collect_writes(0);
         let covered = engine.coverage();
         assert!(
             covered.raw() > 0 && covered.raw() < next,
@@ -799,7 +800,7 @@ mod tests {
         let (mut engine, _) = pair(1 << 12, 4);
         let effect = create(1, BudgetGroup(3));
         engine.write(effect, ApplyIndex(1)).expect("applied");
-        engine.drain(usize::MAX);
+        engine.drain(usize::MAX, 0);
         let once = engine.lookup(TxId(1)).expect("the hold");
 
         // Told that the totals already reflect this position, which is what a restore's header says. Without
@@ -827,7 +828,7 @@ mod tests {
                 ApplyIndex(2),
             )
             .expect("applied");
-        engine.drain(usize::MAX);
+        engine.drain(usize::MAX, 0);
         assert!(
             engine.lookup(TxId(1)).is_none(),
             "a second slot survived the removal"
@@ -851,7 +852,7 @@ mod tests {
             engine
                 .write(create(id as u128, BudgetGroup::ABSENT), ApplyIndex(id))
                 .expect("the index took the hold");
-            engine.drain(usize::MAX);
+            engine.drain(usize::MAX, 0);
         }
         let mut writer = engine.begin_snapshot();
         let coverage = engine.coverage();
@@ -871,7 +872,7 @@ mod tests {
             for _ in 0..3 {
                 next += 1;
                 let _ = engine.write(create(next as u128, BudgetGroup::ABSENT), ApplyIndex(next));
-                engine.drain(usize::MAX);
+                engine.drain(usize::MAX, 0);
             }
             shadow_peak = shadow_peak.max(engine.shadowed_buckets());
         }
@@ -927,7 +928,7 @@ mod tests {
         engine
             .write(create(1, BudgetGroup::ABSENT), ApplyIndex(1))
             .expect("the index took the hold");
-        engine.drain(usize::MAX);
+        engine.drain(usize::MAX, 0);
 
         let mut wrong = PendingEngine::sized(1 << 14, 1, 64, Box::new(MemoryStore::default()));
         let refused = round_trip(&mut engine, &mut wrong).expect_err("a table of another size");

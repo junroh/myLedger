@@ -237,18 +237,19 @@ impl Snapshots {
     fn completion(
         own: &mut Option<Box<dyn DurableStore>>,
         engine: &mut PendingEngine,
+        now: u64,
     ) -> Option<(u64, Result<(), StoreFault>)> {
         match own {
-            Some(store) => store.poll_written(),
+            Some(store) => store.poll_written(now),
             None => engine.take_foreign_completion(),
         }
     }
 
     /// This round's share: a turn at the dump in flight, or the start of one if the log has moved far
     /// enough since the last. Answers whether it did anything, so the worker's backoff sees it as work.
-    pub fn round(&mut self, engine: &mut PendingEngine) -> bool {
+    pub fn round(&mut self, engine: &mut PendingEngine, now: u64) -> bool {
         if self.inflight.is_some() {
-            return self.step(engine);
+            return self.step(engine, now);
         }
         if self.policy.every == 0 {
             return false;
@@ -256,7 +257,7 @@ impl Snapshots {
         if engine.applied_through().raw() < self.next_from.raw().saturating_add(self.policy.every) {
             return false;
         }
-        self.begin(engine)
+        self.begin(engine, now)
     }
 
     /// Ends a dump in flight without publishing it. The worker calls this when the store has broken: the
@@ -276,8 +277,9 @@ impl Snapshots {
     /// Starts one. The partial is removed first so the dump's first chunk can bring the object into being:
     /// `creating` is what a store checks with `O_EXCL`, and a partial left by a crash would otherwise
     /// refuse the first write of every dump until one of them cleared it.
-    fn begin(&mut self, engine: &mut PendingEngine) -> bool {
+    fn begin(&mut self, engine: &mut PendingEngine, now: u64) -> bool {
         let store = Self::volume(&mut self.own, engine);
+        let _ = now;
         let _ = store.remove(ObjectId::SNAPSHOT_PARTIAL);
         self.inflight = Some(InFlight {
             writer: engine.begin_snapshot(),
@@ -290,13 +292,13 @@ impl Snapshots {
         true
     }
 
-    fn step(&mut self, engine: &mut PendingEngine) -> bool {
+    fn step(&mut self, engine: &mut PendingEngine, now: u64) -> bool {
         let Some(mut run) = self.inflight.take() else {
             return false;
         };
         run.rounds += 1;
         let mut broken = false;
-        while let Some((handle, outcome)) = Self::completion(&mut self.own, engine) {
+        while let Some((handle, outcome)) = Self::completion(&mut self.own, engine, now) {
             debug_assert!(
                 IoOwner::Snapshot.owns(handle),
                 "a completion that is not this writer's reached it"
@@ -316,14 +318,14 @@ impl Snapshots {
             self.give_up(&mut run, engine);
         }
         match run.phase {
-            Phase::Filling => self.fill(&mut run, engine),
+            Phase::Filling => self.fill(&mut run, engine, now),
             Phase::Sealing(None) => {
                 // Everything this dump wrote is submitted, and a barrier is what makes it durable. Asked
                 // for before the writes are answered for on purpose: the lane keeps the order, so a barrier
                 // behind them in the queue is a barrier behind them on the device.
                 let handle = IoOwner::Snapshot.handle(self.handles + 1);
                 let store = Self::volume(&mut self.own, engine);
-                if store.submit_barrier(handle) {
+                if store.submit_barrier(handle, now) {
                     self.handles += 1;
                     run.outstanding += 1;
                     run.phase = Phase::Sealing(Some(handle));
@@ -369,7 +371,7 @@ impl Snapshots {
     /// Produces blocks and submits them, up to the throttle. One at a time, because a produced block that
     /// the queue would not take has to wait as bytes: the shadow entries it read are already gone, so the
     /// same block cannot be produced a second time.
-    fn fill(&mut self, run: &mut InFlight, engine: &mut PendingEngine) {
+    fn fill(&mut self, run: &mut InFlight, engine: &mut PendingEngine, now: u64) {
         for _ in 0..(self.policy.bytes_per_round / BLOCK_BYTES).max(1) {
             // The share, before the throttle and before the queue: what this stage may hold of the
             // volume is its own bound, not whatever the queue happens to have free when it asks.
@@ -400,6 +402,7 @@ impl Snapshots {
                 offset,
                 &self.chunk,
                 creating,
+                now,
             ) {
                 return;
             }
@@ -594,10 +597,10 @@ mod tests {
             engine
                 .write(create(id as u128), ApplyIndex(id))
                 .expect("the index took the hold");
-            engine.drain(usize::MAX);
+            engine.drain(usize::MAX, 0);
         }
-        engine.sync();
-        engine.collect_writes();
+        engine.sync(0);
+        engine.collect_writes(0);
     }
 
     /// Rounds until the stage stops having anything to do, so a test drives it the way the worker does —
@@ -605,8 +608,8 @@ mod tests {
     /// completions to it.
     fn drive(snapshots: &mut Snapshots, engine: &mut PendingEngine, rounds: usize) {
         for _ in 0..rounds {
-            let worked = snapshots.round(engine);
-            engine.collect_writes();
+            let worked = snapshots.round(engine, 0);
+            engine.collect_writes(0);
             if !worked {
                 break;
             }
@@ -795,7 +798,7 @@ mod tests {
         );
 
         for _ in 0..64 {
-            snapshots.round(&mut source);
+            snapshots.round(&mut source, 0);
             assert!(
                 held.writes_inflight() <= share,
                 "the dump held {} of a {share}-block share",
@@ -883,13 +886,13 @@ mod tests {
         // has not reached.
         let mut next = holds;
         for _ in 0..64 {
-            if !snapshots.round(&mut source) {
+            if !snapshots.round(&mut source, 0) {
                 break;
             }
-            source.collect_writes();
+            source.collect_writes(0);
             next += 1;
             let _ = source.write(create(next as u128), ApplyIndex(next));
-            source.drain(usize::MAX);
+            source.drain(usize::MAX, 0);
         }
         // And on to where the dump has answered for its writes, because the partial goes then and not
         // when the shadow does.
@@ -944,10 +947,10 @@ mod tests {
         while source.applied_through().raw() < applied * 100 {
             next += 1;
             let _ = source.write(create(next as u128), ApplyIndex(next));
-            source.drain(usize::MAX);
+            source.drain(usize::MAX, 0);
         }
-        source.sync();
-        source.collect_writes();
+        source.sync(0);
+        source.collect_writes(0);
         drive(&mut snapshots, &mut source, 100_000);
         assert_eq!(
             snapshots.stats().written,

@@ -2840,19 +2840,30 @@ removed (rule 12).
 | number | why it moves | retaken |
 |---|---|---|
 | §19's throttle, 4096 bytes a round | chosen entirely because the chunk holds the worker's thread | **yes** — the number stays and the reason changed, §19 |
-| the closed decision *How often should the engine make its blocks durable?* | its evidence is `--store-write 50` costing 29% of throughput, which is a worker-thread cost | **no, and the attempt is the finding** — see below |
-| §16's *a device's cost is charged where it lands* | `LatencyStore` charges writes and syncs to the thread (`busy_until`); they become a queue's cost | not yet, and it is what blocks the row above |
+| the closed decision *How often should the engine make its blocks durable?* | its evidence is `--store-write 50` costing 29% of throughput, which is a worker-thread cost | **yes**, after the model was fixed — the answer holds, `status.md` |
+| §16's *a device's cost is charged where it lands* | `LatencyStore` charges writes and syncs to the thread (`busy_until`); they become a queue's cost | **built** — the backing is asked, and a queued write gets a deadline |
 | §18's read-pool curve | it is a count of spare cores, and a write queue competes for the same ones | **yes** — same peak, steeper fall, `status.md` |
 | `--store-queue-depth`, `--store-read-threads` | they are a volume's properties, and there is no volume today — only a store | a volume exists now where a deployment declares one directory for both |
-| `--store-write` / `--store-sync` | they model thread occupancy | still true, and now measured to be |
+| `--store-write` / `--store-sync` | they model thread occupancy | fixed: they model whichever the backing does |
 
-**The sync cadence cannot be retaken with this tool, and that is worth stating as a result.** Measured
-saturated on a workload whose holds survive, `--store-write 100` costs 63% of throughput with the lane off
-and 70% with it on — the same bite on a path where the `pwrite` has demonstrably left the worker's thread.
-The model charges the caller at submit, so it prices thread occupancy whatever the backing does with the
-write. What is missing is the write side of what `LatencyStore` already does for reads: hold the write with
-a deadline and answer it later, so a slow device shows up as a queue that fills and refuses rather than as a
-thread that is busy. Until then a number from `--store-write` on a laned path is a number about the model.
+### The model had two implementations of one thing, and that is why a lane priced as no lane
+
+The sync cadence could not be retaken at first: `--store-write 100` cost 63% of throughput with the lane
+off and 70% with it on, the same bite on a path where the `pwrite` had demonstrably left the worker's
+thread. The model was charging the caller at submit whatever the backing did.
+
+**The cause was an asymmetry in the interface rather than a wrong branch in the model.** A read carries the
+clock — `submit(handle, object, offset, now)`, `poll(now, into)` — and a write did not. So the model could
+give a read a deadline and had nothing to give a write, and priced it the only way left: by holding the
+caller. When §20 made writes submit-and-complete, the clock did not come with them, and the model stayed on
+the old shape.
+
+Both halves are fixed together. The write side of the trait carries `now`, so a queued write gets a
+deadline exactly as a read does — one server rather than a rate gate, because a lane is one ordered thread
+and a second write waits for the first. And the backing answers `writes_are_queued`, because *which
+arrangement is being modelled* is a fact the backing has and the model was guessing: an inline write really
+does stop the caller's thread, and pricing it as a queue would describe a lane that is not there. One
+implementation, one declared input, no assumption held below the layer that has the answer.
 
 ### What is built, and what is left
 

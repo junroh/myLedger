@@ -44,6 +44,10 @@ help:
 # rate. That last part is the reason it is a second line rather than a replacement — the two-directory run
 # is the other shape, and neither covers the other. The unit tests reach the shared store but not the lane.
 #
+# The two lines also cover the two write arrangements now that the lane is the default: the first asks for
+# `--store-write-lane 0`, which is the synchronous baseline every older number was taken against, and the
+# second takes the default. A baseline nothing runs is a baseline that rots.
+#
 # Nothing here gates a latency target, and one reason is worth stating: a long run's tail is the dedup
 # stand-in's, not the ledger's — see `status.md`.
 verify:
@@ -51,7 +55,7 @@ verify:
 	cargo build --release --workspace --all-targets
 	cargo run --release -p ledgerfio -- run --sweep workload=all --duration 1s
 	cargo run --release -p ledgerfio -- run --workload void-heavy --duration 2s --rate 100k --resolve-after 900000 --expiry-days 6
-	blk=$$(mktemp -d); snap=$$(mktemp -d); cargo run --release -p ledgerfio -- run --workload hold-settle --duration 2s --rate 100k --resolve-after 900000 --store-dir $$blk --store-write-lane 1 --snapshot-dir $$snap --snapshot-every 200; status=$$?; rm -rf $$blk $$snap; exit $$status
+	blk=$$(mktemp -d); snap=$$(mktemp -d); cargo run --release -p ledgerfio -- run --workload hold-settle --duration 2s --rate 100k --resolve-after 900000 --store-dir $$blk --store-write-lane 0 --snapshot-dir $$snap --snapshot-every 200; status=$$?; rm -rf $$blk $$snap; exit $$status
 	one=$$(mktemp -d); cargo run --release -p ledgerfio -- run --workload hold-settle --duration 2s --rate 100k --resolve-after 900000 --store-dir $$one --store-write-lane 1 --snapshot-dir $$one --snapshot-every 200; status=$$?; rm -rf $$one; exit $$status
 	cargo run --release -p ledgerfio -- layout
 	cargo run --release -p ledgersim -- check --seeds 32

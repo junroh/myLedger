@@ -38,32 +38,33 @@ impl DurableStore for HoldingStore {
         offset: u64,
         block: &Block,
         creating: bool,
+        now: u64,
     ) -> bool {
         let mut held = self.0.borrow_mut();
         if !held
             .inner
-            .submit_write(handle, object, offset, block, creating)
+            .submit_write(handle, object, offset, block, creating, now)
         {
             return false;
         }
-        while let Some(done) = held.inner.poll_written() {
+        while let Some(done) = held.inner.poll_written(now) {
             held.held.push_back(done);
         }
         true
     }
 
-    fn submit_barrier(&mut self, handle: u64) -> bool {
+    fn submit_barrier(&mut self, handle: u64, now: u64) -> bool {
         let mut held = self.0.borrow_mut();
-        if !held.inner.submit_barrier(handle) {
+        if !held.inner.submit_barrier(handle, now) {
             return false;
         }
-        while let Some(done) = held.inner.poll_written() {
+        while let Some(done) = held.inner.poll_written(now) {
             held.held.push_back(done);
         }
         true
     }
 
-    fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
+    fn poll_written(&mut self, _now: u64) -> Option<(u64, Result<(), StoreFault>)> {
         let mut held = self.0.borrow_mut();
         if held.release == 0 {
             return None;

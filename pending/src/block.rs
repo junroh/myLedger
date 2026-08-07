@@ -324,6 +324,7 @@ pub trait DurableStore {
         offset: u64,
         block: &Block,
         creating: bool,
+        now: u64,
     ) -> bool;
     /// Takes a barrier. Everything submitted before it is durable once its completion arrives.
     ///
@@ -333,11 +334,20 @@ pub trait DurableStore {
     /// file that does not exist. So durability is a fact about the store at a moment rather than a watermark
     /// per segment, which is the optimisation someone would otherwise reach for. What a barrier covered is
     /// the caller's to remember, because the caller is what submitted it.
-    fn submit_barrier(&mut self, handle: u64) -> bool;
+    fn submit_barrier(&mut self, handle: u64, now: u64) -> bool;
     /// The next write or barrier that has finished, by the handle it was given. `None` while none has.
-    fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)>;
+    fn poll_written(&mut self, now: u64) -> Option<(u64, Result<(), StoreFault>)>;
     /// Writes and barriers taken and not yet answered for.
     fn writes_inflight(&self) -> usize;
+    /// Whether a write leaves the caller's thread. **A model in front of this store has to know**, because
+    /// the two arrangements are different and its whole job is to describe one of them: a queued write
+    /// makes a slow device show as a queue that fills, and an inline one makes it show as a thread that
+    /// stops. Answered by the backing because the backing is what knows — the alternative is a model
+    /// holding an assumption about a layer below it, which is how it came to price a lane that was there
+    /// as though it were not.
+    fn writes_are_queued(&self) -> bool {
+        false
+    }
     /// `&mut` although reading changes nothing a caller can see: a store that models a device charges
     /// the read, and one that can fail counts it.
     fn read_at(
@@ -511,6 +521,7 @@ impl DurableStore for MemoryStore {
         offset: u64,
         block: &Block,
         creating: bool,
+        _now: u64,
     ) -> bool {
         let done = if creating {
             self.open_with(object, offset, block)
@@ -523,12 +534,12 @@ impl DurableStore for MemoryStore {
 
     /// Nothing to do, and nothing dishonest about that: memory has no second layer to push bytes into.
     /// Answered anyway, so the caller's barrier bookkeeping runs here exactly as it does over a device.
-    fn submit_barrier(&mut self, handle: u64) -> bool {
+    fn submit_barrier(&mut self, handle: u64, _now: u64) -> bool {
         self.written.push_back((handle, Ok(())));
         true
     }
 
-    fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
+    fn poll_written(&mut self, _now: u64) -> Option<(u64, Result<(), StoreFault>)> {
         self.written.pop_front()
     }
 
@@ -890,6 +901,14 @@ pub struct LatencyStore {
     /// than a flag because expiry is not the only thing that can have several in flight, and a dropped one
     /// would be a block the caller waits on for ever.
     refused: VecDeque<u64>,
+    /// Queued writes and barriers, in submission order, with when this model says the lane is done with
+    /// each. Empty unless the backing queues its writes.
+    write_due: VecDeque<(u64, u64)>,
+    /// Answers the backing has given and this model has not released, because its own time for them has
+    /// not passed.
+    write_answered: VecDeque<(u64, Result<(), StoreFault>)>,
+    /// When the modelled lane next falls idle. One server: a write waits for the one in front of it.
+    write_busy_until: u64,
     fault_every: u32,
     corrupt_every: u32,
     calls: u64,
@@ -921,6 +940,9 @@ impl LatencyStore {
             queue_depth,
             charged_nanos: 0,
             refused: VecDeque::new(),
+            write_due: VecDeque::new(),
+            write_answered: VecDeque::new(),
+            write_busy_until: 0,
             fault_every: model.fault_every,
             corrupt_every: model.corrupt_every,
             calls: 0,
@@ -950,13 +972,30 @@ impl LatencyStore {
         self.calls += 1;
         self.fault_every > 0 && self.calls.is_multiple_of(u64::from(self.fault_every))
     }
+
+    fn writes_queued(&self) -> usize {
+        self.write_due.len()
+    }
+
+    /// When the lane will be done with this one. **One server, not many**, because that is what a write
+    /// lane is: writes do not commute, so they are served in order by one thread, and a second write
+    /// waits for the first rather than overlapping it. The read side draws from a rate gate instead,
+    /// because reads do overlap.
+    fn serve_write(&mut self, now: u64, cost: Cost) -> u64 {
+        let start = now.max(self.write_busy_until);
+        let due = start + cost.draw(&mut self.prng);
+        self.write_busy_until = due;
+        due
+    }
 }
 
 impl DurableStore for LatencyStore {
-    /// **Still charged to the thread rather than to the queue, and that is not an oversight.** §20 moves
-    /// writes onto a lane of their own, and when the backing has one this charge becomes a deadline the way
-    /// a read's is. Until then the backing still does the `pwrite` on the caller's thread, and a model that
-    /// priced it as a queue's cost would be describing a lane that does not exist yet.
+    /// **Charged where the backing puts it, which is the one thing this had wrong.** A write on a lane is a
+    /// queue's cost: it is admitted, the queue serves it, and the caller goes on — so it gets a deadline,
+    /// exactly as a read does. A write the backing does inline is the caller's thread stopping, so it is
+    /// charged to `busy_until`. Both arrangements exist and the backing is what knows which
+    /// (`writes_are_queued`); before, this assumed the second and priced a lane as though it were not
+    /// there, which measured the model rather than the arrangement.
     fn submit_write(
         &mut self,
         handle: u64,
@@ -964,37 +1003,98 @@ impl DurableStore for LatencyStore {
         offset: u64,
         block: &Block,
         creating: bool,
+        now: u64,
     ) -> bool {
-        self.charge(self.write);
+        if !self.inner.writes_are_queued() {
+            self.charge(self.write);
+            if self.refuses() {
+                self.refused.push_back(handle);
+                return true;
+            }
+            return self
+                .inner
+                .submit_write(handle, object, offset, block, creating, now);
+        }
+        if self.writes_queued() >= self.queue_depth {
+            return false;
+        }
         if self.refuses() {
             self.refused.push_back(handle);
             return true;
         }
-        self.inner
-            .submit_write(handle, object, offset, block, creating)
+        if !self
+            .inner
+            .submit_write(handle, object, offset, block, creating, now)
+        {
+            return false;
+        }
+        let due = self.serve_write(now, self.write);
+        self.write_due.push_back((handle, due));
+        true
     }
 
-    fn submit_barrier(&mut self, handle: u64) -> bool {
-        self.charge(self.sync);
+    fn submit_barrier(&mut self, handle: u64, now: u64) -> bool {
+        if !self.inner.writes_are_queued() {
+            self.charge(self.sync);
+            if self.refuses() {
+                self.refused.push_back(handle);
+                return true;
+            }
+            return self.inner.submit_barrier(handle, now);
+        }
+        if self.writes_queued() >= self.queue_depth {
+            return false;
+        }
         if self.refuses() {
             self.refused.push_back(handle);
             return true;
         }
-        self.inner.submit_barrier(handle)
+        if !self.inner.submit_barrier(handle, now) {
+            return false;
+        }
+        let due = self.serve_write(now, self.sync);
+        self.write_due.push_back((handle, due));
+        true
     }
 
     /// A refusal this model invented is answered here rather than at submit: the caller is told through the
     /// completion, which is the one path a real device's failure takes too (rule 17 — nothing observable
     /// changes at submit but the promise to answer).
-    fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
+    ///
+    /// A queued write leaves when the backing has answered it **and** this model's time for it has passed,
+    /// which is the same floor a read's completion is — a device modelled slower than the one underneath
+    /// dominates, and one modelled faster cannot be expressed.
+    fn poll_written(&mut self, now: u64) -> Option<(u64, Result<(), StoreFault>)> {
         if let Some(handle) = self.refused.pop_front() {
             return Some((handle, Err(StoreFault::Device)));
         }
-        self.inner.poll_written()
+        if !self.inner.writes_are_queued() {
+            return self.inner.poll_written(now);
+        }
+        while let Some(answered) = self.inner.poll_written(now) {
+            self.write_answered.push_back(answered);
+        }
+        // In submission order, because one lane serves them in that order and the caller's barrier
+        // bookkeeping rests on it.
+        let (handle, due) = *self.write_due.front()?;
+        if due > now {
+            return None;
+        }
+        let at = self
+            .write_answered
+            .iter()
+            .position(|(asked, _)| *asked == handle)?;
+        let (_, outcome) = self.write_answered.remove(at)?;
+        self.write_due.pop_front();
+        Some((handle, outcome))
     }
 
     fn writes_inflight(&self) -> usize {
-        self.refused.len() + self.inner.writes_inflight()
+        self.refused.len() + self.write_due.len() + self.inner.writes_inflight()
+    }
+
+    fn writes_are_queued(&self) -> bool {
+        self.inner.writes_are_queued()
     }
 
     /// The read that cannot be submitted and harvested: the apply path is in order and cannot park a
@@ -1370,12 +1470,12 @@ impl RecordLog {
     /// Makes durable everything sealed since this was last asked, and answers whether there was anything to
     /// do. The caller decides how often; the consequence of waiting is that coverage lags, never that
     /// anything is lost, because what is not durable is still in the log.
-    pub fn sync(&mut self) -> bool {
+    pub fn sync(&mut self, now: u64) -> bool {
         // Everything closed has to be *submitted* before the barrier that claims to cover it. One call
         // rather than two statements a caller could get the wrong way round (rule 16): a barrier that
         // overtook a write it was meant to cover would make coverage claim a block a restart cannot read.
         // The lane keeps the order from there on, which is why the write side is a queue and not a pool.
-        self.submit_writes();
+        self.submit_writes(now);
         if self.unsynced.is_none() || self.barrier.is_some() {
             return false;
         }
@@ -1383,7 +1483,7 @@ impl RecordLog {
         // a handle spent on a barrier the queue refused would be one nothing ever completes, and coverage
         // would stop for ever waiting for it.
         let handle = IoOwner::Blocks.handle(self.write_handles + 1);
-        if !self.store.submit_barrier(handle) {
+        if !self.store.submit_barrier(handle, now) {
             return false;
         }
         self.write_handles += 1;
@@ -1786,7 +1886,7 @@ impl RecordLog {
     /// Residency is filled from here rather than at the close, so a block enters that window once a device
     /// has actually been given it. It is trimmed here for the reason it always was: this is the only event
     /// that adds to it.
-    pub fn submit_writes(&mut self) -> bool {
+    pub fn submit_writes(&mut self, now: u64) -> bool {
         let mut any = false;
         let Self {
             store,
@@ -1818,6 +1918,7 @@ impl RecordLog {
                 offset,
                 &held.bytes,
                 unwritten.opening,
+                now,
             ) {
                 break;
             }
@@ -1856,9 +1957,9 @@ impl RecordLog {
     /// device has actually been given it. Completions arrive in submission order because the write side is an
     /// ordered lane (§20), which is what keeps residency's block numbers contiguous — the one property
     /// `oldest_resident` rests on.
-    pub fn collect_writes(&mut self) -> bool {
+    pub fn collect_writes(&mut self, now: u64) -> bool {
         let mut any = false;
-        while let Some((handle, outcome)) = self.store.poll_written() {
+        while let Some((handle, outcome)) = self.store.poll_written(now) {
             // Somebody else's, on a store this volume shares. One queue has one poller, so what does not
             // belong to the blocks is put where its owner will find it rather than dropped — dropping it
             // would leave that owner waiting on a completion that already came (rule 18: the handle says
@@ -2036,8 +2137,8 @@ mod tests {
         }
         // Closing a block no longer writes it (§20): it has to be submitted and answered for before the
         // store can be asked to lie about it, which is what the worker's round does either side of a drain.
-        log.submit_writes();
-        log.collect_writes();
+        log.submit_writes(0);
+        log.collect_writes(0);
         let sealed = addrs[0];
         assert!(
             log.try_read(sealed).is_none(),
@@ -2072,8 +2173,8 @@ mod tests {
         };
         let mut modelled = LatencyStore::new(Box::new(MemoryStore::default()), slow_model, 1);
         let block = Block::zeroed();
-        assert!(modelled.submit_write(1, ObjectId::segment(0), 0, &block, true));
-        assert_eq!(modelled.poll_written(), Some((1, Ok(()))));
+        assert!(modelled.submit_write(1, ObjectId::segment(0), 0, &block, true, 0));
+        assert_eq!(modelled.poll_written(0), Some((1, Ok(()))));
         let mut into = Block::zeroed();
 
         assert!(modelled.submit(7, ObjectId::segment(0), 0, 0));
@@ -2097,8 +2198,8 @@ mod tests {
             ..StoreModel::default()
         };
         let mut stacked = LatencyStore::new(inner, free, 3);
-        assert!(stacked.submit_write(1, ObjectId::segment(0), 0, &block, true));
-        assert_eq!(stacked.poll_written(), Some((1, Ok(()))));
+        assert!(stacked.submit_write(1, ObjectId::segment(0), 0, &block, true, 0));
+        assert_eq!(stacked.poll_written(0), Some((1, Ok(()))));
         assert!(stacked.submit(9, ObjectId::segment(0), 0, 0));
         assert!(
             stacked.poll(0, &mut into).is_none(),
@@ -2136,8 +2237,8 @@ mod tests {
             let key = TxId(index as u128 + 1);
             kept.push((key, log.keep(key, &hold(10), ApplyIndex(1))));
         }
-        log.submit_writes();
-        log.collect_writes();
+        log.submit_writes(0);
+        log.collect_writes(0);
 
         // Residency here is wider than the blocks this makes, so nothing has been evicted and every one of
         // them must still answer from memory. That is a property of the sizing rather than a rule — the
@@ -2177,8 +2278,8 @@ mod tests {
             let key = TxId(index as u128 + 1);
             kept.push((key, log.keep(key, &hold(10), ApplyIndex(1))));
         }
-        log.submit_writes();
-        log.collect_writes();
+        log.submit_writes(0);
+        log.collect_writes(0);
         assert_eq!(
             log.writes_outstanding(),
             4,
@@ -2198,7 +2299,7 @@ mod tests {
 
         // Answered, and now the window applies: the oldest blocks go, and the store is what has them.
         store.release_all();
-        log.collect_writes();
+        log.collect_writes(0);
         assert_eq!(log.writes_outstanding(), 0);
         let (key, oldest) = kept[0];
         assert!(

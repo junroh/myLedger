@@ -181,7 +181,9 @@ fn print_help() {
     );
     println!("  --store-dir <path>          (unset) put segment files here; unset is memory");
     println!("  --store-read-threads <n>    (0) threads issuing the store's preads; 0 reads synchronously");
-    println!("  --store-write-lane <0|1>    (0) put pwrite and fsync on a thread of their own");
+    println!(
+        "  --store-write-lane <0|1>    (1) pwrite and fsync on a thread of their own; 0 is the baseline"
+    );
     println!(
         "  --snapshot-dir <path>       (unset) put snapshots here; its own volume, so its own flag"
     );

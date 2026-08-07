@@ -509,7 +509,7 @@ impl PendingEngine {
     /// Each block: a record is alive exactly when the index still points at it, which needs no extra
     /// bookkeeping — a resolved hold has no entry and a superseded version's entry has moved on. Both
     /// tests are address comparisons, so compaction reads nothing it has not already got in hand.
-    pub fn drain(&mut self, blocks: usize) -> bool {
+    pub fn drain(&mut self, blocks: usize, now: u64) -> bool {
         let mut drained = 0;
         while drained < blocks && self.records.over_window() {
             self.survivors.clear();
@@ -537,15 +537,15 @@ impl PendingEngine {
         // rollover's partial block with them — `open_day` closes one too, and it runs earlier in the same
         // round. Offered, not written: the store answers through `collect_writes` below, and a store that
         // will not take one leaves it here to be offered again.
-        let submitted = self.records.submit_writes();
+        let submitted = self.records.submit_writes(now);
         drained > 0 || submitted
     }
 
     /// Takes every write and barrier the store has answered: blocks enter residency, a completed barrier
     /// moves coverage, and a refusal is latched for the seal. Whoever runs the loop owes this a call each
     /// round, the same way it owes `harvest` one for reads.
-    pub fn collect_writes(&mut self) -> bool {
-        self.records.collect_writes()
+    pub fn collect_writes(&mut self, now: u64) -> bool {
+        self.records.collect_writes(now)
     }
 
     /// Blocks closed or submitted and not yet answered for. What the caller compares against a ceiling, the
@@ -836,8 +836,8 @@ impl PendingEngine {
     /// Makes durable what has been sealed, and answers whether there was anything to make durable. Whoever
     /// runs the loop decides how often, the same way it decides when the day has moved: the engine keeps no
     /// policy of its own, and the cost of asking rarely is a coverage that lags rather than anything lost.
-    pub fn sync(&mut self) -> bool {
-        self.records.sync()
+    pub fn sync(&mut self, now: u64) -> bool {
+        self.records.sync(now)
     }
 
     /// Whether the store has refused something since this was last asked. Taken as it is read, so the news
@@ -1006,8 +1006,8 @@ mod test_support {
             // the drain submits closed blocks and the collect takes the store's answers, which is what puts
             // them in residency. Unbounded because a test drives the engine by hand and has no round to
             // spread a budget over — what is asserted is where records end up, not how many rounds it took.
-            self.drain(usize::MAX);
-            self.collect_writes();
+            self.drain(usize::MAX, 0);
+            self.collect_writes(0);
         }
     }
 }

@@ -908,21 +908,28 @@ An entry that vanishes reads as a question nobody ever asked.
   them. Design notes §16 has both curves, the read curve beside them, and why 1M is the rate they were taken
   at.
 
-  **Retaken, and the retake says the tool cannot answer it.** The shape reproduces on the default path:
-  `hold-settle --resolve-after 900000` saturated, three alternated pairs, `--store-write 50` costs 42% of
-  throughput and `--store-write 100` costs 63% — the same knee, a little steeper than the 29% and 56%
-  recorded above, on a machine that has drifted and a ledger that has changed since. What it does *not*
-  do is change when the write lane is on: 53% and 70%, which is the same bite on a path where the `pwrite`
-  demonstrably left the worker's thread. **That is the model being blind to the lane, not the lane being
-  worthless** — `LatencyStore` charges a write to `busy_until` at submit, which prices thread occupancy by
-  construction, and §20's own table said this would happen. So the question stays open for the laned path
-  until the model prices a write as a queue's cost the way it already prices a read. Recorded as a blocked
-  measurement rather than an answer, because a number taken with this tool would be a number about the
-  tool.
+  **Retaken on the lane, and the answer holds with the same arithmetic behind it.** The retake needed the
+  model fixed first: `LatencyStore` charged every write to the caller's thread, so it priced a lane as
+  though it were not there and gave the same figure either way. It asks the backing now
+  (`writes_are_queued`) and gives a queued write a deadline the way it always did a read.
 
-  **One number did come out of it and it is the lane's own worth at saturation**: 1.26M tx/s against 1.72M
-  with real files on that workload, three pairs, +37%. §20 records +7 to +9% for the same lane, which was a
-  rate-limited run — this is the ceiling, where the thread the writes left is the thing in short supply.
+  With that, `hold-settle --resolve-after 900000` saturated, three alternated pairs. **A sync is cheap on
+  either arrangement**: 400µs costs 9.6% of throughput off the lane and 3.9% on it, and 100µs costs 5.6%
+  and 5.8%. Every round stays the answer, and group commit is still why — one barrier at a time, covering
+  everything sealed since the last, so the barrier rate limits itself.
+
+  **The budget's shape survives and the thread it divides has changed owner.** The seal rate here is
+  19,667 blocks a second, so the budget is 51µs — the same figure as the original run's 19,444 and 51µs,
+  which makes the two directly comparable. Below the budget the lane absorbs most of the cost:
+  `--store-write 50` takes 41% of throughput off the lane and **16%** on it. At twice the budget both are
+  swamped, 61% against 56%, because one lane thread cannot serve 19,667 writes a second at 100µs — that
+  needs two. So: **one thread divided by the block seal rate, and the thread is the lane's.** What the lane
+  changes is not where the knee is but who pays below it — off the lane every lookup does, on it nobody
+  does until the lane itself saturates.
+
+  **And the lane's own worth at saturation is +37%**: 1.26M tx/s against 1.72M with real files on that
+  workload. §20 records +7 to +9% for the same lane on a rate-limited run — this is the ceiling, where the
+  thread the writes left is the thing in short supply. It is the default now.
 - **Where does the writeback buffer's drain run?** In the worker's round, on a declared budget — not on a
   thread of its own. A drain asks the index what is still alive and repoints the survivors, and four ways of
   moving that off the worker all fail or collapse: a lock is forbidden on that path (rule 10), a drain that

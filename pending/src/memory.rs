@@ -955,6 +955,9 @@ impl PendingWorker {
                 backoff.record(false);
                 continue;
             }
+            // One reading of the clock for the round, so every stage in it prices against the same
+            // instant — a store that models a device is handed this the way it already was for reads.
+            let now = self.now();
             let progress = self.hand_over_notices()
                 | self.sweep_expiry()
                 | self.drain_commands()
@@ -962,21 +965,21 @@ impl PendingWorker {
                 // Writes and barriers the store has answered: blocks reach residency and a completed
                 // barrier moves coverage. Beside `harvest` because it is the same job for the other
                 // direction, and before the drain below so this round's submissions find room.
-                | self.engine.collect_writes()
+                | self.engine.collect_writes(now)
                 | self.deliver()
                 // After the replies are out and before the sync, and both edges are the contract. This
                 // round's appends have to be in the buffer for the drain to see them, and what it seals
                 // has to be there for the sync below to cover. Applying no longer does this (§20).
-                | self.engine.drain(self.drain_blocks_per_round)
+                | self.engine.drain(self.drain_blocks_per_round, now)
                 // Last, so one sync covers every block this round sealed — group commit within a round. The
                 // policy is here because it is a policy: syncing less often costs coverage and nothing else,
                 // and what it buys back is a device's fsync off the thread that answers lookups.
                 // `status.md`'s decisions list has that trade and what would settle it.
-                | self.engine.sync()
+                | self.engine.sync(now)
                 // After the sync, because a snapshot may carry only what a crash would find: a dump that
                 // began before it would take this round's seals as still-unwritten and leave their slots
                 // out. Costs nothing but a fresher coverage, and there is no reason to give that up.
-                | self.snapshot_round();
+                | self.snapshot_round(now);
             // Taken after the round rather than before, because the round is what incurred it: the writes,
             // syncs and apply-path reads it just did are time this thread would have been inside a syscall
             // for. Absolute, so a real device under the model has already spent it and the gate is a no-op.
@@ -1011,11 +1014,11 @@ impl PendingWorker {
 
     /// This round's share of a snapshot, and nothing at all when no directory was named. The stage keeps
     /// its own cadence and its own throttle; the worker only owes it a turn.
-    fn snapshot_round(&mut self) -> bool {
+    fn snapshot_round(&mut self, now: u64) -> bool {
         let Some(snapshots) = self.snapshots.as_mut() else {
             return false;
         };
-        snapshots.round(&mut self.engine)
+        snapshots.round(&mut self.engine, now)
     }
 
     /// First in the round, and it retries until each notice lands: news the sequencer has to act on may

@@ -130,14 +130,13 @@ decides what the prediction is worth:
   asked for is one command per resolution, plus fences and writes — the command rate follows the traffic
   and nothing on the sequencer's side reduces it. What the engine's own memory saves is the IO *below*
   that command, which is `--store-read` and `--store-iops`, reported as `reads: memory=N store=M`.
-- **The device's two kinds of cost are separate flags, because they occupy different things.** A lookup's
-  read occupies the *device*: `--store-read` and `--store-iops` set a deadline per read and the engine keeps
-  working while the queue serves it. A write (`--store-write`) and a sync (`--store-sync`) occupy the
-  *thread*: a real `pwrite` or `fsync` blocks, and with `--store-write-lane 0` — the default — that is the
-  engine's own thread, so every lookup's latency includes it and the round that ran them does nothing more
-  until the clock passes. **With the lane on the real writes leave that thread but the model's charge does
-  not follow them yet** (§20), so `--store-write` and `--store-write-lane 1` together price something that is
-  not there. Zero for all of them is the exact store, which every other answer is measured against. Design notes §16 has the measured curves; the
+- **The device's two kinds of cost are separate flags, and each is charged where the backing puts it.** A
+  lookup's read occupies the *device*: `--store-read` and `--store-iops` set a deadline per read and the
+  engine keeps working while the queue serves it. A write (`--store-write`) and a sync (`--store-sync`)
+  occupy whichever the arrangement says — with `--store-write-lane 1`, the default, they are a deadline on
+  the lane's one ordered thread; with `0` they hold the engine's own thread, so every lookup's latency
+  includes them. The model asks the backing rather than assuming, which it did not always do: it charged
+  the caller either way and so priced a lane as though it were not there. Zero for all of them is the exact store, which every other answer is measured against. Design notes §16 has the measured curves; the
   short of it is that a per-block write is roughly four times as expensive per microsecond as a sync, because
   one sync covers every block a round sealed and a write does not.
 - **`--store-dir <path>` puts the engine's blocks in real files**, one per segment, and unset is memory —

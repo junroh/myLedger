@@ -617,6 +617,7 @@ impl DurableStore for FileStore {
         offset: u64,
         block: &Block,
         creating: bool,
+        _now: u64,
     ) -> bool {
         if let Some(lane) = self.lane.as_mut() {
             return lane.submit(handle, Some((object, offset, creating)), Some(block));
@@ -633,7 +634,7 @@ impl DurableStore for FileStore {
         true
     }
 
-    fn submit_barrier(&mut self, handle: u64) -> bool {
+    fn submit_barrier(&mut self, handle: u64, _now: u64) -> bool {
         if let Some(lane) = self.lane.as_mut() {
             return lane.submit(handle, None, None);
         }
@@ -645,11 +646,17 @@ impl DurableStore for FileStore {
         true
     }
 
-    fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
+    fn poll_written(&mut self, _now: u64) -> Option<(u64, Result<(), StoreFault>)> {
         match self.lane.as_mut() {
             Some(lane) => lane.poll(),
             None => self.written.pop_front(),
         }
+    }
+
+    /// The lane is the whole of the answer: with one, a write is handed to a thread and the caller goes
+    /// on; without one, the `pwrite` happens right here.
+    fn writes_are_queued(&self) -> bool {
+        self.lane.is_some()
     }
 
     fn writes_inflight(&self) -> usize {
@@ -857,8 +864,8 @@ mod tests {
         // No residency, so a sealed block is only on disk and a read has to go there.
         let mut log = RecordLog::new(scratch.store(), 1, 0);
         let kept = seal_blocks(&mut log, RECORDS_PER_BLOCK * 3);
-        log.sync();
-        log.collect_writes();
+        log.sync(0);
+        log.collect_writes(0);
 
         let mut read = 0;
         for (key, addr) in &kept {
@@ -891,8 +898,8 @@ mod tests {
             // Twenty blocks, because only the first record of each is read here — one read per block is what
             // makes the completions distinguishable.
             let kept = seal_blocks(&mut log, RECORDS_PER_BLOCK * 20);
-            log.sync();
-            log.collect_writes();
+            log.sync(0);
+            log.collect_writes(0);
             kept
         };
         let mut store = scratch.store_with(4);
@@ -956,8 +963,8 @@ mod tests {
         let addrs = {
             let mut log = RecordLog::new(scratch.store_lane(0, true), 1, 0);
             let kept = seal_blocks(&mut log, RECORDS_PER_BLOCK * 4);
-            log.submit_writes();
-            log.sync();
+            log.submit_writes(0);
+            log.sync(0);
             // The lane is a thread, so the answers arrive when it has done them rather than when they were
             // asked for. Nothing else in this test may proceed until they have.
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -967,10 +974,10 @@ mod tests {
                     "the lane left {} writes unanswered",
                     log.writes_outstanding()
                 );
-                log.collect_writes();
+                log.collect_writes(0);
                 std::thread::yield_now();
             }
-            log.collect_writes();
+            log.collect_writes(0);
             assert_eq!(log.traffic().store_faults, 0, "the lane refused a write");
             kept
         };
@@ -1003,8 +1010,8 @@ mod tests {
         let kept = {
             let mut log = RecordLog::new(scratch.store(), 1, 0);
             let kept = seal_blocks(&mut log, RECORDS_PER_BLOCK * 3);
-            log.sync();
-            log.collect_writes();
+            log.sync(0);
+            log.collect_writes(0);
             kept
         };
 
@@ -1045,8 +1052,8 @@ mod tests {
         seal_blocks(&mut log, RECORDS_PER_BLOCK * 4);
         log.open_day(1);
         seal_blocks(&mut log, RECORDS_PER_BLOCK * 4);
-        log.sync();
-        log.collect_writes();
+        log.sync(0);
+        log.collect_writes(0);
 
         let names = scratch.files();
         assert_eq!(names.len(), 2, "two days, two files: {names:?}");
@@ -1076,8 +1083,8 @@ mod tests {
         let scratch = Scratch::new();
         let mut log = RecordLog::new(scratch.store(), 1, 0);
         seal_blocks(&mut log, RECORDS_PER_BLOCK * 3);
-        log.sync();
-        log.collect_writes();
+        log.sync(0);
+        log.collect_writes(0);
         assert_eq!(scratch.files().len(), 1);
 
         log.free_segment(0);
@@ -1097,8 +1104,8 @@ mod tests {
         {
             let mut log = RecordLog::new(scratch.store(), 1, 0);
             seal_blocks(&mut log, RECORDS_PER_BLOCK * 3);
-            log.sync();
-            log.collect_writes();
+            log.sync(0);
+            log.collect_writes(0);
         }
         assert_eq!(scratch.files().len(), 1, "the first life left its file");
 
@@ -1106,8 +1113,8 @@ mod tests {
         seal_blocks(&mut restarted, RECORDS_PER_BLOCK * 3);
         // Closing a block no longer writes it (§20): the refusal is the store's answer to the write, so the
         // closed blocks have to be submitted and collected for there to be one.
-        restarted.submit_writes();
-        restarted.collect_writes();
+        restarted.submit_writes(0);
+        restarted.collect_writes(0);
         assert!(
             restarted.take_fault(),
             "a file a previous life left behind was written over instead of refused"
