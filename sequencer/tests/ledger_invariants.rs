@@ -141,12 +141,21 @@ fn a_commit_that_answers_the_wrong_batch_applies_nothing() {
     fund_until_committed(&mut harness, ALICE, FUNDING * 100);
 
     // One request at a time, each proposed on its own, so several batches are in flight together.
+    //
+    // **The seal ends this loop, and it has to be allowed to.** Once the mispaired commit is noticed
+    // nothing more is proposed, so a loop that insisted on six batches would wait for a seventh that can
+    // never come — which is what it did, once in about a thousand concurrent runs: the reorder was
+    // noticed at the fifth batch rather than after the sixth, and the count is a property of how the
+    // fifty-millisecond round trips lined up rather than of anything this test is about.
     let batches = 6;
     for batch in 1..=batches {
+        if harness.reactor.is_fail_stopped() {
+            break;
+        }
         let tx = harness.transfer(ALICE, BOB, 10);
         harness.submit(tx);
         harness.tick_until("a request was never proposed", |reactor| {
-            reactor.metrics().proposed_batches > batch
+            reactor.metrics().proposed_batches > batch || reactor.is_fail_stopped()
         });
     }
     harness.tick_until("the reordering was never noticed", |reactor| {

@@ -18,7 +18,8 @@ fn an_out_of_order_reply_quarantines_the_lane() {
 
     assert!(
         harness.reactor.metrics().seq_gaps > 0,
-        "gap must be detected"
+        "gap must be detected: {:?}",
+        harness.reactor.metrics()
     );
     assert_eq!(harness.reactor.quarantined(), &[ALICE]);
     assert!(
@@ -50,7 +51,12 @@ fn a_drained_lane_can_be_released_and_used_again() {
 #[test]
 fn enough_quarantined_lanes_fail_stop_the_sequencer() {
     let mut harness = with_swapped_replies(1);
-    assert!(harness.reactor.is_fail_stopped());
+    assert!(
+        harness.reactor.is_fail_stopped(),
+        "{:?} quarantined={:?}",
+        harness.reactor.metrics(),
+        harness.reactor.quarantined()
+    );
 
     let refused = harness.transfer(BOB, ALICE, 1);
     assert_eq!(
@@ -78,15 +84,17 @@ fn enough_quarantined_lanes_fail_stop_the_sequencer() {
 /// three requests here keep no place at all.
 #[test]
 fn a_request_that_needs_no_balance_check_overtakes_the_pending_path() {
-    let mut harness = Harness::with_stubs(
-        MemoryPendingConfig {
-            latency: LatencyRange::fixed(Duration::from_millis(5)),
-            ..NoLatency::cold_pending()
-        },
-        NoLatency::raft(),
-    );
+    let mut harness = Harness::with_stubs(NoLatency::cold_pending(), NoLatency::raft());
     // EXTERNAL is the unconstrained account, and it is the debit side of both requests below.
     let (hold, _) = harness.hold(EXTERNAL, ALICE, 500);
+
+    // **The lookup is held, not slowed.** This used to be a five-millisecond stub latency, which proved
+    // the same thing until the machine was busy: the test thread would be descheduled past the five
+    // milliseconds, the reply would already be there on the first tick, and both requests would be
+    // answered in submission order. Three failures in two hundred concurrent runs. A held reply is a
+    // state rather than a duration, and no scheduler can make it untrue.
+    let replies = harness.reactor.pending().replies();
+    replies.hold();
 
     let mut settle = harness.transfer(EXTERNAL, ALICE, 100);
     settle.pending_ref = hold;
@@ -95,14 +103,23 @@ fn a_request_that_needs_no_balance_check_overtakes_the_pending_path() {
     harness.submit(settle);
     harness.submit(overtaking);
 
-    let acks = harness.drain_acks(2, "acks stalled");
+    // One ack while the settle's lookup cannot be answered: it has to be the exempt request, because a
+    // request that keeps no place in its lane has nothing to queue behind.
+    let first = harness.drain_acks(1, "the exempt request never came back");
     assert_eq!(
-        acks[0].tx_id, overtaking.id,
+        first[0].tx_id, overtaking.id,
         "the exempt request waited for the lookup"
     );
+
+    replies.release();
+    let rest = harness.drain_acks(1, "the settle never came back once its lookup was answered");
+    assert_eq!(rest[0].tx_id, settle.id);
     assert!(
-        acks.iter().all(|ack| ack.outcome == AckOutcome::Committed),
-        "{acks:?}"
+        first
+            .iter()
+            .chain(rest.iter())
+            .all(|ack| ack.outcome == AckOutcome::Committed),
+        "{first:?} {rest:?}"
     );
     assert_eq!(harness.reactor.metrics().fences, 0);
     // The hold, the settle and the transfer: every one of them debits an account with no balance to
@@ -185,10 +202,14 @@ fn with_swapped_replies(fail_stop_after: usize) -> Harness {
             },
             ..ReactorConfig::default()
         },
-        // Long enough that both replies are queued before either is delivered.
+        // **Every fill, not every second one**, and this was not what was breaking — the swap fired in
+        // the failing runs too, which is worth saying because the first version of this comment claimed
+        // otherwise. What every-second-fill does is make the fault depend on how many replies the run had
+        // produced by then, and that is not fixed: `cold_pending` evicts the overlay a round at a time,
+        // so the count varies with how many rounds the reactor spun. A second dependence on scheduling,
+        // removed while the first one was.
         MemoryPendingConfig {
-            violate_order_every: 2,
-            latency: LatencyRange::fixed(Duration::from_millis(5)),
+            violate_order_every: 1,
             ..NoLatency::cold_pending()
         },
         NoLatency::raft(),
@@ -196,12 +217,35 @@ fn with_swapped_replies(fail_stop_after: usize) -> Harness {
     harness.fund(ALICE, FUNDING * 10);
     let (hold, _) = harness.hold(ALICE, BOB, 500);
 
+    // **Two states, waited for rather than timed.** This was a five-millisecond stub latency with a
+    // comment saying it was long enough, and on a busy machine it was not — the test failed a few times
+    // in every hundred concurrent runs, in three different assertions. Two things have to be true and
+    // neither is a duration.
+    //
+    // First, *both replies have to be waiting before either leaves*, or the fault has nothing to
+    // reorder: the swap trades two reserved places, and a place already released is gone.
+    //
+    // Second, *the reordered reply has to reach the sequencer on its own*. The gap is found when the
+    // judge takes a seq out of turn, and two replies handed over together are judged in whatever order
+    // the tick takes them — which is how the swap could happen and be missed. One permit sends the
+    // swapped one ahead by itself.
+    let replies = harness.reactor.pending().replies();
+    replies.hold();
     for _ in 0..2 {
         let mut settle = harness.transfer(ALICE, BOB, 10);
         settle.pending_ref = hold;
         settle.flags = TransferFlags::POST_PENDING;
         harness.submit(settle);
     }
+    harness.tick_until("the engine never held both replies", |_| {
+        replies.waiting() >= 2
+    });
+    replies.let_through(1);
+    harness.tick_until("the reordered reply was never judged", |reactor| {
+        reactor.metrics().seq_gaps > 0
+    });
+    replies.release();
+
     harness.drain_acks(2, "acks stalled");
     harness
 }

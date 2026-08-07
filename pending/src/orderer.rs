@@ -204,6 +204,12 @@ impl<T> Orderer<T> {
         }
     }
 
+    /// Replies filled and not yet released. What a test holding delivery watches, so it can let go once
+    /// the replies it means to reorder are all here — a count rather than a wait.
+    pub fn held(&self) -> usize {
+        self.held
+    }
+
     /// The next reply due to leave, or nothing. Head of lane only, which is what keeps a lane in order.
     pub fn pop_ready(&mut self, now: u64) -> Option<T> {
         for _ in 0..self.rotation.len() {

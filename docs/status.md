@@ -162,6 +162,16 @@ with latency and an IOPS ceiling. `ledgersim` runs the real reactor on a virtual
 modes: `check` (invariants under fault injection), `capacity` and `require`. `ledgerd` assembles a
 node and drains on a signal.
 
+**A test that has to see a request waiting holds the reply rather than timing it.** `ReplyGate` stops the
+pending stub sending, says how many replies are queued, and lets a declared number through — so an
+interleaving a test depends on is a state it waits for instead of a delay it hopes was long enough. Three
+assertions in `lane_ordering` rested on a five-millisecond stub latency and failed a few times in every
+hundred concurrent runs; the same file now passes 480 of 480, and the whole suite 1,000 of 1,000 with every
+binary running at once. Two of the three needed the reply held until both were queued; the third needed the
+reordered one sent *alone*, because two replies handed over together are judged in whatever order the tick
+takes them. A fourth, in `ledger_invariants`, was the opposite shape — a loop waiting for a batch that a
+seal had already made impossible — and now ends on the seal.
+
 Both tools can now reach the read path for honest reasons: `--resolve-after` gives a hold an age, so
 a resolution reads a record at a declared age rather than one written moments ago. `check` draws
 narrow windows for three seeds in four, so the fetch path runs while faults are on, and the sweep

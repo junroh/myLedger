@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -363,6 +363,87 @@ const NOTICE_QUEUE: usize = 64;
 /// In-memory tier of the pending engine: it stores what the sequencer committed and
 /// provides what a settle or void asks for, and judges nothing. The disk tier for holds
 /// that outlive memory is not built yet.
+/// Holds every reply the engine would send, until whoever holds this lets them go.
+///
+/// **A test that has to see a request wait cannot wait for it in seconds.** The knob this replaces was a
+/// latency: a lookup answered five milliseconds later, which was long enough to prove that an
+/// order-exempt request overtook it — until the machine was busy, the test thread was descheduled past
+/// the five milliseconds, and both were ready in the same tick. It failed three times in two hundred
+/// concurrent runs. What the test wanted was never a duration but a state, so this is the state: the
+/// reply is outstanding until the test says otherwise, and no scheduler can make that untrue.
+///
+/// The same shape as `DaySource::manual`, and for the same reason — a condition no test could otherwise
+/// reach reliably gets a handle rather than a wait.
+#[derive(Clone, Default)]
+pub struct ReplyGate(Arc<GateState>);
+
+struct GateState {
+    /// Replies the engine may still send. `usize::MAX` is an open gate, which is what an ordinary run has.
+    permits: AtomicUsize,
+    /// Replies the engine has produced and cannot send. Published only while the gate is closed, so an
+    /// ungated run pays nothing for it.
+    waiting: AtomicUsize,
+}
+
+impl Default for GateState {
+    fn default() -> Self {
+        Self {
+            permits: AtomicUsize::new(usize::MAX),
+            waiting: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl ReplyGate {
+    /// Nothing more leaves the engine until it is let through. Replies queue up; the engine keeps working.
+    pub fn hold(&self) {
+        self.0.permits.store(0, Ordering::Relaxed);
+    }
+
+    /// Lets exactly `replies` out and closes again. **A count rather than a switch, because the
+    /// interleaving is the thing being tested**: two replies released together may be judged in either
+    /// order, and a test that means to send one ahead of the other has to be able to send one.
+    pub fn let_through(&self, replies: usize) {
+        self.0.permits.store(replies, Ordering::Relaxed);
+    }
+
+    /// Open again, for good.
+    pub fn release(&self) {
+        self.0.permits.store(usize::MAX, Ordering::Relaxed);
+    }
+
+    /// How many replies are waiting to go out. **This is what a test waits on instead of a duration**: a
+    /// fault that reorders two replies needs both of them here, and "both are here" is a state the test
+    /// can see rather than a delay it has to hope was long enough.
+    pub fn waiting(&self) -> usize {
+        self.0.waiting.load(Ordering::Relaxed)
+    }
+
+    /// Whether the gate is out of the way entirely, which is every run but a test's.
+    fn is_open(&self) -> bool {
+        self.0.permits.load(Ordering::Relaxed) == usize::MAX
+    }
+
+    /// Whether one more reply may leave. Asked before a reply is taken and `spend` after, so a round that
+    /// finds nothing to send does not burn a permit.
+    fn may_send(&self) -> bool {
+        self.0.permits.load(Ordering::Relaxed) > 0
+    }
+
+    fn spend(&self) {
+        let left = self.0.permits.load(Ordering::Relaxed);
+        if left != usize::MAX {
+            self.0
+                .permits
+                .store(left.saturating_sub(1), Ordering::Relaxed);
+        }
+    }
+
+    fn note_waiting(&self, replies: usize) {
+        self.0.waiting.store(replies, Ordering::Relaxed);
+    }
+}
+
 pub struct MemoryPending {
     commands: Producer<PendingCommand>,
     results: Consumer<PendingReply>,
@@ -376,6 +457,8 @@ pub struct MemoryPending {
     applies_sent: u64,
     /// What the store is holding, published by the worker because the store lives on its thread.
     occupancy: Arc<Occupancy>,
+    /// A test's hold on the replies. Open unless somebody closed it, which is one relaxed load per round.
+    replies: ReplyGate,
     _thread: WorkerThread,
 }
 
@@ -629,6 +712,8 @@ impl MemoryPending {
         let (notice_tx, notices) = channel(NOTICE_QUEUE);
         let occupancy = Arc::new(Occupancy::default());
         let worker_occupancy = Arc::clone(&occupancy);
+        let replies = ReplyGate::default();
+        let worker_replies = replies.clone();
         let PendingStorage { blocks, snapshots } = storage;
         // One store when the two name one volume, and the `Option` the stage takes is exactly that
         // question: dropping the backing here is what says the blocks' store is this dump's store too.
@@ -658,6 +743,7 @@ impl MemoryPending {
                     )
                 }),
                 occupancy: worker_occupancy,
+                replies: worker_replies,
                 notices: notice_tx,
                 owed: VecDeque::new(),
                 expiring: Vec::new(),
@@ -691,8 +777,14 @@ impl MemoryPending {
             ),
             applies_sent: 0,
             occupancy,
+            replies,
             _thread: thread,
         })
+    }
+
+    /// A hold on the replies, for a test that has to see a request still waiting — see `ReplyGate`.
+    pub fn replies(&self) -> ReplyGate {
+        self.replies.clone()
     }
 
     /// Where the reads went, and how much of what was written never had to be written out.
@@ -888,6 +980,8 @@ struct PendingWorker {
     /// its own state (rule 11); the worker owes it a round.
     snapshots: Option<Snapshots>,
     occupancy: Arc<Occupancy>,
+    /// A test's hold on the replies — see `ReplyGate`. Open unless somebody closed it.
+    replies: ReplyGate,
     /// The engine's own end of the notice channel.
     notices: Producer<PendingNotice>,
     /// Notices the queue would not take yet. Expiry is what makes this a queue rather than one slot: a
@@ -1243,14 +1337,21 @@ impl PendingWorker {
     }
 
     fn deliver(&mut self) -> bool {
+        // A test holding the replies back. Nothing else stops: the engine keeps applying and the store
+        // keeps writing, and only what would leave is kept — which is what makes the hold a state a test
+        // can wait on rather than a duration it has to guess.
+        if !self.replies.is_open() {
+            self.replies.note_waiting(self.orderer.held());
+        }
         if !self.results.flush() {
             return false;
         }
         let now = self.now();
         let mut progress = false;
-        while !self.results.is_stuck() {
+        while !self.results.is_stuck() && self.replies.may_send() {
             match self.orderer.pop_ready(now) {
                 Some(result) => {
+                    self.replies.spend();
                     self.results.send(result);
                     progress = true;
                 }
