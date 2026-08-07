@@ -182,6 +182,23 @@ with latency and an IOPS ceiling. `ledgersim` runs the real reactor on a virtual
 modes: `check` (invariants under fault injection), `capacity` and `require`. `ledgerd` assembles a
 node and drains on a signal.
 
+**`sizing/` answers for a node nobody has run**: memory, disk and device reads a second for a stated
+demand and a stated policy. `make sizing`, or `sizing.ipynb` on the same module. The split is what keeps
+it honest — **the code owns what one unit costs and the model owns how many**. Unit costs are `size_of`,
+declared beside each structure in its crate's `SIZING`, published by `ledgerfio layout --json` and cached
+with the commit they came from; nothing in `sizing/` writes a byte count down. `make verify` regenerates
+the dump against the build and refuses a difference, naming what moved.
+
+What it deliberately does not answer is throughput and the tail: §10 has the formula for those being
+built, measured and refused, and `ledgersim` is what replaced it. Two inputs are curves rather than
+numbers, because both are read at several points and a number each let the readings disagree — a **load**
+curve (traffic in the busiest window of a given width, asked by every window-shaped structure at its own
+width) and a **lifetime** curve (how long holds live, read at the flush window, at residency and at
+retention). Writing them down found four defects in a day, three of them in this repository's own
+reports rather than in the model: the hold index priced as a hash table at eight times its size, twelve
+dead bytes on every record, `engine` as three components' word for one of them, and a disk total that
+read as live data when 92% of it is not.
+
 **A test that has to see a request waiting holds the answer rather than timing it.** `AnswerGate` stops a
 stand-in sending, says how many answers are queued, and lets a declared number through — so an interleaving
 a test depends on is a state it waits for instead of a delay it hopes was long enough. It lives in
