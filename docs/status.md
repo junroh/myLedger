@@ -419,24 +419,34 @@ coverage. Design notes §19 and §20.
 - **A broken store ends it too.** The apply path is about to seal, so nothing more will be applied, and
   finishing a dump of a state that has stopped moving would hold the shadow for the whole of it.
 
-### Starting a node from one is not built, and the order matters
+### Starting a node from one is built, and the order is what made it one call
 
-`Snapshots::read_into` restores the index, the group totals and the coverage. That is not a node.
+`Snapshots::read_into` restores the index, the group totals and the coverage, and then the engine puts its
+log back where the last life left it. A restored engine can be **written to**, which is the whole of what
+was missing: before, it answered lookups against the blocks that were there and its one caller was a test.
 
-The engine's `RecordLog` still has no position: it does not know which block to write next, or which blocks
-each day owns. So a restored engine answers lookups against the blocks that are there and **must not be
-written to**, and its one caller is a test. Deriving those ranges from the restored slots is arithmetic §15
-already argued was possible — the span the slots reference is what the expiry walk needs of them — and it is
-the first half of a start-up reconcile.
+**Two sources, and neither could do it alone.** The restored slots say which blocks still matter, so a day's
+range is the span they cover — a block outside it holds only dead records, which is the same condition
+`reclaim` already uses on a whole day. What the slots cannot say is how far the blocks *went*: a block whose
+records all died leaves nothing to find it by, and writing the next one at its number would give two records
+one address. The volume answers that, because offsets are absolute and a file therefore ends where its last
+block does (§16) — the length *is* the high-water mark, and the filesystem has been keeping it all along.
 
-**The second half is what makes the order non-negotiable.** `reclaim` hands back the blocks of any segment
-the index has no entry in, and it is right to: a segment with no entries holds only dead records. Run before
-an index exists, it finds nothing alive anywhere and deletes **every file**. So the reconcile has to restore
-before it reclaims, and until both halves land together the thing standing in that place is `open_with`'s
-`O_EXCL` refusal — a segment file a previous life left behind is refused rather than written over, which
-seals (§16, and
-`a_segment_file_left_behind_is_refused_rather_than_written_over`). Loud and wrong-way-safe, which is what a
-placeholder for this has to be.
+**The second half is why it is one call and not two.** `reclaim` hands back the blocks of any segment the
+index has no entry in, and it is right to. Run before an index exists, it finds nothing alive anywhere and
+deletes **every file**. So the reconcile is inside `PendingEngine::restore` rather than beside it: a caller
+cannot get the order wrong because there is no order for it to get (rule 16). It also closes the leak the
+other way — a day with a file and no live slot is never reclaimed in the ordinary course, because `reclaim`
+skips a day whose range is empty and a restored range is empty exactly when nothing points into it.
+
+`open_with`'s `O_EXCL` refusal stays where it is (§16, and
+`a_segment_file_left_behind_is_refused_rather_than_written_over`). It is no longer standing in for the
+reconcile; it is what catches a file the reconcile did not account for, which is a different and still
+useful thing.
+
+What is still missing before this is a *node* start-up rather than an engine one: nothing calls it at boot,
+because `ledgerd` has no restore path yet and the account component has no snapshot at all — see the two
+decisions below on the account side.
 
 The sentence that used to be here was wrong in a way worth keeping: it said the flush window is an hour
 because unflushed records have to fit in a checkpoint, so the number could not be justified without one.

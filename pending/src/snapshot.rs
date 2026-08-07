@@ -425,6 +425,10 @@ mod tests {
             self.0.borrow_mut().submit_rename(handle, from, to, now)
         }
 
+        fn blocks_in(&mut self, object: ObjectId) -> u64 {
+            self.0.borrow_mut().blocks_in(object)
+        }
+
         fn exists(&mut self, object: ObjectId) -> bool {
             self.0.borrow_mut().exists(object)
         }

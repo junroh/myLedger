@@ -415,6 +415,18 @@ impl HoldTable {
     }
 
     /// Slots, not buckets: what a load factor is measured against.
+    /// Every address the table still points at, for a start-up that has to work out where a day's blocks
+    /// are from the slots alone. Walked once, at start-up, and never on a path anything waits on.
+    pub fn each_address(&self, mut visit: impl FnMut(RecordAddr)) {
+        for bucket in &self.buckets {
+            for word in bucket.slots {
+                if word != 0 {
+                    visit(address_in(word));
+                }
+            }
+        }
+    }
+
     pub fn slots(&self) -> usize {
         self.buckets.len() * WAYS
     }

@@ -2420,18 +2420,28 @@ At a long interval the share is small in absolute terms: 42.7GB an hour is 11.9M
 volume. At ten minutes it is six times that, which is one more argument for the long interval §15 already
 reached on recovery grounds.
 
-### What this does not do: start a node
+### What this does now: start an engine, and the ordering that made it one call
 
-`Snapshots::read_into` restores the index, the group totals and the coverage — and that is not a node. The
-engine's `RecordLog` still has no position: it does not know which block to write next or which blocks each
-day owns, so a restored engine answers lookups against the blocks that are there and **must not be written
-to**. Its one caller is a test.
+`Snapshots::read_into` restores the index, the group totals and the coverage, and the engine then puts its
+log back where the last life left it. A restored engine can be written to.
 
-That is deliberate ordering rather than an omission. Deriving the ranges from the restored slots is the first
-half of a start-up reconcile, and the second half is the files a previous life left behind — where `reclaim`,
-run before an index exists, would find nothing alive and delete every one of them. Today `open_with`'s
-`O_EXCL` refusal stands in that place (§16), and it has to keep standing there until both halves land
-together. `status.md` carries it.
+**The position comes from two places because neither has all of it.** The restored slots say which blocks
+still matter, so a day's range is the span they cover — everything outside it holds only dead records, which
+is the condition `reclaim` already uses on a whole day. They cannot say how far the blocks went: a block
+whose records all died leaves no slot to find it by, and numbering the next one from what the slots show
+would hand out an address that already belongs to a record on that disk. The volume answers that, and it can
+because offsets are absolute (§16) — a segment's file ends where its last block does, so its **length is the
+high-water mark**, kept by the filesystem the whole time and asked for at start-up.
+
+**The second half is a deletion, which is why it is not a second call.** `reclaim` frees any segment the
+index has no entry in; before an index exists that is every segment on the volume. Putting the reconcile
+inside `restore` removes the ordering from the caller entirely (rule 16) — there is no order to get wrong,
+because there is one call. It also closes the leak in the other direction: a day with a file and no live
+slot would never be reclaimed in the ordinary course, since `reclaim` skips a day whose range is empty and a
+restored range is empty exactly when nothing points into it.
+
+`O_EXCL` stays. It is no longer standing in for this; it is what catches a file the reconcile did not
+account for, which is a smaller and still useful job.
 
 ## 20. There is one path to a device, and apply is not on it
 

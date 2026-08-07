@@ -475,6 +475,15 @@ pub trait DurableStore {
     /// On the queue for the same reason a removal is, and one more: the directory `fsync` inside it is a
     /// real one, and on the caller's thread it was an `fsync` on the thread that answers lookups.
     fn submit_rename(&mut self, handle: u64, from: ObjectId, to: ObjectId, now: u64) -> bool;
+    /// Blocks this object spans from offset zero, which is where its last block ends. Zero for an object
+    /// that is not there.
+    ///
+    /// **What a start-up asks instead of remembering.** Offsets are absolute (§16), so a segment's file
+    /// ends where its last block does — the length *is* the high-water mark, and the restored index cannot
+    /// give it: a block whose records all died leaves no slot to find it by. Asking the store is what lets
+    /// the next block number be one that was never used, rather than one that overwrites bytes a previous
+    /// life wrote.
+    fn blocks_in(&mut self, object: ObjectId) -> u64;
     /// Whether the store has this object at all. Asked before a snapshot is read back, because a node that
     /// has never written one is the ordinary case and a device that refuses is not — and a read of block
     /// zero cannot tell them apart, both being `Missing`.
@@ -713,6 +722,13 @@ impl DurableStore for MemoryStore {
         };
         self.written.push_back((handle, done));
         true
+    }
+
+    fn blocks_in(&mut self, object: ObjectId) -> u64 {
+        self.objects[object.index()]
+            .as_ref()
+            .map(|file| file.end() / BLOCK_BYTES as u64)
+            .unwrap_or(0)
     }
 
     fn exists(&mut self, object: ObjectId) -> bool {
@@ -1397,6 +1413,10 @@ impl DurableStore for LatencyStore {
         self.queue_namespace(handle, now, |inner, handle, now| {
             inner.submit_rename(handle, from, to, now)
         })
+    }
+
+    fn blocks_in(&mut self, object: ObjectId) -> u64 {
+        self.inner.blocks_in(object)
     }
 
     fn exists(&mut self, object: ObjectId) -> bool {
@@ -2127,6 +2147,47 @@ impl RecordLog {
             any = true;
         }
         any
+    }
+
+    /// Puts this log back where a previous life left it, from the addresses a restored index still points
+    /// at and from the volume itself. Answers the segments that have a file and nothing alive in them.
+    ///
+    /// **Two sources and neither could do it alone.** The slots say which blocks still matter, so a day's
+    /// range is the span they cover — a block below or above that span holds only dead records, which is
+    /// the same condition `reclaim` already uses on a whole day. What the slots cannot say is how far the
+    /// blocks *went*: a block whose records all died leaves nothing to find it by, and writing the next
+    /// one at its number would put two records at one address. The volume answers that, because offsets
+    /// are absolute and a file therefore ends where its last block does (§16).
+    ///
+    /// The segments it answers with are the leak this would otherwise leave: a day with a file and no live
+    /// slot is never reclaimed, because `reclaim` skips a day whose range is empty and a restored range is
+    /// empty exactly when nothing points into it.
+    /// The block number the next seal will take. What a restart has to derive, and what nothing but the
+    /// volume can tell it: a block whose records all died leaves no slot to find it by.
+    pub fn next_block(&self) -> u64 {
+        self.next_block
+    }
+
+    pub fn reconcile(&mut self, live: &[(u8, u64, u64)]) -> Vec<u8> {
+        let mut orphans = Vec::new();
+        for segment in 0..SEGMENT_VALUES {
+            let blocks = self.store.blocks_in(ObjectId::segment(segment as u8));
+            self.next_block = self.next_block.max(blocks);
+            let span = live.iter().find(|(at, ..)| *at as usize == segment);
+            match span {
+                Some(&(_, first, last)) => {
+                    self.days[segment] = BlockRange {
+                        first,
+                        blocks: last - first + 1,
+                    };
+                }
+                None if blocks > 0 => orphans.push(segment as u8),
+                None => {}
+            }
+        }
+        // Nothing is resident and nothing is buffered: what a restart has is what the volume has.
+        self.oldest_resident = self.next_block;
+        orphans
     }
 
     /// The volume these blocks are on, for whoever else is on it.

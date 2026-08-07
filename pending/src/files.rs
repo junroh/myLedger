@@ -8,7 +8,9 @@ use std::thread::{JoinHandle, Thread};
 
 use ledger_base::{channel, Consumer, Producer};
 
-use crate::block::{Block, DurableStore, ObjectId, StoreFault, VolumeStats, OBJECT_VALUES};
+use crate::block::{
+    Block, DurableStore, ObjectId, StoreFault, VolumeStats, BLOCK_BYTES, OBJECT_VALUES,
+};
 
 /// The snapshot a restart reads, and the one being written. Two names because the replacement is a rename
 /// (§19), and they are here rather than beside the dump because naming an object is the store's job — a
@@ -884,6 +886,14 @@ impl DurableStore for FileStore {
         let done = self.rename_now(from, to);
         self.written.push_back((handle, done));
         true
+    }
+
+    /// The file's length, which is the whole of the answer: offsets are absolute, so a segment's file ends
+    /// where its last block does and the filesystem has been keeping that all along.
+    fn blocks_in(&mut self, object: ObjectId) -> u64 {
+        std::fs::metadata(self.name_of(object))
+            .map(|at| at.len() / BLOCK_BYTES as u64)
+            .unwrap_or(0)
     }
 
     fn exists(&mut self, object: ObjectId) -> bool {

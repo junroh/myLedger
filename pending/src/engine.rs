@@ -974,6 +974,49 @@ impl PendingEngine {
     pub fn restore(&mut self, groups: FxHashMap<BudgetGroup, BudgetState>, coverage: ApplyIndex) {
         self.budgets = groups;
         self.applied_through = coverage;
+        self.reconcile();
+    }
+
+    /// Puts the log back where the previous life left it, and hands back the days whose files nothing
+    /// points into any more.
+    ///
+    /// **It is part of `restore` rather than a call beside it, and that is the whole safety of it.** The
+    /// second half of this is a removal, and `reclaim` — which does the same job in the ordinary course —
+    /// run before an index exists would find nothing alive anywhere and delete every file on the volume.
+    /// One call cannot be made in the wrong order (rule 16); two could be, and the wrong order is
+    /// everything gone.
+    pub fn traffic_for_test(&self) -> crate::block::LogTraffic {
+        self.records.traffic()
+    }
+
+    /// Offers the log's queued work to the volume, for a test with no worker round to do it.
+    pub fn submit_writes_for_test(&mut self) -> bool {
+        self.records.submit_writes(0) | self.records.collect_writes(0)
+    }
+
+    /// The block number the next seal will take — see `RecordLog::next_block`.
+    pub fn next_block(&self) -> u64 {
+        self.records.next_block()
+    }
+
+    fn reconcile(&mut self) {
+        // The span of blocks each day still has something alive in. A day's range restored from this is a
+        // subset of what it wrote, which is exactly right: the walk looks for live records and there are
+        // none outside it.
+        let mut spans: Vec<(u8, u64, u64)> = Vec::new();
+        self.index.each_address(|addr| {
+            let block = addr.block();
+            match spans.iter_mut().find(|(at, ..)| *at == addr.segment()) {
+                Some((_, first, last)) => {
+                    *first = (*first).min(block);
+                    *last = (*last).max(block);
+                }
+                None => spans.push((addr.segment(), block, block)),
+            }
+        });
+        for segment in self.records.reconcile(&spans) {
+            self.records.free_segment(segment);
+        }
     }
 
     /// The table a snapshot's chunks are written into. Exposed for restore alone — the index is otherwise

@@ -485,12 +485,12 @@ impl Snapshots {
     /// rather than an error — and that is a question for `exists` rather than for a read, because a read of
     /// block zero cannot tell an absent object from an absent block.
     ///
-    /// **What this restores is the index, the group totals and the coverage — not a node.** The engine's
-    /// `RecordLog` still has no position: it does not know which block to write next or which blocks each
-    /// day owns, so an engine restored here answers lookups against the blocks that are there and must not
-    /// be written to. Deriving those from the restored slots is the first half of the start-up reconcile,
-    /// and it is deliberately not here — see `status.md`. Until it is, this has one caller and it is a
-    /// test.
+    /// **What this restores is a node.** The index, the group totals and the coverage come out of the
+    /// stream; the log's position — which block to write next, which blocks each day owns — comes out of
+    /// the restored slots and the volume itself, and the days whose files nothing points into any more are
+    /// handed back. That last part is why the reconcile is inside `PendingEngine::restore` rather than a
+    /// call beside it: it removes files, and removing them before an index exists would remove all of
+    /// them.
     pub fn read_into(&mut self, engine: &mut PendingEngine) -> Result<bool, NotASnapshot> {
         let store = Self::volume(&mut self.own, engine);
         if !store.exists(ObjectId::SNAPSHOT_CURRENT) {
@@ -831,6 +831,161 @@ mod tests {
             share,
             "the dump never reached its share, so the bound was never the thing being tested"
         );
+    }
+
+    /// **A restored engine is one that can be written to**, which is the whole of what the start-up
+    /// reconcile buys and the thing the restore could not do before it. The blocks a previous life wrote
+    /// stay readable, the next block written lands past them rather than over them, and a day whose file
+    /// nothing points into any more is handed back rather than left for ever.
+    #[test]
+    fn a_restored_engine_writes_past_the_blocks_the_last_one_left() {
+        let scratch = Scratch::new();
+        let slots = 1 << 12;
+        let holds = RECORDS_PER_BLOCK as u64 * 3;
+        let mut source = PendingEngine::sized(slots, 1, 0, scratch.volume("blocks"));
+        fill(&mut source, holds);
+        let mut snapshots = apart(
+            scratch.snapshots(),
+            SnapshotPolicy {
+                every: 1,
+                bytes_per_round: BLOCK_BYTES,
+                ..SnapshotPolicy::default()
+            },
+        );
+        drive(&mut snapshots, &mut source, 100_000);
+        assert_eq!(snapshots.stats().written, 1);
+        let blocks_before = scratch.files("blocks").len();
+
+        let mut restored = PendingEngine::sized(slots, 1, 0, scratch.volume("blocks"));
+        assert!(apart(scratch.snapshots(), SnapshotPolicy::default())
+            .read_into(&mut restored)
+            .expect("a snapshot this table can take"));
+
+        // Writing again is what the old restore forbade: with no position, the next block would have been
+        // block zero and its records would have taken addresses that already belong to somebody.
+        // **The claim, directly.** The volume's own length is the high-water mark — offsets are absolute,
+        // so a segment's file ends where its last block does — and a restart that started numbering again
+        // would hand out addresses that already belong to records on that disk.
+        let on_disk = std::fs::metadata(scratch.0.join("blocks/seg-00.blk"))
+            .expect("the first life's file")
+            .len()
+            / BLOCK_BYTES as u64;
+        assert!(on_disk > 0, "the first life wrote nothing");
+        assert!(
+            restored.next_block() >= on_disk,
+            "the restored engine would write over the {on_disk} blocks already there, starting at {}",
+            restored.next_block()
+        );
+
+        let carried: Vec<u64> = (1..=holds)
+            .filter(|id| restored.lookup(TxId(*id as u128)).is_some())
+            .collect();
+        assert!(!carried.is_empty(), "the snapshot carried nothing");
+
+        // Enough to cover every block the first life wrote, so a restart that numbered from zero would
+        // land on top of them rather than beside them.
+        for id in holds + 1..=holds * 4 {
+            restored
+                .write(create(id as u128), ApplyIndex(id))
+                .expect("the index took the hold");
+            restored.drain(usize::MAX, 0);
+        }
+        restored.sync(0);
+        restored.collect_writes(0);
+
+        // **Every hold the snapshot carried still answers**, which is the claim: a second life that
+        // started its block numbering again would have written over the first life's records, and the
+        // holds pointing at them would come back as nothing or as somebody else.
+        for id in carried {
+            let found = restored
+                .lookup(TxId(id as u128))
+                .unwrap_or_else(|| panic!("hold {id} was carried and is now gone"));
+            assert_eq!(found.amount, 100, "hold {id} came back wrong");
+        }
+        for id in holds + 1..=holds * 4 {
+            let found = restored
+                .lookup(TxId(id as u128))
+                .unwrap_or_else(|| panic!("hold {id} was written after the restore and is gone"));
+            assert_eq!(found.amount, 100, "hold {id} came back wrong");
+        }
+        assert!(restored.counts_agree());
+        assert!(
+            scratch.files("blocks").len() >= blocks_before,
+            "the restored engine lost a day's file"
+        );
+    }
+
+    /// **A day nothing points into any more is handed back, and a day that still has holds is not.**
+    /// This is the half of the reconcile whose order cannot be got wrong: `reclaim` frees any segment the
+    /// index has no entry in, which is right once there is an index and catastrophic before there is one
+    /// — it would find nothing alive anywhere and delete every file on the volume. Making it part of
+    /// `restore` is what removes the ordering from the caller's hands.
+    #[test]
+    fn a_restore_frees_the_days_nothing_points_into_and_keeps_the_rest() {
+        let scratch = Scratch::new();
+        let slots = 1 << 12;
+        let mut source = PendingEngine::sized(slots, 1, 0, scratch.volume("blocks"));
+
+        // Two days with holds in them, and the first day's holds all resolved — so its file is on the
+        // volume with nothing alive in it, which is the state a restart has to recognise.
+        let day_one = RECORDS_PER_BLOCK as u64 * 2;
+        fill(&mut source, day_one);
+        for id in 1..=day_one {
+            source
+                .write(
+                    PendingEffect::Remove {
+                        pending_ref: TxId(id as u128),
+                        budget: BudgetGroup::ABSENT,
+                        released: 100,
+                    },
+                    ApplyIndex(id),
+                )
+                .expect("the removal applied");
+        }
+        assert!(source.open_day(1, 2), "the day did not move");
+        let day_two: Vec<u64> = (day_one + 1..=day_one * 3).collect();
+        for id in &day_two {
+            source
+                .write(create(*id as u128), ApplyIndex(*id))
+                .expect("the index took the hold");
+            source.drain(usize::MAX, 0);
+        }
+        source.sync(0);
+        source.collect_writes(0);
+        assert_eq!(
+            scratch.files("blocks").len(),
+            2,
+            "the two days did not each get a file: {:?}",
+            scratch.files("blocks")
+        );
+
+        let mut snapshots = apart(
+            scratch.snapshots(),
+            SnapshotPolicy {
+                every: 1,
+                bytes_per_round: BLOCK_BYTES,
+                ..SnapshotPolicy::default()
+            },
+        );
+        drive(&mut snapshots, &mut source, 100_000);
+        assert_eq!(snapshots.stats().written, 1);
+
+        let mut restored = PendingEngine::sized(slots, 1, 0, scratch.volume("blocks"));
+        assert!(apart(scratch.snapshots(), SnapshotPolicy::default())
+            .read_into(&mut restored)
+            .expect("a snapshot this table can take"));
+        restored.submit_writes_for_test();
+
+        assert_eq!(
+            scratch.files("blocks"),
+            vec!["seg-01.blk".to_string()],
+            "the restore kept the wrong days"
+        );
+        let alive = day_two
+            .iter()
+            .filter(|id| restored.lookup(TxId(**id as u128)).is_some())
+            .count();
+        assert!(alive > 0, "the day that still had holds lost them");
     }
 
     /// A volume with no snapshot on it is the ordinary state of a node that has not written one, so it

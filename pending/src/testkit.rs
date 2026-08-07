@@ -141,6 +141,10 @@ impl DurableStore for HoldingStore {
         true
     }
 
+    fn blocks_in(&mut self, object: ObjectId) -> u64 {
+        self.0.borrow_mut().inner.blocks_in(object)
+    }
+
     fn exists(&mut self, object: ObjectId) -> bool {
         self.0.borrow_mut().inner.exists(object)
     }
