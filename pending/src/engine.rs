@@ -309,6 +309,12 @@ impl PendingEngine {
         Started::Answered(None)
     }
 
+    /// Fills in the group's totals, which is **the only place they come from**.
+    ///
+    /// Not a cache in front of the record: the record does not carry them and cannot, because they
+    /// change every time any *other* member of the group is resolved. One value, one owner (rule 18) —
+    /// and this used to be two, with the record's copy overwritten here on every path and therefore
+    /// never noticed.
     fn with_group(&self, mut hold: HoldData) -> HoldData {
         if let Some(state) = self.budgets.get(&hold.budget) {
             hold.budget_members = state.members;

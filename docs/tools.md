@@ -104,7 +104,7 @@ decides what the prediction is worth:
   never crosses a day and nothing about expiry can be measured at all. Past `retention-days + grace-days`
   to reach the expiry of holds the run created itself, and well past it to make the sweep frequent enough
   to find in a tail: three sweeps in ten seconds hide, sixty do not. `--expiry-blocks <n>` is the blocks of
-  the expiring day a round reads, which bounds the voids too at fifty-one records a block. The report's
+  the expiring day a round reads, which bounds the voids too at sixty records a block. The report's
   `sweep` line prints the blocks read and the records read per void released — the second is the ratio a
   day's density decides, and the one worth watching.
 - **The simulator declares the same two things**, as `--resolve-after`, `--flush-blocks` and

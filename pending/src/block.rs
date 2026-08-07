@@ -12,12 +12,20 @@ pub const BLOCK_BYTES: usize = 4096;
 
 /// A record on a block: its key, then the hold. The key is stored because the index carries only a
 /// 16-bit fingerprint, so the record is what tells two colliding keys apart.
-pub const RECORD_BYTES: usize = 80;
+///
+/// **What a record does not carry is its group's totals**, and that is the whole of why this is 68 and
+/// not 80. `budget_members` and `budget_remaining` were written here and never read back: every answer
+/// leaves through `PendingEngine::with_group`, which overwrites both from the live budget map, and a
+/// restart puts that map back from the snapshot rather than from any record. Two owners for one value,
+/// with the second silently winning — rule 18, and the kind that holds by coincidence of ordering
+/// rather than by anything checked.
+pub const RECORD_BYTES: usize = 68;
 
-/// Fifty-one, with the remainder of the block unused. The source design says sixty-four per block,
-/// which needs its 128-byte record halved by compression; uncompressed that figure is thirty-two.
-/// This record is packed rather than padded, so more fit than either — and the intra-block index is
-/// six bits wide for the same reason it is there: sixty-four is the ceiling the format allows.
+/// Sixty, with sixteen bytes of the block left for the checksum. The source design says sixty-four per
+/// block, which needs its 128-byte record halved by compression; uncompressed that figure is
+/// thirty-two. This record is packed rather than padded, so more fit than either — and the intra-block
+/// index is six bits wide for the same reason it is there: sixty-four is the ceiling the format allows,
+/// which is four above where dropping the group totals landed it.
 pub const RECORDS_PER_BLOCK: usize = BLOCK_BYTES / RECORD_BYTES;
 
 /// One block's bytes, aligned to the block size.
@@ -43,11 +51,11 @@ const _: () = assert!(
 
 ledger_base::layout_claim!(BLOCK_LAYOUT: Block, size = BLOCK_BYTES, LineFit::WholeLines);
 
-/// Where a block's checksum sits: after the records, in the sixteen bytes fifty-one eighty-byte records
-/// leave over. **Integrity costs no space at all here**, which is why it is a whole-block checksum and not a
-/// per-record one — fifty-one four-byte stamps would not fit in sixteen bytes, and widening the record to
-/// carry its own would drop the block from fifty-one records to forty-eight and cost six percent of the
-/// store.
+/// Where a block's checksum sits: after the records, in the sixteen bytes sixty sixty-eight-byte records
+/// leave over — the same sixteen the previous record width left, which is luck rather than design and is
+/// stated so nobody reads it as a constraint. **Integrity costs no space at all here**, which is why it is
+/// a whole-block checksum and not a per-record one: sixty four-byte stamps would not fit in sixteen bytes,
+/// and widening the record to carry its own would drop the block to fifty-six records.
 const CHECKSUM_AT: usize = RECORDS_PER_BLOCK * RECORD_BYTES;
 
 impl Block {
@@ -183,9 +191,10 @@ pub fn encode(key: TxId, hold: &HoldData, into: &mut [u8]) {
     put(&hold.amount.to_le_bytes());
     put(&hold.remaining.to_le_bytes());
     put(&hold.ledger.to_le_bytes());
+    // The group is here and its totals are not: which group a hold belongs to is a fact about the hold,
+    // and how much the group has left is a fact about the group. The engine keeps the second in one map
+    // and answers from it (`with_group`).
     put(&hold.budget.raw().to_le_bytes());
-    put(&hold.budget_members.to_le_bytes());
-    put(&hold.budget_remaining.to_le_bytes());
     debug_assert_eq!(at, RECORD_BYTES);
 }
 
@@ -208,8 +217,10 @@ pub fn decode(bytes: &[u8], _from: RecordAddr) -> (TxId, HoldData) {
         remaining: u64_at(take(8)) as Amount,
         ledger: u32_at(take(4)),
         budget: BudgetGroup(u128_at(take(16))),
-        budget_members: u32_at(take(4)),
-        budget_remaining: u64_at(take(8)) as Amount,
+        // Left at zero, and the engine fills them from the budget map on the way out. A record cannot
+        // answer for a group: the totals change every time any *other* member is resolved.
+        budget_members: 0,
+        budget_remaining: 0,
     };
     (key, hold)
 }
@@ -2686,7 +2697,26 @@ mod tests {
         assert_eq!((back.amount, back.remaining), (500, 499));
         assert_eq!(back.ledger, 3);
         assert_eq!(back.budget, BudgetGroup(99));
-        assert_eq!((back.budget_members, back.budget_remaining), (2, 44));
+    }
+
+    /// The group's totals are **not** a field, and the assertion is here rather than absent because a
+    /// reader who finds them missing should find out why: they are the group's, not the hold's, so a
+    /// record that carried them would be stale the moment any other member resolved. The engine fills
+    /// them from its one map on the way out (`PendingEngine::with_group`).
+    #[test]
+    fn a_record_does_not_carry_its_group_totals() {
+        let mut bytes = vec![0u8; RECORD_BYTES];
+        let mut with_totals = hold(500);
+        with_totals.budget_members = 2;
+        with_totals.budget_remaining = 44;
+        encode(TxId(7), &with_totals, &mut bytes);
+        let (_, back) = decode(&bytes, RecordAddr::new(1, 2, 3));
+        assert_eq!(
+            back.budget,
+            BudgetGroup(99),
+            "which group is the hold's own fact"
+        );
+        assert_eq!((back.budget_members, back.budget_remaining), (0, 0));
     }
 
     #[test]

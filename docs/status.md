@@ -52,8 +52,11 @@ fences in one order.
   cascade cap 128, load target 0.90, and it never grows. Correctness is detection, not probability:
   a shared fingerprint is found at insert and marked, and only marked slots read a record. Design
   notes §11.
-- **Records on blocks.** 4KB blocks, 80-byte records, little-endian by declaration, append-only —
-  a changed remainder is a new version at a new address. Design notes §12.
+- **Records on blocks.** 4KB blocks, 68-byte records, sixty to a block, little-endian by declaration,
+  append-only — a changed remainder is a new version at a new address. A record carries which budget
+  group a hold belongs to and **not** that group's totals: those are the group's and change whenever any
+  other member is resolved, so the engine answers them from its one map (`with_group`) and the twelve
+  bytes that used to duplicate them were written on every append and read by nothing. Design notes §12.
 - **Two memory windows, and they are not the same window.** The writeback buffer holds what is not
   written yet (the flush window, an hour: a recovery bound), and residency holds what is written and
   still worth keeping in memory (a day: a latency bound). Residency holds only survivors, because
@@ -261,7 +264,7 @@ read that still answers inline says so in the figures. `MemoryStore` backs it to
   arguing it.
 - **Written is not durable**, and coverage follows the later one. A block a sync has not covered is not
   carried by a snapshot, because a restart could not read it.
-- **A block carries a checksum**, in the sixteen bytes fifty-one records leave spare, so integrity costs no
+- **A block carries a checksum**, in the sixteen bytes sixty records leave spare, so integrity costs no
   space. It is the only thing that can see a device which *answers* wrongly rather than refusing: double-entry
   cannot, because a corrupted remainder moves both sides by the same wrong amount. `--store-corrupt-every`
   produces one and the reaction is the seal.
@@ -799,6 +802,26 @@ unanswered, and **when that default stops being safe**. The source design's own 
   larger `daily_arrivals`, or a store whose reads are slow enough that a round no longer fits beside the
   lookups. The budget being per round rather than per second is still a number nobody declared in those
   units; it has simply stopped being the expensive one.
+
+- **Should a budget group be an entity of its own, and can a pending exist at group level?**
+  *Default:* a group is an **aggregate, not an entity**. It has no record, no index entry and no expiry;
+  its `members` and `remaining` are the count and sum of its live holds, kept in one map, rebuilt by
+  replay and carried whole in the snapshot. Membership is implicit — a hold names its group.
+  *What that cannot express:* a group with **headroom**. "Reserve a million for this group and let
+  individual holds draw on it" needs a group total that is *declared* rather than derived, and today the
+  total is a sum by construction, so it can never exceed its members. That is a different meaning of
+  "budget group" from the one built, and which one is wanted is a product decision rather than an
+  engineering one — which is why the code cannot move first.
+  *What it would unlock:* design notes §7 leaves three things open and a group record closes all three at
+  once — the client-supplied durable id a group spanning submissions needs, somewhere for the
+  membership index that full-coverage checking wants, and a lifetime the group owns rather than borrows
+  from its last member.
+  *Stops being safe:* when a group has to span submissions, or when a resolution must be checked for
+  covering every member. Today the weaker rule stands in for both — a hold in a group may not be resolved
+  outside a chain — and that rule is only enforceable because a chain names its own group.
+  Raised by asking whether the group totals belonged on the record. They did not (§12), and removing them
+  made the aggregate the single owner — which is right for what a group is *today*, and is the thing that
+  would change if a group became an entity.
 
 - **When does the idem engine get its rotating generations?**
   *Default:* a map that only grows, which owns the worst tail of any long run (see above).

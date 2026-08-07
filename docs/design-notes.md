@@ -972,9 +972,39 @@ last bit on saying whether a fingerprint is shared (§11), which is where the bl
 comes from — this said thirty-six, and the code has never been. The source design packs the same three into
 forty because its slot is a byte smaller and spends the difference on a narrower block field. A block is four
 kilobytes — the unit one read fetches, and so the unit the speed contract is written against — and a
-record is eighty bytes packed, which puts fifty-one on a block. The design's sixty-four per block needs
+record is sixty-eight bytes packed, which puts sixty on a block. The design's sixty-four per block needs
 its 128-byte record halved by compression; uncompressed that figure is thirty-two. The intra-block
-index is six bits wide either way, because sixty-four is what the format allows.
+index is six bits wide either way, because sixty-four is what the format allows — four above where the
+record now lands, which is close enough to be worth saying rather than discovering.
+
+### What a record does not carry, and how twelve dead bytes went a year unnoticed
+
+> **Tried** — putting a hold's budget group *and* that group's totals on the record, so a lookup answered
+> everything the coverage check needs from one read.
+> **Broke** — the totals are the group's, not the hold's: they change every time any *other* member is
+> resolved, so the copy on a record is stale from the moment a sibling moves. The engine already knew
+> that and already fixed it up — `with_group` overwrites both from the live budget map on every path that
+> answers — which meant the record's copy was written on every append and read by nothing.
+> **Weighed** — keeping them as a fallback for a group the map has lost (there is no such state: the map
+> is rebuilt by replay and carried whole in the snapshot); keeping them for a reader outside the engine
+> (there is none — every answer leaves through the port, and the port's answers come from `with_group`).
+> **Chose** — the record carries `budget`, which is the hold's own fact, and not the totals. Eighty bytes
+> to sixty-eight, fifty-one records a block to sixty.
+
+Two owners for one value, with the second silently winning, is rule 18 — and this is the shape the rule
+warns about rather than the obvious one. Nothing was ever wrong: the overwrite happened before any reader
+could see the stale copy, on all three answering paths. What made it a defect was that the invariant held
+by *coincidence of ordering* and nothing checked it. Add a fourth answering path that forgets the
+overwrite and the engine reports a group total that was true when the hold was created.
+
+It also removes a corruption the checksum table below lists as undetectable: a bit flipped in
+`budget_members` or `budget_remaining` used to change a coverage decision with nothing to notice. There is
+no longer a field there to flip.
+
+The width was not the point and the arithmetic is a note rather than a reason: capacity is not a
+constraint here, and 17% off the disk is not what would have justified touching a format. What justified
+it is that a sizing model had to be told what a record is for, and the answer for twelve of its bytes was
+"nothing".
 
 The bytes are little-endian by declaration, not by inheritance. The moment blocks leave this process
 they are a format, and a format that borrows the machine's byte order is not one.
@@ -1993,7 +2023,7 @@ already failed.
 > a flipped bit became an *answer* rather than a fault. **Double-entry does not catch it** — a corrupted
 > remainder moves both sides of the ledger by the same wrong amount, so both sums still balance — which makes
 > rule 19's "detect and stop" impossible where nothing detects.
-> **Weighed** — a checksum per record (fifty-one four-byte stamps do not fit the sixteen spare bytes, and an
+> **Weighed** — a checksum per record (sixty four-byte stamps do not fit the sixteen spare bytes, and an
 > eighty-four-byte record would drop the block to forty-eight and cost six percent of the store);
 > `rustc-hash`, already in the tree and free (a hash makes detection probable where a CRC guarantees every
 > one-bit, two-bit and thirty-two-bit-burst error, and picking the table hasher because it was to hand is
@@ -2002,7 +2032,7 @@ already failed.
 > is latched and the seal follows a round later); a `--store-hang-every` (a knob whose reaction does not exist
 > tests nothing, rule 4).
 > **Chose** — `StoreFault::{Missing, Device}` with one seal between them and two counters apart, a CRC32C over
-> each block in the bytes fifty-one records leave spare, `--store-fault-every` and `--store-corrupt-every` to
+> each block in the bytes the records leave spare, `--store-fault-every` and `--store-corrupt-every` to
 > produce either, and **hang written down as a decision rather than modelled**: contract 2 has no detector
 > anywhere in this ledger, for any component, and the bound and the reaction are the same question for idem and
 > for consensus.
@@ -2013,7 +2043,7 @@ already failed.
 of where blocks are having stopped agreeing with the store, `Device` is an `EIO` or the `ENOSPC` that retention
 was supposed to make impossible, and either way a record the log says exists is one this node cannot read. So
 both seal the apply path, through a third notice — `PendingNotice::StoreFailed`, which carries no id because a
-block holds up to fifty-one records and a failed read is about a block.
+block holds up to sixty records and a failed read is about a block.
 
 Counted apart from `holds_not_stored` all the same. The two conditions are identical and their *causes* are
 not: one is a table sized for a maximum the run passed, the other is a device, and a report that could not
@@ -2047,14 +2077,15 @@ by the same wrong amount, so both sums still balance. Field by field:
 | `remaining`, too large | *sometimes*. An over-settle that drives that account's pending column below zero is `ColumnWentNegative` and seals; with another hold on the same account it takes from that one instead, silently |
 | `remaining`, too small | nothing. A settle that was entitled to happen is refused |
 | either account id | nothing, if the id exists. Money moves between the wrong two accounts and both identities still balance |
-| `budget_members`, `budget_remaining` | nothing. The coverage check decides on a total nobody wrote |
+| `budget_members`, `budget_remaining` | *there is no longer a field to flip* — they left the record (§12), and the engine answers from its one budget map. When they were here: nothing. The coverage check decided on a total nobody wrote |
 
 So the seal that rule 19 asks for could not happen, because nothing detected the condition.
 
-**It costs no space.** Fifty-one eighty-byte records leave sixteen bytes of a four-kilobyte block unused, and
-a CRC32C is four of them. Per-record was weighed and does not fit: fifty-one stamps need two hundred and four
-bytes, and widening the record to eighty-four to carry its own would drop the block to forty-eight records and
-cost six percent of the store. So it is one checksum over the block's records, stamped at the one moment a
+**It costs no space.** Sixty sixty-eight-byte records leave sixteen bytes of a four-kilobyte block unused,
+and a CRC32C is four of them — the same sixteen the previous record width left over, which is luck and is
+said so rather than left to read as a constraint. Per-record was weighed and does not fit: sixty stamps need
+two hundred and forty bytes, and widening the record to carry its own would drop the block to fifty-six
+records. So it is one checksum over the block's records, stamped at the one moment a
 block's bytes stop changing — the seal — and verified by the three paths that read one back.
 
 **A crate rather than the hasher already to hand.** `rustc-hash` is in `base` and would have been free, but it
@@ -2624,7 +2655,8 @@ will read when its reaction is chosen.
 
 ### The expiry path reads one block fifty-two times, and only the first of them is the sweep's
 
-The sweep reads a day's block to find its survivors — that is one read for up to fifty-one voids. Each of
+The sweep reads a day's block to find its survivors — that is one read for up to a blockful of voids
+(fifty-one when this was measured; sixty since the record narrowed in §12). Each of
 those voids is then judged like any resolution, which means a lookup, which means reading the record: **the
 same block, fifty-one more times.** The day being emptied is `retention + grace` old and residency is a day
 wide, so none of it is in memory and every one of them reaches the device.
@@ -2802,7 +2834,7 @@ comes with it is two more things, and they are the reason this is a decision rat
 
 What it buys, and the third is the one that matters most:
 
-- **apply costs the same every time.** Today one apply in fifty-one pays a whole block's compaction — fifty-one
+- **apply costs the same every time.** Today one apply in a blockful pays a whole block's compaction — fifty-one
   index probes plus the survivors' copies and repoints — and the other fifty pay nothing.
 - **the drain gets a ceiling that is declared** instead of one that is whatever the backlog happens to be.
 - **the drain becomes measurable on its own.** It was mixed into apply's time and could not be separated,
