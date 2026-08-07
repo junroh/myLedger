@@ -68,7 +68,7 @@ fences in one order.
   committed hold the index could not take seals the apply path (rule 19, where it used to be
   detect-and-report), a store that refused a call seals it too and is counted apart because the cause is a
   device rather than a table, and a hold that outlived its retention is proposed for release. Design notes
-  §13 and §16.
+  §13, §16 and §17.
 
 ### Retention, and the expiry that makes it true
 
@@ -205,9 +205,11 @@ What it unblocks, and what each is worth now:
   rule, so it belongs inside a block, at the record.
 - **Where a snapshot goes** is still open, and it is the only one of the five that this did not move.
 
-Three things are named as unbuilt in §16 rather than left to read as done: a startup reconcile for files a
-previous life left behind, a `Device` fault a real backend produces rather than a knob, and the recording of
-the apply index on each side.
+Two decisions came out of this one and are written as their own rather than left in its prose: **§17**, what a
+broken store is and what this node does about it, and **§18**, how a read is issued and by how many threads.
+What §16 names as unbuilt is a startup reconcile for files a previous life left behind — and three things that
+all wait on a Linux host: `O_DIRECT`, `SE-OQ-6`'s answer against a device, and whether the read pool earns
+anything.
 
 ## Not built
 
@@ -601,6 +603,10 @@ command that reproduces it. The ones that decide the most:
   <path> --store-queue-depth 2048` — the same read path against real files instead of a model. The depth is in
   the command on purpose: at 128 the same run reports p99 93.7ms and reads as a slow device, at 2048 it is p99
   5.4ms. Not a device measurement on macOS, which has no `O_DIRECT`.
+- The same with `--rate 0 --store-read-threads 0,2,4,8,16` — what the read pool is worth, and the reason a
+  number off it does not travel: the curve peaks at two threads here because two is what four performance cores
+  have spare, and on a device the threads block in the kernel instead of competing, so the shape inverts.
+  Design notes §18.
 - `ledgerfio run --workload hold-settle --resolve-after 900000 --external-ratio 30` — what order
   exemption is worth, as lane depth.
 - `ledgersim check --seeds 64` — every invariant under fault injection, including the store path.

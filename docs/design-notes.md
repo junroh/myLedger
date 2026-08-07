@@ -1717,6 +1717,10 @@ nothing here has established it there.
 > **absolute** — the block number times the block size — so it is a function of the address and nothing
 > has to be restored. `MemoryStore` backs it today, `LatencyStore` prices a device in front of any
 > backend, and `FileStore` is seven methods whenever a disk arrives.
+>
+> Two decisions came out of this one and have sections of their own rather than living in its prose: **§17**,
+> what a broken store is and what this node does about it, and **§18**, how a read is issued and by how many
+> threads.
 
 **The seam is where it is because of what has to be identical.** Above it the engine speaks in
 `RecordAddr` — segment, block, record — and knows about holds, days and retention. Below it there is a
@@ -1878,6 +1882,79 @@ which is why the depth is in `status.md`'s decisions list rather than described 
 stress point rather than a design one: forcing every resolution to miss memory is what the two flags are for,
 and a 24-hour residency exists so that a deployment does not.
 
+### What the simulator found by being given a store
+
+`ledgersim` used to build the engine on `MemoryStore::default()` and nothing else, so the seeds explored the
+store's *path* — 87,000 reads across sixty-four of them — and none of its behaviour: no latency, no refusal, no
+corruption. It draws a `StoreModel` per seed now, with the backing still memory, because a virtual clock with
+real IO under it measures neither of the two.
+
+**Two seeds in three get timing and the third keeps the exact store, and that share is a measurement rather
+than a taste.** With every seed slowed, the sweep's store reads fell from 87,000 to 4,000: a synchronous write
+or sync holds the component's thread, the step budget per seed is fixed, and the *volume* of the read path
+collapses with it. Keeping a third exact holds the volume while the rest explore completions arriving out of
+the order they were asked in, which is what the orderer exists for.
+
+The fault periods are small — a refusal every four to twenty-four store *calls* — and that is not a taste
+either. The first attempt used two hundred to a thousand, by analogy with the index fault's roominess, and it
+never fired once: a short seed makes a few dozen store calls in total, so a period measured for a load run is
+a fault that never happens. The coverage assertion is what said so, and it is the same one the index overflow
+has: a sweep that met no store fault would be reporting that the seal holds about a path it never entered.
+
+**And it found a defect in the second commit that used it.** When `MemoryStore` refused a write, the record log
+advanced its block number and noted the block in the day's range anyway, so the next block was written one
+place past what the store held — and the memory store's own assertion, that a block goes at the end of its
+segment, caught the disagreement.
+
+Advancing was right and the assertion was wrong. The records on the block that could not be written already
+hold addresses, so reusing the number would give two records one address; what the failed write leaves is a
+**hole**, and a hole is exactly what a store addressed by absolute offsets can express. So the assertion now
+refuses only an offset *before* the end — a block written over one already there, which is a genuine
+bookkeeping disagreement — and a gap is `None` in the memory store's sequence, answered as `Missing`. A file
+differs and it is worth knowing which way: reading a hole in a file gives zeroes, so there the block fails its
+checksum and is counted as corruption instead. Same seal, different cause, and both only after a write has
+already failed.
+
+### Still unbuilt, and named so it is not read as done
+
+- **Nothing reconciles at startup**, but the worst of it is now refused rather than done. `reclaim` only
+  frees a segment it has a block count for and a restart begins with none, so a file a previous life left
+  behind is still never removed — a leak. What no longer happens is the damage: `open_with` uses `O_EXCL`, so
+  reusing that segment sixty-three days later *fails* instead of writing over the file's front and leaving a
+  mix of two days that nothing points into. A refusal seals, which is the safe end of it. The reconcile
+  itself is one call at the seam (`existing()`, a bitmap of segments present) and is not built, because
+  nothing restarts yet — and `a_segment_file_left_behind_is_refused_rather_than_written_over` is what holds
+  the position until it is.
+- **Three things wait on the same thing, and it is a Linux host.** `O_DIRECT` (macOS has only the advisory
+  `F_NOCACHE`, which needs `fcntl` and so `unsafe`), and with it `SE-OQ-6`'s answer against a device rather
+  than against a page cache, and with it whether the read pool of §18 earns anything — its whole value is
+  overlapping reads that block, and nothing here blocks. All three open together, which is worth knowing in
+  advance of the box rather than as three surprises.
+
+## 17. A store can be broken three ways, and only one of them was expressible
+
+> **Tried** — a store that could not fail. `read` answered a `bool`, a write answered nothing, and the one
+> failure the seam could express was "the block is not there" — which no backing could produce, memory having
+> every block it was given.
+> **Broke** — a device misbehaves by refusing, by answering wrongly, or by not answering, and the second is the
+> one that mattered most and was not a failure path at all. `decode` turns any four kilobytes into a record, so
+> a flipped bit became an *answer* rather than a fault. **Double-entry does not catch it** — a corrupted
+> remainder moves both sides of the ledger by the same wrong amount, so both sums still balance — which makes
+> rule 19's "detect and stop" impossible where nothing detects.
+> **Weighed** — a checksum per record (fifty-one four-byte stamps do not fit the sixteen spare bytes, and an
+> eighty-four-byte record would drop the block to forty-eight and cost six percent of the store);
+> `rustc-hash`, already in the tree and free (a hash makes detection probable where a CRC guarantees every
+> one-bit, two-bit and thirty-two-bit-burst error, and picking the table hasher because it was to hand is
+> choosing a tool by availability); a notice per cause (the reaction is one seal, so one notice and two
+> counters); returning the fault up the stack from all three read paths (one decision in three places, so it
+> is latched and the seal follows a round later); a `--store-hang-every` (a knob whose reaction does not exist
+> tests nothing, rule 4).
+> **Chose** — `StoreFault::{Missing, Device}` with one seal between them and two counters apart, a CRC32C over
+> each block in the bytes fifty-one records leave spare, `--store-fault-every` and `--store-corrupt-every` to
+> produce either, and **hang written down as a decision rather than modelled**: contract 2 has no detector
+> anywhere in this ledger, for any component, and the bound and the reaction are the same question for idem and
+> for consensus.
+
 ### The fault a device produces, and the one seal it shares
 
 `StoreFault` has two variants and one reaction, which is the honest shape: `Missing` is this node's own record
@@ -1952,38 +2029,26 @@ missing first is the reaction, and that is a decision: what bound, and whether m
 fail-stops the node. A hang is not lane-local, which argues for the second. And it is the same decision for
 idem and for consensus, so it does not belong inside the store's work. `status.md` has it.
 
-### What the simulator found by being given a store
+## 18. How a read is issued, and how many threads issue it
 
-`ledgersim` used to build the engine on `MemoryStore::default()` and nothing else, so the seeds explored the
-store's *path* — 87,000 reads across sixty-four of them — and none of its behaviour: no latency, no refusal, no
-corruption. It draws a `StoreModel` per seed now, with the backing still memory, because a virtual clock with
-real IO under it measures neither of the two.
-
-**Two seeds in three get timing and the third keeps the exact store, and that share is a measurement rather
-than a taste.** With every seed slowed, the sweep's store reads fell from 87,000 to 4,000: a synchronous write
-or sync holds the component's thread, the step budget per seed is fixed, and the *volume* of the read path
-collapses with it. Keeping a third exact holds the volume while the rest explore completions arriving out of
-the order they were asked in, which is what the orderer exists for.
-
-The fault periods are small — a refusal every four to twenty-four store *calls* — and that is not a taste
-either. The first attempt used two hundred to a thousand, by analogy with the index fault's roominess, and it
-never fired once: a short seed makes a few dozen store calls in total, so a period measured for a load run is
-a fault that never happens. The coverage assertion is what said so, and it is the same one the index overflow
-has: a sweep that met no store fault would be reporting that the seal holds about a path it never entered.
-
-**And it found a defect in the second commit that used it.** When `MemoryStore` refused a write, the record log
-advanced its block number and noted the block in the day's range anyway, so the next block was written one
-place past what the store held — and the memory store's own assertion, that a block goes at the end of its
-segment, caught the disagreement.
-
-Advancing was right and the assertion was wrong. The records on the block that could not be written already
-hold addresses, so reusing the number would give two records one address; what the failed write leaves is a
-**hole**, and a hole is exactly what a store addressed by absolute offsets can express. So the assertion now
-refuses only an offset *before* the end — a block written over one already there, which is a genuine
-bookkeeping disagreement — and a gap is `None` in the memory store's sequence, answered as `Missing`. A file
-differs and it is worth knowing which way: reading a hole in a file gives zeroes, so there the block fails its
-checksum and is counted as corruption instead. Same seal, different cause, and both only after a write has
-already failed.
+> **Tried** — the `pread` inside `poll`, which is what `FileStore` began as: correct, simplest, and nothing
+> overlaps.
+> **Broke** — nothing here. On a page cache it is the fastest thing measured short of two threads' worth of
+> overlap. It breaks on a *device*: the read blocks the pending worker's own thread, so a 100µs read caps store
+> reads at ten thousand a second **and stalls the whole component for each of them** — no applies, no lookups
+> answered, no sync.
+> **Weighed** — the pool as a decorator above the backing (io_uring owns the descriptors and issues its own
+> reads, so it could never be one, and the same job would then live in two places); one shared request queue
+> (`base`'s ring is single-producer single-consumer and a queue several threads read is not); a shared slot
+> array so nothing is copied (needs `unsafe`, which rule 7 does not allow here); sixteen threads because the
+> design says sixteen (measured, that is oversubscription on four performance cores — the curve peaks at two,
+> nine percent over synchronous, and is forty-three percent *below* it at sixteen); parking with a timeout
+> (self-inflicted — sixty-four idle threads waking twenty thousand times a second reported p50 174ms against
+> 1.6ms, and `park` needs no timeout because `unpark` leaves a token).
+> **Chose** — N threads *inside* the backing, one SPSC pair each, buffers travelling as boxed pointers so a
+> ring moves eight bytes and not four kilobytes, `park` with no timeout, and a default of **zero** — not
+> because a pool is worthless but because the right count follows from the cores an assembly has spare, which
+> no constant knows. The trait the design asks for arrives with the second implementation, not before it.
 
 ### The modelled store had to hand the read down, and did not
 
@@ -2097,14 +2162,3 @@ modelled time. Same wall as `O_DIRECT`, same answer: a Linux host.
 version parked each idle thread with a fifty-microsecond timeout, so sixteen idle threads woke twenty thousand
 times a second each and sixty-four reported p50 174ms against 1.6ms. `park` needs no timeout — `unpark` leaves a
 token when it arrives first — and with it gone the curve is monotonic past its peak.
-
-### Still unbuilt, and named so it is not read as done
-
-- **Nothing reconciles at startup**, but the worst of it is now refused rather than done. `reclaim` only
-  frees a segment it has a block count for and a restart begins with none, so a file a previous life left
-  behind is still never removed — a leak. What no longer happens is the damage: `open_with` uses `O_EXCL`, so
-  reusing that segment sixty-three days later *fails* instead of writing over the file's front and leaving a
-  mix of two days that nothing points into. A refusal seals, which is the safe end of it. The reconcile
-  itself is one call at the seam (`existing()`, a bitmap of segments present) and is not built, because
-  nothing restarts yet — and `a_segment_file_left_behind_is_refused_rather_than_written_over` is what holds
-  the position until it is.

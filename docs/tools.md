@@ -145,7 +145,7 @@ decides what the prediction is worth:
 - **`--store-read-threads <n>` issues the store's reads on a pool** instead of synchronously inside `poll`.
   Zero is the default, and that is a refusal to pick rather than a measurement: the curve peaks at two threads
   here — 9% better than synchronous — and is 43% worse at sixteen, because what bounds the count is the cores
-  left over after the reactor and the worker. Design notes §16 has the curve, and the reason a number read off
+  left over after the reactor and the worker. Design notes §18 has the curve, and the reason a number read off
   one machine's spare cores does not travel.
 - **The read queue's depth is a flag, and it bounds what a slow read can hide behind.**
   `--store-queue-depth` (128) is how many reads the store holds at once; past it reads are refused and the
@@ -178,8 +178,8 @@ decides what the prediction is worth:
 
 ## What a harness must not assume
 
-Two rules, each written after breaking it. They are about the simulator, not the ledger, and both cost
-a run that looked plausible and was wrong.
+Three rules, each written after breaking it. Two are about the simulator and one about any measurement here,
+and each cost a run that looked plausible and was wrong.
 
 - **Owed work is a monotone accumulator, never a function of `now`.** A virtual clock jumps — to the
   next component event, or by whatever the tick's work cost — so a deadline set as `now + gap` throws
@@ -189,6 +189,14 @@ a run that looked plausible and was wrong.
   apply path means no commit is ever coming, which is the design working; a harness that waits for one
   anyway turns a reportable outcome into a hang. A timeout is not a substitute: it spins and then reports
   the wrong thing.
+- **Before a number is about the thing being measured, name every bound in the path that *this repository*
+  chose — and vary it.** Three times in one session a figure was read as a device's and was ours: a
+  `--store-read 5000` run reporting p50 212ms was a queue depth of 128 that a runner had written as a
+  constant; "a read pool costs a third of the read ceiling" was sixteen threads on a machine with four
+  performance cores; and a thread-count cliff at sixty-four was a fifty-microsecond park timeout waking every
+  idle thread twenty thousand times a second. Each time the fix was a knob of ours, not a slower disk, and
+  each time the giveaway was the same — the number moved when something we owned did. Vary our bounds first;
+  the component's turn comes after they are excluded.
 
 ## What a sweep proves
 
