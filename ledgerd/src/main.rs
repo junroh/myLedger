@@ -5,7 +5,10 @@ use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{AccountId, Signals};
 use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
-use ledger_pending::{DaySource, MemoryPending, MemoryPendingConfig, OpenBacking};
+use ledger_pending::{
+    DaySource, MemoryPending, MemoryPendingConfig, OpenBacking, PendingStorage, SnapshotDir,
+    SnapshotPolicy,
+};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_service::{ClientEndpoint, LedgerService, ServiceConfig};
 
@@ -16,6 +19,13 @@ const DEFAULT_ACCOUNTS: u64 = 1_000;
 /// law on the store read rate; design notes §16 has the numbers and why the design's sixteen is not the
 /// default here.
 const READ_THREADS: usize = 0;
+/// Whether `pwrite` and `fsync` go to a thread of their own. False is the synchronous baseline, and what
+/// every number in the documents was taken against; a deployment on a device turns it on. Design notes §20.
+const WRITE_LANE: bool = false;
+/// Log positions between snapshots when a directory was named and no distance was. Small enough that a
+/// local run writes several, which is what makes the flag observable at all; a deployment says its own,
+/// and what it should be is arithmetic on the log it means to retain — see design notes §19.
+const SNAPSHOT_EVERY: u64 = 100_000;
 const EXTERNAL: AccountId = AccountId(1);
 const FIRST_ACCOUNT: u64 = 1_000;
 const LEDGER: u32 = 1;
@@ -76,22 +86,46 @@ fn serve(_endpoint: ClientEndpoint) {
 /// against, and a node that wrote files without being asked would change what a run means. A directory is
 /// refused loudly rather than fallen back from — somebody asked for durable space and got none is worse than
 /// not starting.
+///
+/// The two directories are separate flags because they may be separate volumes (§19); naming neither is
+/// still the default, and naming one without the other is a perfectly ordinary deployment.
 fn start_pending() -> MemoryPending {
-    let backing = match flag("--store-dir") {
+    let blocks = match flag("--store-dir") {
         None => OpenBacking::Memory,
-        Some(dir) => {
-            OpenBacking::files(std::path::Path::new(&dir), READ_THREADS).unwrap_or_else(|err| {
+        Some(dir) => OpenBacking::files(std::path::Path::new(&dir), READ_THREADS, WRITE_LANE)
+            .unwrap_or_else(|err| {
                 eprintln!("ledgerd: --store-dir {dir} cannot be opened ({err:?})");
                 std::process::exit(2);
-            })
-        }
+            }),
+    };
+    let snapshots = flag("--snapshot-dir").map(|dir| {
+        SnapshotDir::open(std::path::Path::new(&dir)).unwrap_or_else(|err| {
+            eprintln!("ledgerd: --snapshot-dir {dir} cannot be opened ({err})");
+            std::process::exit(2);
+        })
+    });
+    // A directory with no cadence writes nothing, which reads as a flag that did not work. The two have
+    // to arrive together, so naming the directory is what turns the policy on.
+    let snapshot = SnapshotPolicy {
+        every: match snapshots {
+            None => 0,
+            Some(_) => number("--snapshot-every").unwrap_or(SNAPSHOT_EVERY),
+        },
+        ..SnapshotPolicy::default()
     };
     MemoryPending::start_with_days(
-        MemoryPendingConfig::default(),
+        MemoryPendingConfig {
+            snapshot,
+            ..MemoryPendingConfig::default()
+        },
         DaySource::WallClock,
-        backing,
+        PendingStorage { blocks, snapshots },
     )
     .expect("the default engine config is valid")
+}
+
+fn number(name: &str) -> Option<u64> {
+    flag(name).and_then(|value| value.parse().ok())
 }
 
 fn flag(name: &str) -> Option<String> {

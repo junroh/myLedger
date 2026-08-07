@@ -14,7 +14,7 @@ use ledger_base::{
 };
 use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
 use ledger_pending::{
-    DaySource, MemoryPending, MemoryPendingConfig, OpenBacking, PendingCapacity, StoreModel,
+    DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity, PendingStorage, StoreModel,
 };
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, Reactor, ReactorConfig, Transport};
@@ -255,7 +255,7 @@ impl<C: Clock> Harness<C> {
                 acks: ack_tx,
             },
             accounts,
-            MemoryPending::start_with_days(pending, days, OpenBacking::Memory)
+            MemoryPending::start_with_days(pending, days, PendingStorage::memory())
                 .expect("a test engine config"),
             MemoryIdem::start(NoLatency::idem()),
             EchoRaft::start(raft),

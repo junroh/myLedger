@@ -59,6 +59,8 @@ pub struct PendingEngine {
     /// component that has reordered its own queue — which is the check that replaces the lane's order
     /// for a request that keeps no place in it.
     applied: u64,
+    /// Buffered blocks the drain has carried out. The drain's own cost, which apply used to hide.
+    drained_blocks: u64,
 }
 
 /// Where a lookup has got to: which key it is for, the addresses its fingerprint matched, and how many
@@ -488,12 +490,26 @@ impl PendingEngine {
         }
     }
 
-    /// Carries the oldest buffered block's survivors on and drops the rest. A record is alive exactly
-    /// when the index still points at it, which needs no extra bookkeeping: a resolved hold has no
-    /// entry and a superseded version's entry has moved on. Both tests are address comparisons, so
-    /// compaction reads nothing it has not already got in hand.
-    fn compact(&mut self) {
-        while self.records.over_window() {
+    /// Empties the writeback buffer, at most `blocks` of them, and answers whether it did anything.
+    ///
+    /// **Whoever runs the loop calls this; applying an effect does not.** It used to be the last thing
+    /// `put` did, so the append that pushed the buffer over its window paid for draining it — which made
+    /// one apply in fifty-one cost a whole block's compaction and the other fifty nothing, and gave the
+    /// drain a ceiling of "however far behind the buffer is" rather than a declared one. Neither was
+    /// chosen; the drain was simply written where the overflow is noticed. Design notes §20.
+    ///
+    /// **Bounded, and that is the half that has to come with the move.** A budget here is only safe
+    /// because the caller also stops applying when the buffer passes its ceiling: with the producer doing
+    /// the draining, the window could not be exceeded at all, and that invariant held by the arrangement
+    /// rather than by anyone declaring it (rule 18). Both halves are now declared — see
+    /// `MemoryPendingConfig`.
+    ///
+    /// Each block: a record is alive exactly when the index still points at it, which needs no extra
+    /// bookkeeping — a resolved hold has no entry and a superseded version's entry has moved on. Both
+    /// tests are address comparisons, so compaction reads nothing it has not already got in hand.
+    pub fn drain(&mut self, blocks: usize) -> bool {
+        let mut drained = 0;
+        while drained < blocks && self.records.over_window() {
             self.survivors.clear();
             let mut died = 0;
             for (key, hold, addr) in self.records.oldest_block() {
@@ -512,7 +528,43 @@ impl PendingEngine {
                 self.index.replace(key, old, new);
             }
             self.records.drop_oldest(died);
+            drained += 1;
         }
+        self.drained_blocks += drained as u64;
+        // Every block this round closed is offered to the store before the round ends, and the day
+        // rollover's partial block with them — `open_day` closes one too, and it runs earlier in the same
+        // round. Offered, not written: the store answers through `collect_writes` below, and a store that
+        // will not take one leaves it here to be offered again.
+        let submitted = self.records.submit_writes();
+        drained > 0 || submitted
+    }
+
+    /// Takes every write and barrier the store has answered: blocks enter residency, a completed barrier
+    /// moves coverage, and a refusal is latched for the seal. Whoever runs the loop owes this a call each
+    /// round, the same way it owes `harvest` one for reads.
+    pub fn collect_writes(&mut self) -> bool {
+        self.records.collect_writes()
+    }
+
+    /// Blocks closed or submitted and not yet answered for. What the caller compares against a ceiling, the
+    /// same way it does the writeback buffer: a store that stops answering must stop the applies behind it
+    /// rather than let this grow (rule 12).
+    pub fn writes_outstanding(&self) -> usize {
+        self.records.writes_outstanding()
+    }
+
+    /// Blocks the writeback buffer is holding. What the caller compares against the ceiling it declared,
+    /// because the engine keeps no policy about when to stop applying — that belongs to whoever owns the
+    /// command queue.
+    pub fn buffered_blocks(&self) -> usize {
+        self.records.buffered_blocks()
+    }
+
+    /// Buffered blocks the drain has carried out. Counted so a run can say what the drain cost, which is
+    /// the number nobody had: inside apply it was mixed into the apply path's own time and could not be
+    /// separated from it. Whether the drain ever deserves a thread of its own is decided on this.
+    pub fn drained_blocks(&self) -> u64 {
+        self.drained_blocks
     }
 
     /// Appends the record and points the key at it. Both halves are one call because a record the
@@ -538,7 +590,6 @@ impl PendingEngine {
             let mut verify = Self::verifier(records, key);
             index.repoint(key, addr, &mut verify);
         }
-        self.compact();
         true
     }
 
@@ -936,6 +987,12 @@ mod test_support {
 
         fn stored_at(&mut self, effect: PendingEffect, at: ApplyIndex) {
             self.write(effect, at).expect("the index took the hold");
+            // What the worker's round does around applying, and what applying itself no longer does (§20):
+            // the drain submits closed blocks and the collect takes the store's answers, which is what puts
+            // them in residency. Unbounded because a test drives the engine by hand and has no round to
+            // spread a budget over — what is asserted is where records end up, not how many rounds it took.
+            self.drain(usize::MAX);
+            self.collect_writes();
         }
     }
 }

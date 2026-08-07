@@ -26,10 +26,13 @@ sequencer holds is one leader's work in progress.
 |---|---|
 | sequencer | built |
 | account balances | in-memory, persistence not built |
-| pending engine (holds) | in-memory tier with retention and expiry; disk tier not built |
+| pending engine (holds) | index, two memory windows and blocks, with retention and expiry |
+| the engine's blocks on disk | real files when a directory is named (`--store-dir`); memory otherwise |
+| the engine's snapshot | format, replay, stable read and a destination built; starting a node from one is not |
+| store IO | reads on an optional pool, writes and barriers on an optional lane; both default to synchronous |
 | idempotency | in-memory map; the one-hour window is not expired yet |
 | consensus | commits locally after a simulated round trip; no replication |
-| expiry throttle | paces against the sequencer; the policy that sizes its slice waits on a measurement |
+| expiry throttle | paces against the sequencer, and the day sizes its slice |
 | rate limiter (client edge) | not built |
 
 The sequencer reaches all of them through ports, so each can be replaced without touching it. The

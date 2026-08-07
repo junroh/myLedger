@@ -754,7 +754,31 @@ in the wrong order, and the store can be filled until the next effect cannot lan
 
 Measurements are not recorded in these documents. The code changes, so a number written here would be
 stale without saying so; what is kept is the direction a measurement showed and the command that
-reproduces it. Every report prints its own conditions — thread placement, workload, flags — and that is
+reproduces it.
+
+### A baseline goes stale in minutes, and this machine drifts ten percent in an hour
+
+**Two comparisons in this repository were taken against a baseline measured earlier in the same session,
+and one of them invented an eight percent regression that did not exist.** Moving the writeback drain out
+of apply (§20) measured 2.56M tx/s against a baseline of 2.77M taken an hour before — until the *unchanged*
+code was rebuilt and measured again at that moment and gave 2.50M. Interleaved, alternating the two
+binaries run by run, the change won all three pairs.
+
+So the rule is not "repeat the measurement" — the repeats were tight, ±1% within each set. It is
+**interleave the arms**: build both, then alternate them, because whatever moves over an hour on a laptop
+under sustained load moves both arms equally only if they are measured together. `--repeat` covers noise
+within a set and cannot see drift between sets, which is exactly why the wrong conclusion looked solid.
+
+It is the same failure as reading a queue depth of ours as a device's, one level up: a number that belongs
+to the conditions was read as belonging to the change.
+
+**And interleaving alone is not enough, because the pair-to-pair band is wide.** Eleven interleaved pairs of
+the same before/after comparison (`partial-settle`, `--rate 0`, five and ten seconds) came out at −8.4, −4.7,
+−4.6, −4.0, −3.5, −2.4, +1.5, +1.7, +1.7, +5.6, +6.5 percent: **mean −1%, spread ±7%**, and ten-second runs
+were no tighter than five-second ones. So a single pair says nothing at all, and **no effect smaller than
+about seven percent is resolvable here without many pairs.** Anything reported below that band has to say so
+rather than pick a side — which is what the entry above is: the split it measured has no mechanism that could
+cost a percent, and the numbers agree by not agreeing on a sign. Every report prints its own conditions — thread placement, workload, flags — and that is
 where the numbers belong.
 
 The crates' benches and `ledgerfio run` report the thread placement they actually got, and
@@ -1453,11 +1477,13 @@ offered, admitted and refused, and whose sweep test fails if no seed outlived it
 
 ## 15. The snapshot is the index, and the log being truncated is the only reason it exists
 
-> **Partly built.** The format, the round trip, coverage, replay and the copy-on-write stable read are code
-> with tests; what is not is **where a snapshot goes** — nothing writes one anywhere, the throttle that would
-> pace it is a number nobody has chosen, and whether a cold start reads a local copy or fetches from a peer is
-> a decision. `status.md` tracks those three. Everything below is the reasoning either way, including the
-> turns that were wrong, which is what this file is for.
+> **Built, except starting a node from one.** The format, the round trip, coverage, replay and the
+> copy-on-write stable read are code with tests, and **§19 is where a snapshot goes** — the destination, the
+> cadence and the throttle, which this section left open and which `status.md` tracked until it closed. What
+> is still not built is a start-up that begins from one: restoring the index is not restoring a node, because
+> the `RecordLog` has no position, and the reconcile that would give it one has to precede `reclaim` or that
+> deletes every file. Everything below is the reasoning either way, including the turns that were wrong,
+> which is what this file is for.
 >
 > **Tried** — "a checkpoint of the engine's state", taken to mean the index, the buffer, the block
 > metadata and the per-segment counts, written every N minutes.
@@ -1763,15 +1789,20 @@ constant. `ledgerfio layout` prints the claim beside everyone else's.
 
 ### What a real backend is, method by method
 
+The method names below are the ones this section was written with. §20 later replaced the three write-side
+ones with `submit_write` / `submit_barrier` / `poll_written`, which changes when the answer arrives and not
+what the syscall is — so the mapping stands and the names are marked.
+
 | seam | a file per segment |
 |---|---|
-| `open_with(segment, offset, block)` | `openat(dir, "seg-NN.blk", O_CREAT\|O_EXCL\|O_RDWR\|O_DIRECT)` then `pwrite` at `offset` |
-| `append(segment, offset, block)` | `pwrite` |
+| `submit_write(.., creating: true)` (was `open_with`) | `openat(dir, "seg-NN.blk", O_CREAT\|O_EXCL\|O_RDWR\|O_DIRECT)` then `pwrite` at `offset` |
+| `submit_write(.., creating: false)` (was `append`) | `pwrite` |
 | `read_at(segment, offset, into)` | `pread`. A short read is `Missing`; `EIO` is the fault variant that arrives with the device |
 | `submit` / `poll` | the one pair POSIX has no answer for — `pread` on a thread pool, or io_uring. `SE-OQ-4` is a choice between two implementations of these two methods, and this is where it lives |
+| `submit_barrier` (was `sync`) | `fsync` per dirty file, then `fsync(dir)` if one came into being |
 | `remove(segment)` | `unlinkat`, then close |
 
-**`open_with` is one call and not a create followed by a write**, because a segment's first block *is* its
+**Creating is a flag on the write and not a call of its own**, because a segment's first block *is* its
 creation and two statements that always happen together are two that can come apart (rule 16). Which of
 the two a write is, is the caller's to say rather than the backend's to discover: `RecordLog` knows from
 the day's own block count, so a real backend never pays a syscall to learn what its caller already knew.
@@ -1833,6 +1864,13 @@ a restore taken before the sync answers none of the holds while one taken after 
 syncs too, and those are charged differently on purpose: a read occupies the *device* — submitted, served by
 the queue, harvested later, with the engine working meanwhile — while a write, a sync and an apply-path read
 occupy the *thread*, which on this component is the thread every lookup passes through.
+
+**That last claim is now conditional, and the model still makes it unconditionally.** §20 gives writes and
+barriers a lane, so with `--store-write-lane 1` they no longer hold the engine's thread. The model charges
+them to it regardless, which is right while the lane is off — the default, and the baseline — and wrong once
+it is on. Fixing that means the charge becoming a deadline the way a read's is, and it belongs with the
+re-measurement §20 lists rather than ahead of it: a model that priced a write as a queue's cost would have
+been describing a lane that did not exist when these curves were taken.
 
 **Where 1M tx/s comes from, because it is not a target.** The design's rate is 150M arrivals a day, which is
 1,736/s — six hundred times lower. At `ledgerfio`'s usual 100k/s neither flag is visible, and not because it
@@ -2162,3 +2200,571 @@ modelled time. Same wall as `O_DIRECT`, same answer: a Linux host.
 version parked each idle thread with a fifty-microsecond timeout, so sixteen idle threads woke twenty thousand
 times a second each and sixty-four reported p50 174ms against 1.6ms. `park` needs no timeout — `unpark` leaves a
 token when it arrives first — and with it gone the curve is monotonic past its peak.
+
+## 19. Where a snapshot goes, and what paces it there
+
+> **Tried** — a wall-clock interval and a chunk sized for throughput: write a snapshot every N minutes, in
+> the largest pieces the volume takes cheaply.
+> **Broke** — both halves. A wall clock steps backwards, jumps, and restarts, so a *duration* between
+> snapshots needs a monotonic clock the engine deliberately does not have; and the large chunk optimises the
+> quantity nobody has an SLO on. Measured, 64KB a round costs 0.11% of throughput for each MB/s it writes
+> against 4KB's 0.28% — and while a dump runs it takes the median from 1.3ms to 6.5ms, against 1.5ms at 4KB.
+> The cheap chunk is the one that misses the contract.
+> **Weighed** — a monotonic elapsed-time cadence (works, and needs a clock for a decision that has no
+> calendar in it); a snapshot in the store's own directory (would decide a provisioning question the design
+> answers elsewhere, §2.2); writing in place with no partial name (a crash then leaves a prefix wearing the
+> current name, and a reader cannot tell one from a complete stream because a short file simply ends); a
+> shadow that is allowed to grow (rule 20 — the ceiling would be the allocator's); retrying a chunk that
+> failed to write (the shadow entries it consumed are already gone, so there is nothing to retry *from*).
+> **Chose** — a cadence measured in **log positions**, a throttle of **4096 bytes a round**, one file
+> replaced by rename, and a **declared** shadow budget whose breach abandons the dump.
+>
+> ⚠ **The throttle is answered against an arrangement §20 changes, and does not survive it.** 4096 wins
+> only because a chunk is written on the thread that answers lookups. Once every IO has a lane of its own
+> the chunk stops holding that thread, the tail argument is gone, and the cheaper large chunk wins. The
+> cadence, the file discipline and the shadow budget are unaffected — they are about a log, a rename and a
+> map, none of which care which thread the bytes leave on.
+
+§15 is the format, the coverage rule, replay and the stable read. This is the other half it names as
+missing: where the bytes go, how often, and how fast. `pending/src/snapshots.rs` is the code.
+
+### The cadence is a distance, and that is what removes the clock
+
+What recovery costs is the effects it replays. What the log has to retain is the entries it keeps. Both are
+counted in log positions, so an interval measured in them needs no clock at all — not the wall clock, which
+steps backwards and restarts, and not a monotonic one, which restarts at zero and so cannot express "since
+the last snapshot" across a restart either.
+
+It also behaves better than a duration in both directions. A node applying nothing writes no snapshots,
+because there is nothing new to write down. A node at ten times the rate writes them ten times as often,
+without anybody configuring that.
+
+**The unit is a committed batch, not an effect.** `ApplyIndex` is a batch's position in the log — gapless
+across committed batches, which is what makes "everything up to here" well formed (§15). So `--snapshot-every
+200` is two hundred batches, and what that is in effects is the batch size: a run at 100k/s reports about
+eighty effects a batch, so two hundred batches is sixteen thousand effects. A deployment converts once, from
+the log it means to retain.
+
+### The throttle: a round's worth, and the tail is what picks it
+
+The dump's own work is nothing. 42.7GB of stream costs the engine three to eight seconds (`cargo bench -p
+ledger-pending --bench snapshot`) against 85 seconds of a 500MB/s volume, so what the throttle paces is a
+device and the worker's own thread — not this code.
+
+Measured with `partial-settle`, five seconds, continuous dumping (`--snapshot-every 1`). **Every row carries
+its own baseline, run immediately before it**, because this machine drifts about ten percent over an hour of
+sustained benchmarking — §10 has what that cost once:
+
+| bytes a round | baseline tx/s | with a dump | cost | wrote in 5s | cost per MB/s | p50 at 1M/s (base → dump) |
+|---|---|---|---|---|---|---|
+| 4,096 | 2,665,485 | 2,437,503 | 8.6% | 111.0MB | **0.39%** | 1,338 → 1,543µs |
+| 16,384 | 2,541,173 | 2,476,099 | 2.6% | 224.6MB | 0.06% | 1,339 → 4,182µs |
+| 65,536 | 2,590,420 | 2,344,523 | 9.5% | 399.9MB | 0.12% | 1,339 → 6,701µs |
+| 262,144 | 2,295,636 | 2,102,705 | 8.4% | 677.4MB | 0.06% | — |
+| 1,048,576 | 2,483,814 | 1,903,223 | 23.4% | 1275.1MB | 0.09% | — |
+
+**The bytes written differ per row and that is not noise** — a bigger chunk finishes a dump sooner, so more
+dumps fit in five seconds. Which is why the comparable column is the sixth: cost per MB/s written, where a
+larger chunk is straightforwardly better because the syscall is amortised over more bytes. The absolute cost
+column is a single run each and is noisy to a few points; the ratio is what transfers, and there 4KB is three
+to six times the rest.
+
+The last column is why 4,096 wins anyway, and the obvious objection to it was checked. **It is not that a
+bigger chunk writes more bytes.** At 1M/s the total written goes 2,804MB → 3,850MB → 4,036MB from 4KB to
+16KB to 64KB — up 44% — while the median goes 1,338µs → 4,182µs → 6,701µs against an unchanged baseline, up
+400%. Volume moves a tenth as fast as latency, so the chunk is the cause and not the traffic it generates.
+
+**What it is not is the write itself either**, and saying so is the difference between a measurement and a
+story. 64KB to a page cache is tens of microseconds; the median moved by five milliseconds. So what is being
+seen is queueing behind a worker that is the bottleneck for lookups and fences at this rate, not the syscall's
+own duration — the chunk sets how long the one thread every lookup passes through is unavailable, and at
+saturation that time is multiplied by the depth waiting on it. Which is exactly why the number belongs to the
+tail: a small chunk running more of the time costs the median a little, a large one running less of the time
+costs a percentile a lot, and a percentile is what the contract is written in. 64KB's 6.5ms is already past
+the 5ms one.
+
+**A round is what a dump gets, so it yields to traffic on its own.** The stage takes one chunk per worker
+round and the worker's rounds go to commands first. At 4KB the same throttle writes 558MB/s when the engine
+has rounds to spare and 35MB/s when it is saturated — sixteen times apart, from the same number. A rate limit
+in bytes a second would have had to be told.
+
+Reproduce:
+
+```
+cargo run --release -p ledgerfio -- run --workload partial-settle --duration 5s --rate 0 \
+  --snapshot-dir <path> --snapshot-every 1 --snapshot-bytes <n>
+```
+
+**Not with `--sweep`, and that is the point of writing the command this way.** A sweep runs the arms minutes
+apart with no baseline between them, which is the drift §10 describes. Each arm needs a run with no
+`--snapshot-dir` immediately before it.
+
+**Not a device's numbers.** These are writes to a page cache on macOS, the same limit `FileStore`'s reads are
+under (§16): what is priced is the syscall path and the round-sharing, not a volume. What a volume adds is the
+85 seconds above, and the throttle is what spreads it.
+
+### The shadow needed a ceiling, and it had none
+
+§15 sized the copy-on-write side buffer by arithmetic — a dump lasting a minute or two shadows tens of
+megabytes against 42.7GB for a second array — and then left it a map that grows. That is rule 20's shape
+exactly: the real bound was whichever structure ran out first, which is the allocator, and a bound expressed
+that way is one nobody declared and no build can check.
+
+It is declared now, in buckets, and breaching it **abandons the dump**. Abandoning costs the work and nothing
+else: the current snapshot is untouched, because a dump is written to a name of its own, and the cadence tries
+again. What it must not do is silently succeed at a size nobody planned.
+
+The standing population is not the total. A bucket is shadowed when it is written ahead of the cursor and
+dropped when the cursor reaches it, so with writes at rate *w* over a dump of duration *D* the peak is around
+*wD/4* rather than *wD* — and heavy dedup on a small table pulls it lower still. Measured at 4KB a round:
+**63,863 buckets (2.0MB) at the ceiling, 19,951 (0.6MB) at 1M/s** — the slower dump holding three times as
+much, which is the trade in one line.
+
+Both terms are a deployment's, so the default budget is headroom rather than a prediction: 2²¹ buckets, 64MB
+of slots, some thirty times what this machine reaches. Every run reports the peak beside the ceiling, so a
+budget that is wrong shows up as a number rather than as a dump that quietly never lands.
+
+**And the failure mode has a shape worth naming.** A throttle too slow for the cadence makes every dump long,
+a long dump shadows more, and past the budget every dump is abandoned — so nothing is ever written and the log
+can never be truncated. It reads as `abandoned` climbing with `written` at zero, which is why the report
+carries both.
+
+### One file, replaced by rename
+
+`pending.snapshot.part` is written, made durable, renamed over `pending.snapshot`, and the directory synced
+after so the name itself survives. A crash at any point leaves the previous snapshot or the new one, never a
+prefix of the new one wearing the current name — which a reader could not tell from a complete stream, since
+the header says how many records there are and a truncated file simply ends early.
+
+**One name, not a series.** An older snapshot is only restorable while the log still holds everything after
+its coverage, so keeping two would keep one that is already useless. The partial name is what gives the
+previous one its life until the moment the new one is complete.
+
+**A write that fails ends the dump rather than retrying it**, and the reason is the shadow: `next_chunk`
+consumes the shadow entries for the buckets it read, so a chunk that was produced and not written cannot be
+produced again. Retry is at the granularity of a dump, and that is the granularity the cadence already has.
+
+### Where it goes is two directories, because that is a provisioning decision
+
+`--store-dir` and `--snapshot-dir` are separate flags, and neither implies the other. The design puts the
+Raft log and the snapshot on Disk 1 (§2.2); this code does not care, and that is the point. What sharing
+changes is only the arithmetic — a shared volume measures the snapshot's share against the log's own write
+rate, a separate one against the engine's reads — and the throttle is required either way, which is what
+makes the layout somebody else's decision rather than a hole here.
+
+At a long interval the share is small in absolute terms: 42.7GB an hour is 11.9MB/s, or 2.4% of a 500MB/s
+volume. At ten minutes it is six times that, which is one more argument for the long interval §15 already
+reached on recovery grounds.
+
+### What this does not do: start a node
+
+`SnapshotDir::read_into` restores the index, the group totals and the coverage — and that is not a node. The
+engine's `RecordLog` still has no position: it does not know which block to write next or which blocks each
+day owns, so a restored engine answers lookups against the blocks that are there and **must not be written
+to**. Its one caller is a test.
+
+That is deliberate ordering rather than an omission. Deriving the ranges from the restored slots is the first
+half of a start-up reconcile, and the second half is the files a previous life left behind — where `reclaim`,
+run before an index exists, would find nothing alive and delete every one of them. Today `open_with`'s
+`O_EXCL` refusal stands in that place (§16), and it has to keep standing there until both halves land
+together. `status.md` carries it.
+
+## 20. There is one path to a device, and apply is not on it
+
+> **Decided, not built.** Nothing below is code. It is written now because the work it describes
+> invalidates numbers this repository already reports as answers — §19's throttle above all — and a measured
+> number whose arrangement is about to change reads exactly like a settled one.
+>
+> **Tried** — a pool for reads only, default off, and every other IO synchronous on the pending worker's
+> thread.
+> **Broke** — not the read pool's default, which was right and is worth saying plainly because the first
+> draft of this line said otherwise. §18 and `status.md` both record zero as "a refusal to pick rather than a
+> measurement", say the curve does not transfer ("here a read is CPU; on a device it blocks in the kernel and
+> costs nothing"), and name the condition under which zero stops being merely suboptimal and becomes the
+> ceiling. That question was asked, answered, and its limits written down.
+>
+> What broke is that **only reads were ever asked.** The block write, the `fsync`, the `unlink`, the expiry
+> sweep's block reads and now a snapshot chunk all hold the thread that answers every lookup — and that is
+> *recorded* in three places as a fact about where a cost lands, with no paragraph anywhere asking whether it
+> should. A fact stated is not a decision taken.
+> **Weighed** — **the placement of the buffer's drain was never a choice, and it must not be written up as
+> one.** Nothing in §12 or §8 asks who empties the writeback buffer; `compact()` sits at the end of `put()`
+> because that is where the buffer overflows. Two things *were* weighed here and both were refused. **A
+> second abstraction below `DurableStore`**, owning threads and queues per volume: refused, because
+> `DurableStore` already is that layer — `RecordLog` computes the offset and hands down a block, which is a
+> device's vocabulary and not a store's, and a second layer would be one job in two places (§16's own
+> "Broke" line is that complaint). **Detecting a shared volume from `st_dev`**: refused, because it is wrong
+> in *both* directions — two partitions of one NVMe have different device ids and one queue, and LVM, RAID
+> and network volumes give one id across several devices. A number that decides a queue depth cannot rest on
+> a guess.
+> **Chose** — one path to a device and it is `DurableStore`; **one instance per declared volume**, named so
+> that two directories can say they are one disk; writes become `submit`/`poll` the way reads already are,
+> with the **synchronous baseline kept** the way reads keep theirs, because it is what every number is
+> compared against and what a virtual clock can run; and **apply reduced to an append**, the drain moving to
+> the worker's round on a declared budget. A watchdog is deliberately *not* part of this — see the last
+> section.
+
+### Each part's job, and nothing else
+
+| part | does | must not |
+|---|---|---|
+| **apply** | appends the record to the writeback buffer and points the index at it | touch a device, close a block, decide when to drain |
+| **the drain** | in the worker's round, on a declared budget: compacts aged blocks, packs survivors, closes a full block, submits it | run inside apply, or drain more than its budget in one round |
+| **`RecordLog`** | segment ↔ day, address ↔ offset (§16) | own threads or a queue |
+| **`Snapshots`** | the stream, the throttle, the cadence | know which volume it is on |
+| **`DurableStore`** | *is* the device: threads, queue, ordering, depth, in-flight, counters. One per declared volume | decide what a full queue means |
+| **the caller** | decides what "full" means: apply stops, or a dump waits | reach past the store |
+| **watchdog** | *deferred, see the last section* — one thread, asleep, watching every store's in-flight table | do any IO of its own |
+
+The watchdog's row is the point of it. `status.md` records that contract 2 — a component answers within a
+bounded time — has **no detector anywhere**. A hung IO means the thread that issued it is inside a syscall,
+so the detector cannot be that thread; and it cannot be the worker's round either, because then the
+detector's liveness depends on the liveness of the thing it is watching. One sleeping thread that owns no
+IO is the only shape that survives everything else blocking.
+
+### One path, and it is the one that already exists
+
+`DurableStore` is not a store's interface that happens to reach a disk. It *is* the device abstraction, and
+the code already treats it that way:
+
+```rust
+self.store.append(self.segment, addr.block_offset(), &self.store_open.bytes)
+```
+
+`RecordLog` computes the offset. `DurableStore` is told a file, an offset and a block — which is a device's
+vocabulary, not a store's. §16's rule that the offset is a function of the address lives *above* it, and
+stays there.
+
+So the snapshot does not need a layer of its own, and the objection that it cannot use this one does not
+survive being checked. It writes 4096-byte chunks — §19's throttle is exactly one block — into a
+4096-aligned buffer, which is the alignment `Block` already carries for direct IO. The only thing that does
+not fit is that a file is named by `segment: u8`, and that is the store's way of naming, not the device's.
+
+**One instance per declared volume is what makes "the same disk" mean something.** Two writers on one
+volume share one queue because they share one `DurableStore`. Two volumes are two instances. The mapping
+from a directory to a volume is declared, for the reason in the four lines above: it decides a queue depth,
+and a queue depth derived from a guess is the same mistake this repository has now made twice in the other
+direction — reading a number of ours as a number of the device's.
+
+### What has to change, and one of the three is done
+
+1. **Writes become `submit`/`poll`.** ✅ `submit_write`, `submit_barrier` and `poll_written` replace
+   `open_with`, `append` and `sync`. A `Result` returned inline is what put the `pwrite` on the caller's
+   thread; completions are what move `unsynced` and coverage instead.
+2. **A file is named by an object id, not by `segment: u8`.** Left. The store's days and the snapshot's two
+   files would then live in one namespace, and the day ↔ segment mapping stays in `RecordLog` where it
+   belongs.
+3. **`rename` joins `remove`.** Left. The snapshot's atomic replacement needs it, and it is the same kind of
+   operation: a namespace change rather than a block one.
+
+`MemoryStore` answers a write the moment it takes it, which is what keeps it the exact baseline every number
+in these documents was taken against. `LatencyStore` still charges its write and barrier costs to the
+*thread* rather than to a queue, and that is deliberate until the lane is the default: a model that priced a
+write as a queue's cost while the backing did it inline would be describing something that is not there.
+
+### Ordering belongs to the implementation, the reaction belongs to the caller
+
+The read side commutes. The write side does not:
+
+- `open_with(file)` brings it into being, so it precedes every write to it.
+- `fsync` must follow every write it claims to have covered. §15's boundary rests on that — coverage is "what
+  a crash would still find", and a barrier that overtook a write it was meant to cover would name blocks a
+  restart cannot read.
+- `unlink(file)` must not overtake a read of it. **Today this holds by accident**: `FileStore` hands the pool
+  an `Arc<File>`, so an in-flight read of an unlinked file still succeeds under unix semantics. Rule 18 is
+  about exactly this — it holds by a coincidence of how the pieces behave, and it should be decided once.
+
+All three are the implementation's, beside the queue they order. What is *not* the implementation's is what a
+full queue means. The store says "full" — `submit` already returns `false` for it — and the caller decides:
+`RecordLog` stops applying, so backpressure reaches the client; `Snapshots` lets the dump wait, and never
+touches apply. One queue cannot express two reactions, so it does not try to.
+
+### Every device operation there is, and where it comes from
+
+| operation | reached from | how often |
+|---|---|---|
+| `open_with` / `append` | `seal_store_block` ← `keep` ← `compact` ← `put` ← **`apply_effect`** | every 51 survivors |
+| `open_with` / `append` | `seal_store_block` ← **`open_day`** ← `sweep_expiry`, in the worker's round | once a day, closing a partial block so one block never spans two days |
+| `fsync` | `RecordLog::sync` ← the worker's round | every round |
+| `unlink` | `free_segment` ← `reclaim` ← `sweep_expiry` | when a day empties |
+| `read_at` | **the expiry sweep**, `each_record_in_day` ← `propose_expiry` | `expiry_blocks_per_round` a round while a day is being emptied |
+| `read_at` | the apply-path fallback, `RecordLog::read` | measured at **zero** — the record it wants was appended moments ago and the buffer is an hour wide |
+| `submit` / `poll` | a lookup that missed both memory windows | the only one with a lane, and it is off by default |
+| snapshot chunk | `Snapshots::step`, in the worker's round | §19's throttle |
+
+Two rows are easy to miss and both were missed once here. The **day rollover** already issues a device write
+outside apply. The **expiry sweep** already issues device reads on the worker's thread, and unlike the apply
+fallback it is not zero — `swept_blocks` counts it.
+
+The apply-path cost is neither absent nor amortised, which is the worst shape for a tail. `hold-settle` at
+100k/s for two seconds appends 100,032 records, 58% die in the buffer, and **nothing reaches the store** —
+`engine record blocks peak 0`. The same workload with `--resolve-after 900000` appends 500,032, none die,
+458,388 are carried on and 8,987 blocks are written: **one 4KB `pwrite` every 56 applies.**
+
+### Terminology, because two words are doing three jobs
+
+| word | means | what the code does today |
+|---|---|---|
+| **flush** | reaches the device | `flush_window_hours` means this. The `flushed` counter does **not** — it counts a survivor leaving the buffer for the block being packed, which is memory. The load driver already prints it as `carried on`, a label working around a name |
+| **seal** | a block is closed: no more records go in, its bytes stop changing, and a whole-block checksum becomes possible | `seal_store_block` closes **and** writes, in one call |
+| **compaction** | dropping what the index no longer points at, on the way out of the buffer | `compact()`, and this one is right |
+
+`seal_store_block` merging two events is not a naming complaint. **It is why the write cannot move without
+touching everything**: there is no seam between "this block is closed" and "this block is on the device", so
+nothing can hold the first and submit the second.
+
+Renaming waits for the work rather than going first. `flushed` will count a different event once a drain
+exists, and renaming a counter twice is worse than carrying a written-down divergence for one piece of work.
+
+### Handing a block over costs nothing, and the first version of this section said otherwise
+
+A sealed block is already kept in memory: `seal_store_block` pushes it straight into residency, which is a
+day wide. So the bytes a write needs are bytes the engine was going to hold anyway, and the block is
+immutable from the moment it is sealed — its own comment says so, because that is what makes a whole-block
+checksum possible. An `Arc<Block>` shared between residency and the queue costs one clone and no copy, which
+is the same thing `FileStore` already does with `Arc<File>` for the read pool.
+
+An earlier draft claimed the drain would stall waiting for buffers to come back. That was about the wrong
+buffer: what goes to the device is the packed block, not the buffered one, and the buffered one is dropped
+as soon as its survivors are copied out.
+
+### The drain leaves apply, and that is three changes rather than one
+
+`compact()` is the drain: it takes the oldest buffered block, asks the index which of its records are still
+alive, copies those into the block being packed, and drops the rest. It is the last thing `put()` does
+(`engine.rs:541`), so applying a committed effect is what empties the buffer. Nothing chose that.
+
+It moves to the worker's round, beside the sweep, the sync and the snapshot. **The move is one line; what
+comes with it is two more things, and they are the reason this is a decision rather than an edit.**
+
+1. **A declared budget, in blocks a round.** Today the call is `while over_window()`, so a single apply
+   drains however far behind the buffer is — a ceiling of "whatever has piled up", which is rule 20's shape.
+   In the round it becomes a number, like `expiry_blocks_per_round`.
+2. **A stall when the producer outruns it.** This is the real cost and it is worth stating plainly: today
+   the flush window cannot be exceeded, because the producer *is* the drain — put one in, take one out.
+   That invariant holds by the arrangement rather than by anybody declaring it, which is rule 18 exactly. Move
+   the drain and a round can dequeue thousands of commands (`drain_commands` empties the queue) while
+   draining a budget's worth, and the buffer grows. So apply has to pause when the buffer is over its window.
+   New machinery, and the thing that makes this cost real.
+
+What it buys, and the third is the one that matters most:
+
+- **apply costs the same every time.** Today one apply in fifty-one pays a whole block's compaction — fifty-one
+  index probes plus the survivors' copies and repoints — and the other fifty pay nothing.
+- **the drain gets a ceiling that is declared** instead of one that is whatever the backlog happens to be.
+- **the drain becomes measurable on its own.** It was mixed into apply's time and could not be separated,
+  which is why nobody knew what it cost — and that number is the one that decides whether the drain ever
+  deserves a thread. See below.
+
+**Measured, the move costs nothing.** Two binaries alternated run by run — the code before it and the code
+after — on `partial-settle` at `--rate 0` for five seconds: 2,565,062 / 2,593,593 / 2,501,341 before against
+2,603,295 / 2,668,855 / 2,556,328 after, the moved version ahead in all three pairs. The same work happens,
+and moving it out of the apply path does not make it cost more.
+
+**It first appeared to cost eight percent, and that was a measurement fault rather than the change.** The
+comparison was against a baseline taken an hour earlier; re-measuring the *unchanged* code at that moment
+gave the same figure the change did. §10 has the rule that came out of it: interleave the arms, because
+`--repeat` sees noise within a set and cannot see drift between sets.
+
+**And the stall is real but rare.** At the ceiling a five-second run reports 984 applies deferred against
+214,138 blocks drained, and disabling the ceiling entirely changes throughput by nothing — so what the
+ceiling costs is a round's delay for one command, not a rate limit. A stall count that grows with the run is
+a store that cannot keep up, which is the thing it exists to make visible.
+
+### Closing a block and writing it are two calls now, and the read path had to learn about the gap
+
+`seal_store_block` did both: it stamped the checksum — the one moment a block's bytes stop changing — and it
+issued the `pwrite`. **That merge is why the write could not be moved anywhere**, because there was no seam
+to hold the first half and hand off the second.
+
+They are apart now. Closing pushes the block onto `pending_writes`; `submit_writes` offers them to the store,
+oldest first, and `collect_writes` takes the answers — and only on the answer does the block enter residency. Today one call follows the other inside the same round —
+`PendingEngine::drain` ends by flushing, and `sync` flushes before its barrier so a sync cannot overtake a
+write it claims to cover (rule 16). The lane is what replaces the flush; nothing above `RecordLog` changes
+when it does.
+
+**A closed block is still in memory, and two readers had to be told.** `try_read` now looks in
+`pending_writes` between the block being filled and residency, because a lookup that missed it would go to a
+device the block has not reached. And the expiry walk looks there too — which is a *different* argument from
+residency's and worth separating: residency is a window a validated configuration bounds below the retention
+period, so an expired day's blocks are provably out of it, while `pending_writes` is this instant's and no
+day's age says a block cannot be in it. It cannot happen in the round as the round is ordered today, the
+sweep running before the drain — and an invariant resting on an ordering is exactly what rule 18 says not to
+leave standing. The queue holds at most one round's closes and is normally empty there, so the check costs
+nothing.
+
+**Coverage is untouched by the split, deliberately.** `unsynced` is recorded at the *close*, so a block that
+is closed and not yet written is already outside what a snapshot may carry — which was true before, and is
+now true for one more reason.
+
+Measured, and this is where the measurement runs out: eleven interleaved pairs give a mean of −1% with a
+spread of ±7%, which is the machine's own band (§10). There is no mechanism here that could cost a percent —
+a `VecDeque` push and pop per sealed block, and a scan of a normally-empty queue — so the honest reading is
+that the split is free and the numbers are too noisy to say more.
+
+### The write lane, and what it was worth
+
+Writes are submitted and answered for, the way reads already were: `submit_write`, `submit_barrier`,
+`poll_written`. `FileStore` serves them on **one** thread — not a pool, because writes do not commute. A
+segment's first block brings the segment into being, so it has to land before the ones after it, and a
+barrier has to follow every write it claims to have covered. One thread on one queue keeps both orders for
+free; a pool would keep neither.
+
+`MemoryStore` answers immediately, which makes it the baseline it always was, and **zero threads stays a
+supported setting** for the same two reasons zero read threads does: it is what every number is compared
+against, and a real thread underneath a virtual clock measures neither of the two.
+
+### The invariant this broke, and the four patches that hid it
+
+**A block that is not in the memory tier has already been written.** That is what lets a read fall through to
+the device without asking anything: if residency does not have it, the device does. Nothing wrote it down,
+because the structure made it true — a block was written by the call that closed it, so *closed*, *written*
+and *resident* were one event.
+
+Submitting the write split that event, and residency was filled at **completion**. A block could then be
+closed, unwritten and unresident all at once, and the invariant was gone. What followed is worth recording
+exactly, because it is the shape of the mistake rather than the mistake:
+
+1. Lookups started missing those blocks — so a lookup path was added to search the two new queues.
+2. The expiry walk missed them too — so the same search was added there.
+3. `LatencyStore` answers a refused write ahead of pending ones, so residency filled out of order and a read
+   of block 0 returned block 1's record — so completions were reassembled into block order.
+4. And a per-block number check was proposed, so a positional lookup could catch itself.
+
+**Four patches, one cause.** Each made the next look local rather than like evidence that the block had been
+put somewhere no reader expected. The repair is none of them, and it is what the code does now: **residency
+takes the block when it is closed**, and a completion only decides when it may be *evicted*. All four patches
+came out with it — the two extra search paths, the reassembly of completions into block order, and the
+per-block check that was proposed to catch what the reassembly might miss. What is left in their place is one
+condition on eviction: a block whose write is outstanding does not leave memory. Residency may therefore sit
+above its window by as many blocks as the store will hold writes for, which is its queue depth and so a
+number somebody declared.
+
+The test that found it now guards the structure rather than the symptom: it asserts every block is still
+answered **from memory**, and putting residency back on the completion makes it fail with `RecordAddr(0) was
+not in memory` rather than with a wrong record.
+
+CLAUDE.md rule 22 is this generalised: when a call stops being synchronous, the question is who was relying
+on it being synchronous, and it is asked of the code that already exists rather than of the code being
+written.
+
+**Completion order is not block order, and residency depended on it being so.** Blocks used to enter the
+residency window as the store answered for them, which was the same thing while the write was a synchronous
+call that could not answer out of turn. It is not the same thing once a write is submitted: `LatencyStore`
+answers a write it *refused* ahead of the ones the store below is still holding, which is what every
+`--store-fault-every` run and every faulted simulator seed produce. One block entering early is enough,
+because residency finds a block by arithmetic — its number minus `oldest_resident` — and `Filling::get`
+decodes at an index without checking whose block it is. A read of block 0 came back with block 1's first
+record, under the key it had asked for.
+
+Blocks now leave the submitted queue **from the front and only from the front**: one that is answered early
+waits for the ones in front of it. What made the original wrong is rule 18 exactly — the ordering held
+because of how one implementation happened to behave, and nothing said so. It is the store's own model that
+broke it, which is the useful part: the fault injection this repository built to exercise a seal is what
+found a defect in the path beside it.
+
+**The barrier state machine is where the other risk was, so it is worth stating exactly.** A block closed while a
+barrier is outstanding is *not* covered by that barrier, so it joins a second run (`after_barrier`) rather
+than the one the barrier will clear. On a completed barrier `unsynced` becomes that second run; on a failed
+one the two are contiguous and the older stands. Folding them together instead would let a completed barrier
+claim a block the device was never asked about — and a snapshot would then carry slots naming a block a
+restart cannot read, which is the one failure §15's whole boundary exists to prevent.
+
+**Measured, and this is the result the whole section was for.** `hold-settle` at 200k/s for five seconds with
+`--resolve-after 900000`, against real files, three interleaved pairs:
+
+| | p99 | p99.9 | max |
+|---|---|---|---|
+| synchronous | 73.5 – 85.0ms | 103 – 124ms | 110 – 131ms |
+| write lane | **1.68ms** | **3.4 – 3.7ms** | 6.5 – 6.9ms |
+
+**A factor of thirty-one on p99.9, three pairs out of three**, which is two orders past this machine's ±7%
+band (§10). And throughput at the ceiling with real files gains too: +8.7, +6.9, +7.7, +8.3 percent, four
+pairs out of four.
+
+The size of it is the part worth keeping. This is **macOS with a page cache**, where a `pwrite` is a memcpy
+and the interesting device costs are absent — and it still moved the tail by thirty times, because `fsync` is
+a real durability barrier whatever the cache does, and it was running on the thread that answers every
+lookup. Every earlier tail measurement in this repository was taken with that in the path.
+
+### Why the drain does not get a thread, and what would change that
+
+A thread for the drain is the textbook writeback cache, and it is refused here for one reason: the drain's
+work is mostly *index* work, and the index has one owner. `points_at` for every record on the block,
+`replace` for every survivor — against a table that apply writes, every lookup reads, and a snapshot shadows,
+all on the worker's thread.
+
+Four ways round it were considered and all of them fail or collapse:
+
+| | why not |
+|---|---|
+| lock the index | rule 10 forbids a lock on this path |
+| the drain thread owns the index | every lookup would reach the index through a queue — the whole engine inverts |
+| partition by bucket range | a cuckoo kick moves entries between arbitrary buckets, so there is no partition |
+| the worker computes the survivors and the thread packs them | the index work stays with the worker, and that is most of the cost — this collapses into the round |
+
+So a drain thread is really the question *who owns the index*, which is a different and much larger piece of
+work. And it cannot be judged today, because the drain has never been measured apart from apply. Moving it to
+the round is what produces that measurement; the decision to give it a thread waits for the number.
+
+### What blocks, and it is one thing
+
+Nothing, in the ordinary case: the drain submits and goes on.
+
+The exception is a queue that stays full, which means the device is *sustainably* slower than the ledger
+produces records. Then apply stops and backpressure reaches the client. That is a capacity fact rather than a
+threading one — an unbounded buffer is not an alternative to it, it is the same failure with the signal
+removed (rule 12).
+
+### What this invalidates, so nothing reads as settled that is not
+
+| number | why it moves |
+|---|---|
+| §19's throttle, 4096 bytes a round | chosen entirely because the chunk holds the worker's thread |
+| the closed decision *How often should the engine make its blocks durable?* | its evidence is `--store-write 50` costing 29% of throughput, which is a worker-thread cost |
+| §16's *a device's cost is charged where it lands* | `LatencyStore` charges writes and syncs to the thread (`busy_until`); they become a queue's cost |
+| §18's read-pool curve | it is a count of spare cores, and a write queue competes for the same ones |
+| `--store-queue-depth`, `--store-read-threads` | they are a volume's properties, and there is no volume today — only a store |
+| `--store-write` / `--store-sync` | they model thread occupancy |
+
+### What is built, and what is left
+
+| | |
+|---|---|
+| the drain out of apply, on a declared budget, with the stall it needs | **built** |
+| closing a block and writing it as two calls | **built** |
+| writes submitted and completed, with the barrier's bookkeeping | **built** |
+| a write lane: one thread, ordered, synchronous baseline kept | **built** |
+| the snapshot on the store — object ids, `rename`, a padded stream | left |
+| one store instance per declared volume | left, and behind a configuration question |
+| the watchdog | left, deliberately — see below |
+
+The three left are structural rather than load-bearing: the payload of this section is that the block write
+and the `fsync` are off the thread that answers lookups, and the measurement above is what that was worth.
+What the snapshot's move buys is that its writes are counted, bounded and queued with everything else on the
+same volume instead of being invisible to every IO figure the tools print.
+
+### What is deliberately left out, and why each
+
+**A watchdog.** The argument for it stands — a hung IO means the thread that issued it is inside a syscall,
+so the detector cannot be that thread, and it cannot be the worker's round either, because then the
+detector's liveness depends on the liveness of what it watches. One sleeping thread owning no IO is the only
+shape that survives. It is still not built, because **there is no reaction to a detection**. `status.md`
+carries *What bounds a component's answer, and what happens when it misses that bound?* as an open decision,
+and this repository has already refused the same shape once for the same reason: there is no
+`--store-hang-every`, because a knob whose reaction does not exist tests nothing. What this work does build
+is the in-flight accounting a queue needs anyway — which is where the watchdog goes when the bound is chosen.
+
+**What `sync()` covers.** It takes no argument today, deliberately: on a filesystem a block can be durable
+inside a file whose *name* is not, so §16 made durability a fact about the store at a moment, and the
+file-then-directory order is what that one call owns. **Per-file `fsync` is not the obstacle**, and that is
+worth writing down because the no-argument signature reads like a claim that it is: `FileStore::sync` already
+calls `sync_all` on each dirty file, and `fsync(fd)` is per file by definition — `sync()` is the system-wide
+one, `syncfs` the filesystem-wide one, and neither is what this uses. The question is scope: once the
+snapshot shares an instance, one call syncs both, which is safe and wasteful, and each side's barrier becomes
+the other's latency. `status.md` carries it, for after this.
+
+**The configuration surface.** Volumes are named, which is one more flag on a tool that already has more than
+forty, and the flags are where every one of these knobs has landed by default. That is a separate piece of
+work — a declared configuration file rather than an argument list — and it is on `status.md` so that adding
+volumes here is not mistaken for a considered answer to it.

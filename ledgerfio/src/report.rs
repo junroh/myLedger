@@ -127,6 +127,15 @@ pub struct RunReport {
     /// What keeping each lane in seq order cost on top of the reads. Its own field because it is the
     /// engine's orderer's number, not the log's.
     pub order_wait: ledger_pending::OrderWait,
+    /// Buffered blocks the drain carried out, and applies it refused by falling behind. The second is
+    /// the failure the drain's move out of apply made possible, so a run has to be able to say it never
+    /// happened.
+    pub drain_work: (u64, u64),
+    /// What the snapshot stage wrote, and what the stable read cost while it did.
+    pub snapshots: ledger_pending::SnapshotStats,
+    /// The ceiling the peak above is read against. Carried beside the numbers rather than looked up
+    /// again, because a report printed after the run has no options to ask.
+    pub snapshot_shadow_budget: usize,
 }
 
 impl RunReport {
@@ -472,6 +481,37 @@ impl RunReport {
             traffic.ambiguous,
             traffic.overflowed
         );
+        // The drain, which apply no longer does. Printed always rather than only when it moved something:
+        // zero blocks drained on a workload whose holds die young is a real answer, and `stalls` above
+        // zero is the one number here that says the ledger was held back by its own bookkeeping.
+        let (drained, stalls) = self.drain_work;
+        println!(
+            "  engine drain  {} blocks carried out of the buffer ({:.1}% of the records appended), \
+             applies stalled on a full buffer={}",
+            drained,
+            share(
+                drained * ledger_pending::RECORDS_PER_BLOCK as u64,
+                traffic.appended
+            ),
+            stalls
+        );
+        // Only when a directory was named, because every field is zero otherwise and a line of zeroes
+        // reads as a measurement rather than as an absence.
+        let snapshots = self.snapshots;
+        if snapshots.written > 0 || snapshots.abandoned > 0 {
+            println!(
+                "  engine snaps  written={} abandoned={} wrote {:.1}MB, covered to {} | last dump {} \
+                 rounds, shadow peak {} of {} buckets ({:.1}MB)",
+                snapshots.written,
+                snapshots.abandoned,
+                mb(snapshots.bytes as usize),
+                snapshots.covered,
+                snapshots.last_rounds,
+                snapshots.shadow_peak,
+                self.snapshot_shadow_budget,
+                mb(snapshots.shadow_peak as usize * ledger_pending::SNAPSHOT_RECORD)
+            );
+        }
     }
 
     fn print_safety(&self) {
@@ -703,6 +743,9 @@ mod tests {
             footprints: Vec::new(),
             pending_traffic: ledger_pending::LogTraffic::default(),
             order_wait: ledger_pending::OrderWait::default(),
+            drain_work: (0, 0),
+            snapshots: ledger_pending::SnapshotStats::default(),
+            snapshot_shadow_budget: 0,
         }
     }
 

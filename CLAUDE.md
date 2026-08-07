@@ -100,7 +100,7 @@ sequencer's either — `Reactor::new` hands back queue endpoints and `ledgerfio`
 Every integrity bug found in this code so far came from one of two places, and neither is inside a
 component. Most were at a **seam**: two things that had to happen together were written as two
 statements, and something failed or intervened between them. The rest only appeared under **load**:
-something latent that every short run reached the edge of and no short run crossed. These six rules are
+something latent that every short run reached the edge of and no short run crossed. These seven rules are
 those bugs generalised.
 
 16. **A pairing is one call, not two statements.** Both overlays are taken by `take_overlays` and
@@ -146,6 +146,15 @@ those bugs generalised.
     had not skipped it — a seq gap of this node's own making, which the timing hid until a change widened
     the window. Where a request needs one and not the other, ask for one and not the other
     (`IdemAsk::Serialize`); do not skip the component.
+22. **When a call stops being synchronous, go and find the readers that assumed it was.** Making the block
+    write submit-and-complete broke an invariant nothing had written down — *a block that is not in the
+    memory tier has already been written* — because a block could now be closed, unwritten and unresident all
+    at once, and the read path's fall-through to the device rested on that being impossible. The readers were
+    then patched one at a time: a lookup path, the expiry walk, an ordering, a per-block check. Four patches,
+    one cause, and each made the next look local rather than like evidence the structure was wrong. The
+    question that catches it is one sentence — **who was relying on this being synchronous?** — and it belongs
+    to the *change*, not to the new code. Rule 18 turned on what is already there instead of on what is being
+    added. The repair is never another reader: put the block back where nothing has to look for it.
 
 ## Layout discipline
 

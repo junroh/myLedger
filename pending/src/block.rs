@@ -243,16 +243,38 @@ pub enum StoreFault {
 /// that read to the thread rather than to its queue (`take_charge`). Both are priced now; they are counted
 /// separately because only the second is what a read cache would remove.
 pub trait DurableStore {
-    /// A segment's first block, which is what brings the segment into being. One call rather than a
-    /// create followed by a write: a segment's first block *is* its creation, and two statements that
-    /// always happen together are two that can come apart (rule 16). The caller knows which of this and
-    /// `append` a write is, from the blocks it has already put there, so a backend never pays a syscall
-    /// to find out what its caller already knew.
-    fn open_with(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault>;
-    /// The next block of a segment that already exists. Same shape as `open_with` on purpose: the two
-    /// differ in whether the segment is there yet and in nothing else, and which it is is the caller's to
-    /// say.
-    fn append(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault>;
+    /// Takes a block write. `false` means the queue is full and nothing was taken — backpressure rather
+    /// than failure, so the caller keeps the block and offers it again.
+    ///
+    /// `creating` says this is the segment's first block, which is what brings the segment into being. One
+    /// call rather than a create followed by a write: a segment's first block *is* its creation, and two
+    /// statements that always happen together are two that can come apart (rule 16). The caller knows which
+    /// it is from the blocks it has already put there, so a backend never pays a syscall to find out what
+    /// its caller already knew.
+    ///
+    /// **Submitted rather than done, the way a read already is** (§20). What the caller must not assume is
+    /// that returning means written: only the completion says that, and only a barrier says durable.
+    fn submit_write(
+        &mut self,
+        handle: u64,
+        segment: u8,
+        offset: u64,
+        block: &Block,
+        creating: bool,
+    ) -> bool;
+    /// Takes a barrier. Everything submitted before it is durable once its completion arrives.
+    ///
+    /// **One call with no segment, and that is a property of a filesystem rather than a simplification.**
+    /// `fsync(fd)` makes a file's bytes durable — per file, which is what this does underneath — but a file
+    /// that has just been created also needs its directory synced, or a crash can leave durable bytes in a
+    /// file that does not exist. So durability is a fact about the store at a moment rather than a watermark
+    /// per segment, which is the optimisation someone would otherwise reach for. What a barrier covered is
+    /// the caller's to remember, because the caller is what submitted it.
+    fn submit_barrier(&mut self, handle: u64) -> bool;
+    /// The next write or barrier that has finished, by the handle it was given. `None` while none has.
+    fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)>;
+    /// Writes and barriers taken and not yet answered for.
+    fn writes_inflight(&self) -> usize;
     /// `&mut` although reading changes nothing a caller can see: a store that models a device charges
     /// the read, and one that can fail counts it.
     fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault>;
@@ -270,15 +292,6 @@ pub trait DurableStore {
     fn take_charge(&mut self) -> u64 {
         0
     }
-    /// Everything written before this returns is durable when it does.
-    ///
-    /// **One call with no argument, and that is a property of a filesystem rather than a simplification.**
-    /// `fsync(fd)` makes a file's bytes durable, but a file that has just been created also needs its
-    /// directory synced or a crash can leave durable bytes in a file that does not exist. So durability is
-    /// a fact about the store at a moment, not a watermark per segment — which is the optimisation someone
-    /// would otherwise reach for. What is covered is the caller's to remember, because the caller is what
-    /// wrote it.
-    fn sync(&mut self) -> Result<(), StoreFault>;
     /// Stops a segment existing. The one way the store shrinks: blocks are written once and never
     /// rewritten, so space comes back a whole day at a time, and only once nothing in the index points
     /// into that day.
@@ -302,6 +315,10 @@ pub struct MemoryStore {
     /// modelled a device would answer out of order; this one is the baseline that says what the
     /// structure does when the device is not the variable.
     submitted: VecDeque<(u64, u8, u64)>,
+    /// Writes and barriers, done as they are taken and answered in the order they were taken. Memory has
+    /// no queue to be behind in, so the completion is immediate — which is what makes this the baseline a
+    /// backend with a lane is measured against.
+    written: VecDeque<(u64, Result<(), StoreFault>)>,
 }
 
 /// One segment's blocks, and the offset the first of them landed at.
@@ -349,6 +366,7 @@ impl Default for MemoryStore {
         Self {
             segments: std::array::from_fn(|_| None),
             submitted: VecDeque::new(),
+            written: VecDeque::new(),
         }
     }
 }
@@ -366,7 +384,7 @@ impl MemoryStore {
     }
 }
 
-impl DurableStore for MemoryStore {
+impl MemoryStore {
     fn open_with(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
         // What `O_EXCL` is for, and a self-invariant rather than a fault: both sides of it are ours. A
         // segment brought into being twice would hold two days' blocks under one day's count.
@@ -397,6 +415,40 @@ impl DurableStore for MemoryStore {
         file.put(offset, block);
         Ok(())
     }
+}
+
+impl DurableStore for MemoryStore {
+    fn submit_write(
+        &mut self,
+        handle: u64,
+        segment: u8,
+        offset: u64,
+        block: &Block,
+        creating: bool,
+    ) -> bool {
+        let done = if creating {
+            self.open_with(segment, offset, block)
+        } else {
+            self.append(segment, offset, block)
+        };
+        self.written.push_back((handle, done));
+        true
+    }
+
+    /// Nothing to do, and nothing dishonest about that: memory has no second layer to push bytes into.
+    /// Answered anyway, so the caller's barrier bookkeeping runs here exactly as it does over a device.
+    fn submit_barrier(&mut self, handle: u64) -> bool {
+        self.written.push_back((handle, Ok(())));
+        true
+    }
+
+    fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
+        self.written.pop_front()
+    }
+
+    fn writes_inflight(&self) -> usize {
+        self.written.len()
+    }
 
     fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault> {
         into.copy_from_slice(self.block_at(segment, offset)?);
@@ -415,13 +467,6 @@ impl DurableStore for MemoryStore {
 
     fn inflight(&self) -> usize {
         self.submitted.len()
-    }
-
-    /// Nothing to do, and nothing dishonest about that: memory has no second layer to push bytes into. What
-    /// this store implements is the *barrier* — the caller learns what is covered by when it asked — and
-    /// that half is the half a test can exercise without a device.
-    fn sync(&mut self) -> Result<(), StoreFault> {
-        Ok(())
     }
 
     fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
@@ -482,6 +527,19 @@ impl BlockRange {
 }
 
 /// One block's worth of records, and how much of it is used.
+/// A block that is closed and not yet on a device: its bytes will not change again, and where it goes is
+/// already decided. What sits between the two halves `seal_store_block` used to do in one call (§20).
+///
+/// **It carries no bytes.** The block itself is already in residency, because closing is what puts it there
+/// — see `seal_store_block`. This is the note that it still has to be written.
+#[derive(Clone, Copy)]
+struct Unwritten {
+    block: u64,
+    segment: u8,
+    /// Whether this is the segment's first block, and so what brings the segment into being.
+    opening: bool,
+}
+
 struct Filling {
     bytes: Box<Block>,
     filled: usize,
@@ -578,6 +636,9 @@ pub enum OpenBacking {
         dir: std::fs::File,
         path: PathBuf,
         read_threads: usize,
+        /// Whether `pwrite` and `fsync` go to a thread of their own. False is the synchronous baseline
+        /// every number is compared against, and what a virtual clock can run (§20).
+        write_lane: bool,
     },
 }
 
@@ -589,13 +650,14 @@ impl OpenBacking {
     /// design's sixteen comes from 0.5ms against tens of thousands a second. A configuration that forces every
     /// read to miss needs an order more, and sixteen failing to keep up there is the arithmetic holding rather
     /// than the pool being wrong.
-    pub fn files(path: &Path, read_threads: usize) -> Result<Self, LedgerError> {
+    pub fn files(path: &Path, read_threads: usize, write_lane: bool) -> Result<Self, LedgerError> {
         let (dir, path) =
             crate::files::open_directory(path).map_err(|_| LedgerError::ConfigInvalid)?;
         Ok(Self::Files {
             dir,
             path,
             read_threads,
+            write_lane,
         })
     }
 }
@@ -608,11 +670,13 @@ impl StoreModel {
                 dir,
                 path,
                 read_threads,
+                write_lane,
             } => Box::new(crate::files::FileStore::new(
                 dir,
                 path,
                 self.queue_depth.max(1),
                 read_threads,
+                write_lane,
             )),
         };
         if self.is_exact() {
@@ -696,6 +760,10 @@ pub struct LatencyStore {
     queue_depth: usize,
     /// Device time charged by synchronous calls and not yet handed to whoever has a clock.
     charged_nanos: u64,
+    /// Writes and barriers this model refused, waiting to be answered as failed completions. A queue rather
+    /// than a flag because expiry is not the only thing that can have several in flight, and a dropped one
+    /// would be a block the caller waits on for ever.
+    refused: VecDeque<u64>,
     fault_every: u32,
     corrupt_every: u32,
     calls: u64,
@@ -726,6 +794,7 @@ impl LatencyStore {
             spare: Vec::new(),
             queue_depth,
             charged_nanos: 0,
+            refused: VecDeque::new(),
             fault_every: model.fault_every,
             corrupt_every: model.corrupt_every,
             calls: 0,
@@ -758,20 +827,48 @@ impl LatencyStore {
 }
 
 impl DurableStore for LatencyStore {
-    fn open_with(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
+    /// **Still charged to the thread rather than to the queue, and that is not an oversight.** §20 moves
+    /// writes onto a lane of their own, and when the backing has one this charge becomes a deadline the way
+    /// a read's is. Until then the backing still does the `pwrite` on the caller's thread, and a model that
+    /// priced it as a queue's cost would be describing a lane that does not exist yet.
+    fn submit_write(
+        &mut self,
+        handle: u64,
+        segment: u8,
+        offset: u64,
+        block: &Block,
+        creating: bool,
+    ) -> bool {
         self.charge(self.write);
         if self.refuses() {
-            return Err(StoreFault::Device);
+            self.refused.push_back(handle);
+            return true;
         }
-        self.inner.open_with(segment, offset, block)
+        self.inner
+            .submit_write(handle, segment, offset, block, creating)
     }
 
-    fn append(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
-        self.charge(self.write);
+    fn submit_barrier(&mut self, handle: u64) -> bool {
+        self.charge(self.sync);
         if self.refuses() {
-            return Err(StoreFault::Device);
+            self.refused.push_back(handle);
+            return true;
         }
-        self.inner.append(segment, offset, block)
+        self.inner.submit_barrier(handle)
+    }
+
+    /// A refusal this model invented is answered here rather than at submit: the caller is told through the
+    /// completion, which is the one path a real device's failure takes too (rule 17 — nothing observable
+    /// changes at submit but the promise to answer).
+    fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
+        if let Some(handle) = self.refused.pop_front() {
+            return Some((handle, Err(StoreFault::Device)));
+        }
+        self.inner.poll_written()
+    }
+
+    fn writes_inflight(&self) -> usize {
+        self.refused.len() + self.inner.writes_inflight()
     }
 
     /// The read that cannot be submitted and harvested: the apply path is in order and cannot park a
@@ -860,14 +957,6 @@ impl DurableStore for LatencyStore {
         self.inflight.len() + self.completed.len()
     }
 
-    fn sync(&mut self) -> Result<(), StoreFault> {
-        self.charge(self.sync);
-        if self.refuses() {
-            return Err(StoreFault::Device);
-        }
-        self.inner.sync()
-    }
-
     fn take_charge(&mut self) -> u64 {
         std::mem::take(&mut self.charged_nanos)
     }
@@ -918,6 +1007,30 @@ pub struct RecordLog {
     /// Blocks dropped out of residency, whose buffers the next seal reuses. Bounded by the window, and
     /// it makes the steady state — drop one, seal one — allocate nothing.
     spare: Vec<Filling>,
+    /// Blocks closed and not yet written. Bounded by what one drain round can close, because the same round
+    /// issues them — it is a hand-off inside a round rather than a backlog, and it becomes a real queue only
+    /// when the write leaves this thread (§20).
+    ///
+    /// They are read from as well as written from: a record on a closed block is still in memory, and a
+    /// lookup that could not see it would go to a device that has not been given the block yet.
+    pending_writes: VecDeque<Unwritten>,
+    /// Writes the store has taken and not yet answered for, by the handle it was given. Only the note
+    /// travels: the block itself is in residency the whole time.
+    ///
+    /// **What this gates is eviction, not reading.** A block whose write is outstanding may not leave
+    /// residency, or a read of it would go to a device that has not been given it — which is the invariant
+    /// the whole read path rests on: *a block that is not in the memory tier has already been written*
+    /// (rule 22).
+    submitted_writes: VecDeque<(u64, Unwritten)>,
+    /// The barrier in flight, if any. **One at a time on purpose**: a barrier covers everything submitted
+    /// before it, so a second while one is outstanding covers a subset of the first and buys nothing.
+    barrier: Option<u64>,
+    /// Blocks closed *after* the barrier in flight was submitted, which it therefore does not cover. When
+    /// the barrier completes this becomes `unsynced`; when it fails, `unsynced` already covers them because
+    /// the two runs are contiguous.
+    after_barrier: Option<(u64, ApplyIndex)>,
+    /// Handles for writes and barriers. One counter, because the completion queue is one queue.
+    write_handles: u64,
     segment: u8,
     /// The blocks each day wrote, so expiry can read a day's own records instead of searching the index
     /// for them. Block numbers count on across day boundaries, so a day owns a contiguous range and two
@@ -994,6 +1107,11 @@ impl RecordLog {
             oldest_resident: 0,
             resident_blocks,
             spare: Vec::new(),
+            pending_writes: VecDeque::new(),
+            submitted_writes: VecDeque::new(),
+            barrier: None,
+            after_barrier: None,
+            write_handles: 0,
             segment: 0,
             days: [BlockRange::default(); SEGMENT_VALUES],
             next_block: 0,
@@ -1030,6 +1148,12 @@ impl RecordLog {
             .put_at(key, hold, at);
         self.appended += 1;
         RecordAddr::buffered(ordinal, index as u8)
+    }
+
+    /// Blocks the buffer is holding, the one being filled included. Against the window it was sized for,
+    /// this is how far behind the drain has fallen.
+    pub fn buffered_blocks(&self) -> usize {
+        self.buffer.len()
     }
 
     /// Whether the buffer is over its flush window and its oldest block is due to be compacted.
@@ -1098,20 +1222,23 @@ impl RecordLog {
     /// do. The caller decides how often; the consequence of waiting is that coverage lags, never that
     /// anything is lost, because what is not durable is still in the log.
     pub fn sync(&mut self) -> bool {
-        if self.unsynced.is_none() {
+        // Everything closed has to be *submitted* before the barrier that claims to cover it. One call
+        // rather than two statements a caller could get the wrong way round (rule 16): a barrier that
+        // overtook a write it was meant to cover would make coverage claim a block a restart cannot read.
+        // The lane keeps the order from there on, which is why the write side is a queue and not a pool.
+        self.submit_writes();
+        if self.unsynced.is_none() || self.barrier.is_some() {
             return false;
         }
-        // Nothing to react to yet, for the same reason a write has nothing: no store here can refuse. The
-        // reaction — a coverage that must stop advancing, and rule 19 if it keeps failing — arrives with a
-        // store that can fail at it.
-        if self.store.sync().is_ok() {
-            self.unsynced = None;
-        } else {
-            // Coverage stops advancing on its own — `unsynced` is what it stops at and it is still set — so
-            // a snapshot cannot claim a block this failed to make durable. The seal is for the same reason
-            // as a failed write: a device refusing is one this node cannot go on writing to.
-            self.note_fault();
+        // A barrier is not taken until the store says so, and nothing is recorded before it does (rule 17):
+        // a handle spent on a barrier the queue refused would be one nothing ever completes, and coverage
+        // would stop for ever waiting for it.
+        let handle = self.write_handles + 1;
+        if !self.store.submit_barrier(handle) {
+            return false;
         }
+        self.write_handles = handle;
+        self.barrier = Some(handle);
         true
     }
 
@@ -1179,10 +1306,16 @@ impl RecordLog {
     /// Every record of one of a day's blocks, by position within the day. `false` means the day has no
     /// block there, which is how a walk knows it has reached the end.
     ///
-    /// One store read for the whole block, and it does not try memory first. A day being expired is
-    /// `retention + grace` days old and a configuration is refused unless residency is shorter than that,
-    /// so its blocks left memory long ago — the same reason `free_segment` does not touch residency. Asking
-    /// memory would be a test whose answer is always no.
+    /// One store read for the whole block, and residency is not tried first: a day being expired is
+    /// `retention + grace` days old and a configuration is refused unless residency is shorter than that, so
+    /// its blocks left that window long ago — the same reason `free_segment` does not touch residency.
+    ///
+    /// **A block that is closed and not yet written is tried, and that is not the same argument.** Residency
+    /// is a window a validated configuration bounds; `pending_writes` is this instant's, and nothing about a
+    /// day's age says a block cannot be sitting in it. It cannot happen in the worker's round as the round
+    /// is ordered today — the sweep runs before the drain, so anything closed earlier is already issued —
+    /// and that is precisely the kind of invariant rule 18 says not to leave resting on an ordering. The
+    /// queue holds at most one round's closes and is normally empty here, so the scan costs nothing.
     ///
     /// A closure rather than an iterator because the block is decoded out of the log's own scratch buffer,
     /// so nothing is allocated per record or per block. The address goes with each record because that is
@@ -1197,6 +1330,18 @@ impl RecordLog {
         let Some(block) = self.days[segment as usize].block_at(at) else {
             return false;
         };
+        if let Some(held) = block
+            .checked_sub(self.oldest_resident)
+            .and_then(|slot| self.resident.get(slot as usize))
+        {
+            for index in 0..held.filled {
+                let addr = RecordAddr::new(segment, block, index as u8);
+                if let Some((key, hold)) = held.get(index, addr) {
+                    visit(key, hold, addr);
+                }
+            }
+            return true;
+        }
         // Where an address with its record field zeroed used to be built, which was the distinction between
         // a block and a record being made by convention rather than by the seam.
         let offset = block * BLOCK_BYTES as u64;
@@ -1420,46 +1565,191 @@ impl RecordLog {
             self.days.iter().map(|day| day.blocks as usize).sum(),
         )
     }
-
-    /// The block is written now — not durable, which is `sync`'s to say — and it stays readable anyway: the
-    /// two memory windows are independent, and this is the one place that says so. Residency is trimmed here
-    /// rather than on a schedule because this is the only event that adds to it.
+    /// **Closes the block. It does not write it**, and that split is why this exists apart from
+    /// `flush_writes` below (design notes §20).
+    ///
+    /// Closing is what a checksum needs — this is the one moment the bytes stop changing — and writing is
+    /// what a device does. They were one call, which is why the write could not be moved anywhere: there was
+    /// no seam to hold the first half and hand off the second. A closed block now waits in `pending_writes`
+    /// until something issues it, and today that something is still this thread.
+    ///
+    /// **Coverage is deliberately unaffected.** `unsynced` is recorded here, at the close, so a block that is
+    /// closed and not yet written is already outside what a snapshot may carry — which was true before and is
+    /// now true for one more reason.
     fn seal_store_block(&mut self) {
         // Stamped here and nowhere else: this is the one moment a block's bytes stop changing, which is what
         // makes a whole-block checksum possible at all.
         self.store_open.bytes.stamp();
-        let addr = RecordAddr::new(self.segment, self.next_block, 0);
         // A segment's first block is what brings it into being, and a later one lands in a segment that
         // exists. This side knows which from the day's own count, so the store is told rather than asked —
         // a real one would otherwise pay a syscall to find out what its caller already knew.
         let opening = self.days[self.segment as usize].blocks == 0;
-        let written = if opening {
-            self.store
-                .open_with(self.segment, addr.block_offset(), &self.store_open.bytes)
-        } else {
-            self.store
-                .append(self.segment, addr.block_offset(), &self.store_open.bytes)
-        };
-        // Nothing here can repair a store that would not take a block, and nothing here decides what to do
-        // about it either: the index already points at these records, so the reaction is rule 19's seal and
-        // it arrives with a store that can actually fail.
-        if written.is_err() {
-            // The index already points at every record on this block, so they are unreachable and the log
-            // says they exist. Nothing here can repair that; the sequencer seals.
-            self.note_fault();
-        }
         // The oldest block a sync has not covered, and the position it began at. Only the first seal since a
         // sync records it: later ones are newer, and it is the oldest that bounds both coverage and which
         // slots a snapshot may keep.
-        self.unsynced
-            .get_or_insert((self.next_block, self.store_open.began_at));
+        // Which of the two runs this block joins is decided by whether a barrier is outstanding. A block
+        // closed after one was submitted is not covered by it, and folding it into `unsynced` would make the
+        // barrier's completion claim a block the device was never asked about — a snapshot would then carry
+        // slots naming a block a restart cannot read, which is the one failure §15's whole boundary exists
+        // to prevent.
+        if self.barrier.is_some() {
+            self.after_barrier
+                .get_or_insert((self.next_block, self.store_open.began_at));
+        } else {
+            self.unsynced
+                .get_or_insert((self.next_block, self.store_open.began_at));
+        }
         self.days[self.segment as usize].note(self.next_block);
         let fresh = self.spare.pop().unwrap_or_else(Filling::new);
-        let sealed = std::mem::replace(&mut self.store_open, fresh);
-        self.resident.push_back(sealed);
+        let closed = std::mem::replace(&mut self.store_open, fresh);
+        // **Residency takes it now, not when the device answers.** A block that is not in the memory tier
+        // has already been written — that is what lets a read that misses here go straight to the device
+        // without asking anything else, and it is only true if closing is what puts a block in. Filling
+        // residency on completion instead left a block closed, unwritten and unresident all at once, and
+        // every reader had to be taught about the gap one at a time (rule 22, design notes §20).
+        //
+        // It also puts residency back in block order by construction — pushed at the back as blocks close,
+        // dropped from the front — which is the same shape the writeback buffer has and depends on nothing
+        // outside this file.
+        self.resident.push_back(closed);
+        self.pending_writes.push_back(Unwritten {
+            block: self.next_block,
+            segment: self.segment,
+            opening,
+        });
         self.next_block += 1;
         self.store_open.filled = 0;
+    }
+
+    /// Issues every closed block that is waiting, oldest first, and answers whether there were any.
+    ///
+    /// **In order, because writes to one segment are not interchangeable**: a segment's first block is what
+    /// brings it into being, so it has to reach the device before the ones after it. A queue keeps that for
+    /// free while one thread serves it — which is why §20 has the write side as an ordered lane and not a
+    /// pool.
+    ///
+    /// Residency is filled from here rather than at the close, so a block enters that window once a device
+    /// has actually been given it. It is trimmed here for the reason it always was: this is the only event
+    /// that adds to it.
+    pub fn submit_writes(&mut self) -> bool {
+        let mut any = false;
+        let Self {
+            store,
+            resident,
+            oldest_resident,
+            pending_writes,
+            submitted_writes,
+            write_handles,
+            ..
+        } = self;
+        while let Some(unwritten) = pending_writes.front().copied() {
+            let offset = RecordAddr::new(unwritten.segment, unwritten.block, 0).block_offset();
+            // The bytes are in residency, because closing put them there. A block with no entry there is one
+            // eviction has taken, which cannot happen before its write is answered for.
+            let Some(held) = unwritten
+                .block
+                .checked_sub(*oldest_resident)
+                .and_then(|slot| resident.get(slot as usize))
+            else {
+                break;
+            };
+            let handle = *write_handles + 1;
+            // Refused means the store's queue is full: the note stays where it is and is offered again next
+            // round. Nothing observable moves before the store has taken it (rule 17) — the handle is only
+            // spent once the submit succeeded.
+            if !store.submit_write(
+                handle,
+                unwritten.segment,
+                offset,
+                &held.bytes,
+                unwritten.opening,
+            ) {
+                break;
+            }
+            *write_handles = handle;
+            pending_writes.pop_front();
+            submitted_writes.push_back((handle, unwritten));
+            any = true;
+        }
+        any
+    }
+
+    /// Blocks closed or submitted and not yet answered for.
+    pub fn writes_outstanding(&self) -> usize {
+        self.pending_writes.len() + self.submitted_writes.len()
+    }
+
+    /// Takes every write and barrier the store has answered. Answers whether it took any.
+    ///
+    /// **A write's completion is what puts its block into residency**, so a block enters that window once a
+    /// device has actually been given it. Completions arrive in submission order because the write side is an
+    /// ordered lane (§20), which is what keeps residency's block numbers contiguous — the one property
+    /// `oldest_resident` rests on.
+    pub fn collect_writes(&mut self) -> bool {
+        let mut any = false;
+        while let Some((handle, outcome)) = self.store.poll_written() {
+            any = true;
+            if self.barrier == Some(handle) {
+                self.barrier = None;
+                match outcome {
+                    // Everything submitted before it is durable, so what is left unsynced is exactly what
+                    // was closed after it went out.
+                    Ok(()) => self.unsynced = self.after_barrier.take(),
+                    // It covered nothing. The two runs are contiguous and `unsynced` is the older, so the
+                    // later one folds into it — and if there was no older one, it becomes it.
+                    Err(_) => {
+                        let later = self.after_barrier.take();
+                        if self.unsynced.is_none() {
+                            self.unsynced = later;
+                        }
+                        self.note_fault();
+                    }
+                }
+                continue;
+            }
+            let Some(at) = self
+                .submitted_writes
+                .iter()
+                .position(|(asked, _)| *asked == handle)
+            else {
+                continue;
+            };
+            self.submitted_writes.remove(at);
+            // Nothing here can repair a store that would not take a block, and nothing here decides what to
+            // do about it: the index already points at every record on it, so they are unreachable and the
+            // log says they exist. The reaction is rule 19's seal, latched and handed over a round later.
+            if outcome.is_err() {
+                self.note_fault();
+            }
+        }
+        // Answering for a write is what lets its block leave memory, and nothing else about it changes: the
+        // block has been in residency since it was closed. Completions may arrive in any order — a store
+        // that models a device answers a write it refused ahead of ones the backing is still holding — and
+        // that no longer matters here, because nothing is placed by it.
+        self.trim_residency();
+        any
+    }
+
+    /// Drops residency's oldest blocks back to its window, and stops at one whose write is outstanding.
+    ///
+    /// **That stop is the invariant, not a nicety.** A block evicted before the device has been given it
+    /// would send the next read of it to a device that does not have it — and the read path goes there
+    /// precisely *because* a block is not here. Residency may therefore sit above its window by as many
+    /// blocks as the store will hold writes for, which is its queue depth and so a declared number.
+    fn trim_residency(&mut self) {
         while self.resident.len() > self.resident_blocks {
+            let oldest = self.oldest_resident;
+            if self
+                .submitted_writes
+                .iter()
+                .any(|(_, unwritten)| unwritten.block == oldest)
+                || self
+                    .pending_writes
+                    .iter()
+                    .any(|unwritten| unwritten.block == oldest)
+            {
+                break;
+            }
             let Some(mut dropped) = self.resident.pop_front() else {
                 break;
             };
@@ -1563,6 +1853,10 @@ mod tests {
         for index in 0..RECORDS_PER_BLOCK * 2 {
             addrs.push(log.keep(TxId(index as u128 + 1), &hold(10), ApplyIndex(1)));
         }
+        // Closing a block no longer writes it (§20): it has to be submitted and answered for before the
+        // store can be asked to lie about it, which is what the worker's round does either side of a drain.
+        log.submit_writes();
+        log.collect_writes();
         let sealed = addrs[0];
         assert!(
             log.try_read(sealed).is_none(),
@@ -1597,9 +1891,8 @@ mod tests {
         };
         let mut modelled = LatencyStore::new(Box::new(MemoryStore::default()), slow_model, 1);
         let block = Block::zeroed();
-        modelled
-            .open_with(0, 0, &block)
-            .expect("memory takes a block");
+        assert!(modelled.submit_write(1, 0, 0, &block, true));
+        assert_eq!(modelled.poll_written(), Some((1, Ok(()))));
         let mut into = Block::zeroed();
 
         assert!(modelled.submit(7, 0, 0, 0));
@@ -1623,15 +1916,217 @@ mod tests {
             ..StoreModel::default()
         };
         let mut stacked = LatencyStore::new(inner, free, 3);
-        stacked
-            .open_with(0, 0, &block)
-            .expect("memory takes a block");
+        assert!(stacked.submit_write(1, 0, 0, &block, true));
+        assert_eq!(stacked.poll_written(), Some((1, Ok(()))));
         assert!(stacked.submit(9, 0, 0, 0));
         assert!(
             stacked.poll(0, &mut into).is_none(),
             "the outer model released a read the store below had not answered"
         );
         assert_eq!(stacked.poll(1_000, &mut into), Some(Ok(9)));
+    }
+
+    /// A store that takes writes and answers for them only when asked.
+    ///
+    /// `MemoryStore` answers as it takes, so nothing is ever outstanding under it and the eviction gate is
+    /// unreachable. Shared through an `Rc` for the same reason the snapshot tests' store is: the log owns
+    /// the box, and the test has to reach past it to say when the device replies.
+    #[derive(Clone, Default)]
+    struct HoldingStore(std::rc::Rc<std::cell::RefCell<Holding>>);
+
+    #[derive(Default)]
+    struct Holding {
+        inner: MemoryStore,
+        held: VecDeque<(u64, Result<(), StoreFault>)>,
+        release: usize,
+    }
+
+    impl HoldingStore {
+        fn release_all(&self) {
+            let mut held = self.0.borrow_mut();
+            held.release = held.held.len();
+        }
+    }
+
+    impl DurableStore for HoldingStore {
+        fn submit_write(
+            &mut self,
+            handle: u64,
+            segment: u8,
+            offset: u64,
+            block: &Block,
+            creating: bool,
+        ) -> bool {
+            let mut held = self.0.borrow_mut();
+            if !held
+                .inner
+                .submit_write(handle, segment, offset, block, creating)
+            {
+                return false;
+            }
+            while let Some(done) = held.inner.poll_written() {
+                held.held.push_back(done);
+            }
+            true
+        }
+
+        fn submit_barrier(&mut self, handle: u64) -> bool {
+            let mut held = self.0.borrow_mut();
+            if !held.inner.submit_barrier(handle) {
+                return false;
+            }
+            while let Some(done) = held.inner.poll_written() {
+                held.held.push_back(done);
+            }
+            true
+        }
+
+        fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
+            let mut held = self.0.borrow_mut();
+            if held.release == 0 {
+                return None;
+            }
+            let done = held.held.pop_front()?;
+            held.release -= 1;
+            Some(done)
+        }
+
+        fn writes_inflight(&self) -> usize {
+            self.0.borrow().held.len()
+        }
+
+        fn read_at(
+            &mut self,
+            segment: u8,
+            offset: u64,
+            into: &mut Block,
+        ) -> Result<(), StoreFault> {
+            self.0.borrow_mut().inner.read_at(segment, offset, into)
+        }
+
+        fn submit(&mut self, handle: u64, segment: u8, offset: u64, now: u64) -> bool {
+            self.0
+                .borrow_mut()
+                .inner
+                .submit(handle, segment, offset, now)
+        }
+
+        fn poll(&mut self, now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
+            self.0.borrow_mut().inner.poll(now, into)
+        }
+
+        fn inflight(&self) -> usize {
+            self.0.borrow().inner.inflight()
+        }
+
+        fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
+            self.0.borrow_mut().inner.remove(segment)
+        }
+    }
+
+    /// **A block that is not in the memory tier has already been written**, and a store answering out of
+    /// order must not be able to change that.
+    ///
+    /// Residency is filled when a block is *closed*, so the queue is in block order by construction and a
+    /// completion places nothing. It only opens eviction. Filling it on completion instead — which is what
+    /// this once did — left a block closed, unwritten and unresident at the same time, and `LatencyStore`
+    /// answering a write it refused ahead of ones the backing still held put residency out of order: a read
+    /// of block 0 came back with block 1's first record.
+    ///
+    /// Every read here has to be answered and answered correctly, because none of these blocks may have left
+    /// memory: the faults mean some of their writes never landed, and eviction is what waits on those.
+    #[test]
+    fn a_write_answered_out_of_order_does_not_shift_the_blocks_beside_it() {
+        let model = StoreModel {
+            // Every other call, so refusals land among writes the store below has taken.
+            fault_every: 2,
+            queue_depth: 8,
+            ..StoreModel::default()
+        };
+        // Residency wide enough to hold every block, so what is asserted is where they sit in it.
+        let mut log = RecordLog::new(model.build(OpenBacking::Memory, 5), 1, 64);
+        let mut kept = Vec::new();
+        for index in 0..RECORDS_PER_BLOCK * 6 {
+            log.append(TxId(index as u128 + 1), &hold(10), ApplyIndex(1));
+        }
+        for index in 0..RECORDS_PER_BLOCK * 5 {
+            let key = TxId(index as u128 + 1);
+            kept.push((key, log.keep(key, &hold(10), ApplyIndex(1))));
+        }
+        log.submit_writes();
+        log.collect_writes();
+
+        // Residency here is wider than the blocks this makes, so nothing has been evicted and every one of
+        // them must still answer from memory. That is a property of the sizing rather than a rule — the
+        // rule is that a block *not* in memory has been written, and the next test is the one about that.
+        for (key, addr) in &kept {
+            let found = log.try_read(*addr);
+            assert!(
+                found.is_some(),
+                "{addr:?} left memory although residency is wide enough to hold every block here"
+            );
+            assert_eq!(
+                found.expect("just checked").0,
+                *key,
+                "{addr:?} came back with another block's record, so residency is not in block order"
+            );
+        }
+    }
+
+    /// **A block whose write is outstanding does not leave memory**, which is the one condition holding up
+    /// the invariant that a block not in memory has been written.
+    ///
+    /// It needs a store that takes a write and does not answer for it, because `MemoryStore` answers as it
+    /// takes and nothing is ever outstanding — so the gate is never reached and no other test here can meet
+    /// it. Residency is one block wide against four, so without the gate three of them would be evicted
+    /// into a device that has not been given them.
+    #[test]
+    fn a_block_whose_write_is_outstanding_does_not_leave_memory() {
+        let store = HoldingStore::default();
+        let mut log = RecordLog::new(Box::new(store.clone()), 1, 1);
+        let mut kept = Vec::new();
+        for index in 0..RECORDS_PER_BLOCK * 6 {
+            log.append(TxId(index as u128 + 1), &hold(10), ApplyIndex(1));
+        }
+        // Five blocks' worth of survivors seals four: the fifth block's records are in the block being
+        // packed, which is full and not yet closed.
+        for index in 0..RECORDS_PER_BLOCK * 5 {
+            let key = TxId(index as u128 + 1);
+            kept.push((key, log.keep(key, &hold(10), ApplyIndex(1))));
+        }
+        log.submit_writes();
+        log.collect_writes();
+        assert_eq!(
+            log.writes_outstanding(),
+            4,
+            "the store answered writes it was supposed to be holding"
+        );
+
+        // Residency is one block; four are outstanding, so all four have to still be here.
+        for (key, addr) in &kept {
+            let found = log.try_read(*addr);
+            assert_eq!(
+                found.map(|(found, _)| found),
+                Some(*key),
+                "{addr:?} left memory while its write was outstanding, so a read of it would go to a \
+                 device that has not been given it"
+            );
+        }
+
+        // Answered, and now the window applies: the oldest blocks go, and the store is what has them.
+        store.release_all();
+        log.collect_writes();
+        assert_eq!(log.writes_outstanding(), 0);
+        let (key, oldest) = kept[0];
+        assert!(
+            log.try_read(oldest).is_none(),
+            "the window did not apply once the writes were answered"
+        );
+        assert_eq!(
+            log.read(oldest).map(|(found, _)| found),
+            Some(key),
+            "a block the window dropped was not on the store, which is the whole of what the gate buys"
+        );
     }
 
     /// Every field, both ways. A format that loses one field silently is a store that answers with

@@ -180,6 +180,16 @@ fn print_help() {
         "  --store-corrupt-every <n>   (0) flip a bit in every nth block read: a device that answers wrongly"
     );
     println!("  --store-dir <path>          (unset) put segment files here; unset is memory");
+    println!("  --store-read-threads <n>    (0) threads issuing the store's preads; 0 reads synchronously");
+    println!("  --store-write-lane <0|1>    (0) put pwrite and fsync on a thread of their own");
+    println!(
+        "  --snapshot-dir <path>       (unset) put snapshots here; its own volume, so its own flag"
+    );
+    println!(
+        "  --snapshot-every <n>        (0) log positions between snapshots — a distance, so no clock"
+    );
+    println!("  --snapshot-bytes <n>        (64k) bytes of the stream one worker round writes");
+    println!("  --snapshot-shadow <n>       (2M) buckets the stable read may hold before a dump is dropped");
     println!("  --overlay-limit <n>         (1M) ceiling on the sequencer's own hold decisions; in flight bounds it");
     println!("  --idem-latency <us>         (1:5) idem; every request pays it");
     println!("  --violate-order-every <n>   (0) return every nth lane reply out of order");

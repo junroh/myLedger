@@ -191,6 +191,222 @@ impl Drop for ReadPool {
     }
 }
 
+/// One write, on its way to the lane. The buffer travels as a `Box` and comes back with the completion, so
+/// what moves through the queue is a pointer rather than four kilobytes and the steady state allocates
+/// nothing.
+struct WriteAsk {
+    handle: u64,
+    /// `None` is a barrier: everything asked for before it is made durable.
+    at: Option<(u8, u64, bool)>,
+    buffer: Box<Block>,
+}
+
+struct WriteDone {
+    handle: u64,
+    buffer: Box<Block>,
+    ok: bool,
+}
+
+/// `pwrite` and `fsync` on **one** thread, in the order they were asked for.
+///
+/// **One thread, not a pool, and that is the difference from the read side.** Reads commute; writes do not.
+/// A segment's first block brings the segment into being, so it has to land before the ones after it, and a
+/// barrier has to follow every write it claims to have covered — coverage rests on that (§15), and a barrier
+/// that overtook a write would name blocks a restart cannot read. One thread serving one queue keeps both
+/// orders for free. Design notes §20.
+///
+/// The lane owns the files it writes, and the directory: a barrier is the file's bytes and then the
+/// directory's entries, so both have to be on the side that issues it. The main side opens its own handles
+/// for reading, which costs a descriptor and buys single ownership on each side.
+struct WriteLane {
+    asks: Producer<WriteAsk>,
+    dones: Consumer<WriteDone>,
+    thread: Thread,
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+    /// Buffers not currently with the thread. Bounded by the depth the lane was built for.
+    spare: Vec<Box<Block>>,
+    outstanding: usize,
+}
+
+/// What the lane thread owns while it runs.
+struct LaneFiles {
+    dir: File,
+    path: PathBuf,
+    files: [Option<File>; SEGMENT_VALUES],
+    /// Segments written since the last barrier, one bit each, and whether a file came into being — a newly
+    /// created file's *name* is not durable until the directory is synced.
+    dirty: u64,
+    created: bool,
+}
+
+impl LaneFiles {
+    fn name_of(&self, segment: u8) -> PathBuf {
+        self.path.join(format!("seg-{segment:02}.blk"))
+    }
+
+    fn write(&mut self, segment: u8, offset: u64, creating: bool, block: &Block) -> bool {
+        if creating {
+            // `create_new` is `O_EXCL`, and it failing is information rather than an inconvenience: a
+            // segment's file already existing means a previous life left it there, and writing over its
+            // front would leave a mix of two days that nothing points into and nothing frees (§16).
+            let Ok(file) = FileStore::options()
+                .create_new(true)
+                .open(self.name_of(segment))
+            else {
+                return false;
+            };
+            self.files[segment as usize] = Some(file);
+            self.created = true;
+        }
+        if self.files[segment as usize].is_none() {
+            let Ok(file) = FileStore::options().open(self.name_of(segment)) else {
+                return false;
+            };
+            self.files[segment as usize] = Some(file);
+        }
+        let Some(file) = self.files[segment as usize].as_ref() else {
+            return false;
+        };
+        if file.write_at(block, offset).is_err() {
+            return false;
+        }
+        self.dirty |= 1 << segment;
+        true
+    }
+
+    fn barrier(&mut self) -> bool {
+        for segment in 0..SEGMENT_VALUES {
+            if self.dirty & (1 << segment) == 0 {
+                continue;
+            }
+            let Some(file) = self.files[segment].as_ref() else {
+                continue;
+            };
+            if file.sync_all().is_err() {
+                return false;
+            }
+        }
+        if self.created && self.dir.sync_all().is_err() {
+            return false;
+        }
+        self.dirty = 0;
+        self.created = false;
+        true
+    }
+}
+
+impl WriteLane {
+    fn new(dir: File, path: PathBuf, depth: usize) -> Self {
+        let (asks, ask_rx) = channel::<WriteAsk>(depth.max(1));
+        let (done_tx, dones) = channel::<WriteDone>(depth.max(1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopping = Arc::clone(&stop);
+        let handle = std::thread::Builder::new()
+            .name("pending-write".to_owned())
+            .spawn(move || {
+                let mut owned = LaneFiles {
+                    dir,
+                    path,
+                    files: std::array::from_fn(|_| None),
+                    dirty: 0,
+                    created: false,
+                };
+                Self::serve(ask_rx, done_tx, stopping, &mut owned)
+            })
+            .expect("a write thread");
+        Self {
+            asks,
+            dones,
+            thread: handle.thread().clone(),
+            stop,
+            handle: Some(handle),
+            spare: (0..depth.max(1)).map(|_| Block::zeroed()).collect(),
+            outstanding: 0,
+        }
+    }
+
+    /// Take one, do it, hand it back. Parked rather than spinning, for the same reason the read threads are:
+    /// a thread about to block in `pwrite` has no reason to burn a core waiting for work, and `unpark` leaves
+    /// a token so there is no lost wakeup to guard against.
+    fn serve(
+        asks: Consumer<WriteAsk>,
+        dones: Producer<WriteDone>,
+        stop: Arc<AtomicBool>,
+        owned: &mut LaneFiles,
+    ) {
+        while !stop.load(Ordering::Relaxed) {
+            let Some(ask) = asks.pop() else {
+                std::thread::park();
+                continue;
+            };
+            let ok = match ask.at {
+                Some((segment, offset, creating)) => {
+                    owned.write(segment, offset, creating, &ask.buffer)
+                }
+                None => owned.barrier(),
+            };
+            let mut done = WriteDone {
+                handle: ask.handle,
+                buffer: ask.buffer,
+                ok,
+            };
+            // Cannot overflow — the queues are as deep as what can be outstanding — but a push that failed
+            // would drop a completion the caller is waiting on for ever, so it is retried rather than
+            // trusted.
+            while let Err(returned) = dones.push(done) {
+                done = returned;
+                std::thread::yield_now();
+            }
+        }
+    }
+
+    fn submit(&mut self, handle: u64, at: Option<(u8, u64, bool)>, block: Option<&Block>) -> bool {
+        let Some(mut buffer) = self.spare.pop() else {
+            return false;
+        };
+        if let Some(block) = block {
+            buffer.copy_from_slice(block);
+        }
+        let ask = WriteAsk { handle, at, buffer };
+        match self.asks.push(ask) {
+            Ok(()) => {
+                self.outstanding += 1;
+                self.thread.unpark();
+                true
+            }
+            Err(refused) => {
+                self.spare.push(refused.buffer);
+                false
+            }
+        }
+    }
+
+    fn poll(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
+        let done = self.dones.pop()?;
+        self.outstanding -= 1;
+        self.spare.push(done.buffer);
+        Some((
+            done.handle,
+            if done.ok {
+                Ok(())
+            } else {
+                Err(StoreFault::Device)
+            },
+        ))
+    }
+}
+
+impl Drop for WriteLane {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread.unpark();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// One file per segment, in one directory. The backing a deployment has, against `MemoryStore`'s which
 /// nothing survives.
 ///
@@ -230,13 +446,33 @@ pub struct FileStore {
     /// `read_at` could never become one.
     pool: Option<ReadPool>,
     queue_depth: usize,
+    /// Writes and barriers taken and not yet collected, when there is no lane. Bounded by `queue_depth`,
+    /// which is what turns a backing that cannot keep up into backpressure rather than a queue that grows
+    /// (rule 12).
+    written: VecDeque<(u64, Result<(), StoreFault>)>,
+    /// `pwrite` and `fsync` on a thread of their own, absent when the lane was not asked for.
+    ///
+    /// **Zero threads is kept, and it is not a leftover.** It is the synchronous baseline every number is
+    /// compared against — the same role `--store-read-threads 0` plays for reads — and it is what a virtual
+    /// clock can run, since a real thread underneath a simulated one measures neither. Design notes §20.
+    lane: Option<WriteLane>,
 }
 
 impl FileStore {
     /// Takes the directory already opened by whoever validated it, so nothing here can fail at start-up on a
     /// thread that has no way to report it (rule 6).
-    pub fn new(dir: File, path: PathBuf, queue_depth: usize, read_threads: usize) -> Self {
+    pub fn new(
+        dir: File,
+        path: PathBuf,
+        queue_depth: usize,
+        read_threads: usize,
+        write_lane: bool,
+    ) -> Self {
         let queue_depth = queue_depth.max(1);
+        let lane = write_lane.then(|| {
+            let owned = File::open(&path).expect("the directory this store was opened on");
+            WriteLane::new(owned, path.clone(), queue_depth)
+        });
         Self {
             dir,
             path,
@@ -246,6 +482,8 @@ impl FileStore {
             submitted: VecDeque::new(),
             pool: (read_threads > 0).then(|| ReadPool::new(read_threads, queue_depth)),
             queue_depth,
+            written: VecDeque::new(),
+            lane,
         }
     }
 
@@ -272,7 +510,7 @@ impl FileStore {
             .ok_or(StoreFault::Missing)
     }
 
-    fn options() -> OpenOptions {
+    pub(crate) fn options() -> OpenOptions {
         let mut options = OpenOptions::new();
         options.read(true).write(true);
         #[cfg(target_os = "linux")]
@@ -288,7 +526,7 @@ impl FileStore {
     }
 }
 
-impl DurableStore for FileStore {
+impl FileStore {
     /// `create_new` is `O_EXCL`, and it failing is information rather than an inconvenience: a segment's file
     /// already existing means a previous life left it there, and writing over its front would leave a mix of
     /// two days that nothing points into and nothing frees. So it refuses, which seals — until there is a
@@ -312,6 +550,84 @@ impl DurableStore for FileStore {
             .map_err(|_| StoreFault::Device)?;
         self.note_write(segment);
         Ok(())
+    }
+
+    /// The file's bytes, then the directory's entries, and that order is why the barrier takes no segment:
+    /// on a filesystem a block can be durable inside a file whose *name* is not, so durability is a fact
+    /// about the store at a moment rather than a watermark per segment (§16).
+    ///
+    /// `sync_all` rather than `sync_data` because appending changes the file's length, and a length is
+    /// metadata: `fdatasync` does not promise it.
+    fn barrier(&mut self) -> Result<(), StoreFault> {
+        for segment in 0..SEGMENT_VALUES {
+            if self.dirty & (1 << segment) == 0 {
+                continue;
+            }
+            let Some(file) = self.files[segment].as_ref() else {
+                continue;
+            };
+            file.sync_all().map_err(|_| StoreFault::Device)?;
+        }
+        if self.created {
+            self.dir.sync_all().map_err(|_| StoreFault::Device)?;
+        }
+        self.dirty = 0;
+        self.created = false;
+        Ok(())
+    }
+}
+
+impl DurableStore for FileStore {
+    /// Done here and answered from `poll_written`, which is the synchronous baseline the way zero read
+    /// threads is: the `pwrite` still happens on the caller's thread. What the shape buys is that the lane
+    /// §20 asks for replaces the body of this method and nothing above it changes.
+    fn submit_write(
+        &mut self,
+        handle: u64,
+        segment: u8,
+        offset: u64,
+        block: &Block,
+        creating: bool,
+    ) -> bool {
+        if let Some(lane) = self.lane.as_mut() {
+            return lane.submit(handle, Some((segment, offset, creating)), Some(block));
+        }
+        if self.written.len() >= self.queue_depth {
+            return false;
+        }
+        let done = if creating {
+            self.open_with(segment, offset, block)
+        } else {
+            self.append(segment, offset, block)
+        };
+        self.written.push_back((handle, done));
+        true
+    }
+
+    fn submit_barrier(&mut self, handle: u64) -> bool {
+        if let Some(lane) = self.lane.as_mut() {
+            return lane.submit(handle, None, None);
+        }
+        if self.written.len() >= self.queue_depth {
+            return false;
+        }
+        let done = self.barrier();
+        self.written.push_back((handle, done));
+        true
+    }
+
+    fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
+        match self.lane.as_mut() {
+            Some(lane) => lane.poll(),
+            None => self.written.pop_front(),
+        }
+    }
+
+    fn writes_inflight(&self) -> usize {
+        match self.lane.as_ref() {
+            Some(lane) => lane.outstanding,
+            None => self.written.len(),
+        }
     }
 
     fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault> {
@@ -358,30 +674,6 @@ impl DurableStore for FileStore {
             Some(pool) => pool.outstanding(),
             None => self.submitted.len(),
         }
-    }
-
-    /// The file's bytes, then the directory's entries, and that order is the whole of why this call takes no
-    /// argument: on a filesystem a block can be durable inside a file whose *name* is not, so durability is a
-    /// fact about the store at a moment rather than a watermark per segment (§16).
-    ///
-    /// `sync_all` rather than `sync_data` because appending changes the file's length, and a length is
-    /// metadata: `fdatasync` does not promise it.
-    fn sync(&mut self) -> Result<(), StoreFault> {
-        for segment in 0..SEGMENT_VALUES {
-            if self.dirty & (1 << segment) == 0 {
-                continue;
-            }
-            let Some(file) = self.files[segment].as_ref() else {
-                continue;
-            };
-            file.sync_all().map_err(|_| StoreFault::Device)?;
-        }
-        if self.created {
-            self.dir.sync_all().map_err(|_| StoreFault::Device)?;
-        }
-        self.dirty = 0;
-        self.created = false;
-        Ok(())
     }
 
     /// Closed and unlinked. The unlink itself is not synced, and does not need to be: `reclaim` uses no clock
@@ -443,8 +735,12 @@ mod tests {
         }
 
         fn store_with(&self, read_threads: usize) -> Box<FileStore> {
+            self.store_lane(read_threads, false)
+        }
+
+        fn store_lane(&self, read_threads: usize, write_lane: bool) -> Box<FileStore> {
             let (dir, path) = open_directory(&self.0).expect("the scratch directory opens");
-            Box::new(FileStore::new(dir, path, 32, read_threads))
+            Box::new(FileStore::new(dir, path, 32, read_threads, write_lane))
         }
 
         fn files(&self) -> Vec<String> {
@@ -507,6 +803,7 @@ mod tests {
         let mut log = RecordLog::new(scratch.store(), 1, 0);
         let kept = seal_blocks(&mut log, RECORDS_PER_BLOCK * 3);
         log.sync();
+        log.collect_writes();
 
         let mut read = 0;
         for (key, addr) in &kept {
@@ -540,6 +837,7 @@ mod tests {
             // makes the completions distinguishable.
             let kept = seal_blocks(&mut log, RECORDS_PER_BLOCK * 20);
             log.sync();
+            log.collect_writes();
             kept
         };
         let mut store = scratch.store_with(4);
@@ -585,6 +883,57 @@ mod tests {
         );
     }
 
+    /// The write lane answers the same records the synchronous path does, and the barrier that follows a
+    /// write really does make it durable — through a thread rather than on the caller's.
+    ///
+    /// **What this is for is the ordering, not the speed.** A segment's first block brings the segment into
+    /// being, so it has to land before the ones after it, and a barrier has to follow every write it claims
+    /// to cover. One thread serving one queue is what keeps both; a pool would keep neither. So the test
+    /// submits a segment's blocks in order across a barrier and asks for every record back.
+    #[test]
+    fn a_write_lane_keeps_the_order_writes_need_and_the_records_come_back() {
+        let scratch = Scratch::new();
+        let addrs = {
+            let mut log = RecordLog::new(scratch.store_lane(0, true), 1, 0);
+            let kept = seal_blocks(&mut log, RECORDS_PER_BLOCK * 4);
+            log.submit_writes();
+            log.sync();
+            // The lane is a thread, so the answers arrive when it has done them rather than when they were
+            // asked for. Nothing else in this test may proceed until they have.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while log.writes_outstanding() > 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the lane left {} writes unanswered",
+                    log.writes_outstanding()
+                );
+                log.collect_writes();
+                std::thread::yield_now();
+            }
+            log.collect_writes();
+            assert_eq!(log.traffic().store_faults, 0, "the lane refused a write");
+            kept
+        };
+
+        // A second store over the same directory, reading what the lane wrote — which is only possible if
+        // every block landed and the segment was brought into being by the first of them.
+        let mut restarted = RecordLog::new(scratch.store(), 1, 0);
+        let mut read = 0;
+        for (key, addr) in &addrs {
+            let Some((found, back)) = restarted.read(*addr) else {
+                continue;
+            };
+            assert_eq!(found, *key, "the wrong record came back from {addr:?}");
+            assert_eq!(back.amount, 100);
+            read += 1;
+        }
+        assert!(
+            read >= RECORDS_PER_BLOCK,
+            "the lane wrote {read} records that could be read back, so the order or the barrier did not hold"
+        );
+        assert_eq!(restarted.traffic().store_corruptions, 0);
+    }
+
     /// **The test the absolute offset was chosen for.** A second store over the same directory reads the
     /// blocks the first wrote, knowing nothing but the addresses — no range restored, no directory scanned, no
     /// superblock. §16 argued it; this is the argument being run.
@@ -595,6 +944,7 @@ mod tests {
             let mut log = RecordLog::new(scratch.store(), 1, 0);
             let kept = seal_blocks(&mut log, RECORDS_PER_BLOCK * 3);
             log.sync();
+            log.collect_writes();
             kept
         };
 
@@ -636,6 +986,7 @@ mod tests {
         log.open_day(1);
         seal_blocks(&mut log, RECORDS_PER_BLOCK * 4);
         log.sync();
+        log.collect_writes();
 
         let names = scratch.files();
         assert_eq!(names.len(), 2, "two days, two files: {names:?}");
@@ -666,6 +1017,7 @@ mod tests {
         let mut log = RecordLog::new(scratch.store(), 1, 0);
         seal_blocks(&mut log, RECORDS_PER_BLOCK * 3);
         log.sync();
+        log.collect_writes();
         assert_eq!(scratch.files().len(), 1);
 
         log.free_segment(0);
@@ -686,11 +1038,16 @@ mod tests {
             let mut log = RecordLog::new(scratch.store(), 1, 0);
             seal_blocks(&mut log, RECORDS_PER_BLOCK * 3);
             log.sync();
+            log.collect_writes();
         }
         assert_eq!(scratch.files().len(), 1, "the first life left its file");
 
         let mut restarted = RecordLog::new(scratch.store(), 1, 0);
         seal_blocks(&mut restarted, RECORDS_PER_BLOCK * 3);
+        // Closing a block no longer writes it (§20): the refusal is the store's answer to the write, so the
+        // closed blocks have to be submitted and collected for there to be one.
+        restarted.submit_writes();
+        restarted.collect_writes();
         assert!(
             restarted.take_fault(),
             "a file a previous life left behind was written over instead of refused"

@@ -77,8 +77,10 @@ pub struct Options {
     /// only where the missing device would be. Zero is the exact store, which every other answer is
     /// measured against.
     pub store_read: LatencyRange,
-    /// What sealing one block costs. Unlike a read, a write is synchronous and on the engine's own thread,
-    /// so this is time no lookup gets — which is why it shows up in the tail rather than only in throughput.
+    /// What sealing one block costs. With `--store-write-lane 0` — the default — a write is on the engine's
+    /// own thread, so this is time no lookup gets, which is why it shows up in the tail rather than only in
+    /// throughput. The lane moves the real write off that thread; this charge does not follow it yet, so the
+    /// two together price something that is not there (design notes §20).
     pub store_write: LatencyRange,
     /// What making the written blocks durable costs. The knob the sync cadence turns on: an `fsync` is the
     /// longest thing a real store does synchronously, and it holds the thread every lookup passes through.
@@ -108,6 +110,25 @@ pub struct Options {
     /// deployment that bypasses the cache has to set it, and the arithmetic is Little's law on the *store
     /// read* rate: threads ≈ reads a second × the latency of one. Design notes §16.
     pub store_read_threads: usize,
+    /// Whether the store's `pwrite` and `fsync` go to a thread of their own when `--store-dir` is set.
+    /// Off by default, which is the synchronous baseline every number is compared against — the same role
+    /// zero read threads plays. Design notes §20.
+    pub store_write_lane: bool,
+    /// A directory to put the engine's snapshots in. Its own flag rather than the store's, because the two
+    /// may be separate volumes and which they are is a provisioning decision (design notes §19).
+    pub snapshot_dir: Option<&'static str>,
+    /// Log positions between one snapshot's coverage and the next dump's start — the cadence.
+    ///
+    /// A distance rather than a duration, which is what leaves this tool with no snapshot clock to inject:
+    /// what recovery costs is the effects it replays and what the log has to retain is the entries it
+    /// keeps, and both are counted here. Zero writes none, which is also what an unnamed directory does.
+    pub snapshot_every: u64,
+    /// Bytes of the stream one worker round writes — the throttle. What it trades is the shadow below: a
+    /// slower dump lasts longer, and a longer dump shadows more buckets.
+    pub snapshot_bytes: usize,
+    /// Buckets the stable read may hold aside before a dump is given up on. The declared ceiling, so a
+    /// dump that runs long is refused rather than allowed to grow (rule 20).
+    pub snapshot_shadow: usize,
     /// Holds the engine's overlay may keep before idle ones are evicted. Small enough and a resolution
     /// has to ask the engine, which is the only way a run reaches the fetch path at all.
     pub overlay_limit: usize,
@@ -174,6 +195,11 @@ impl Default for Options {
             store_corrupt_every: 0,
             store_dir: None,
             store_read_threads: 0,
+            store_write_lane: false,
+            snapshot_dir: None,
+            snapshot_every: 0,
+            snapshot_bytes: ledger_pending::DEFAULT_SNAPSHOT_BYTES_PER_ROUND,
+            snapshot_shadow: ledger_pending::DEFAULT_SNAPSHOT_SHADOW_BUDGET,
             overlay_limit: 1 << 20,
             idem_latency: LatencyRange::new(Duration::from_micros(1), Duration::from_micros(5)),
             violate_order_every: 0,
@@ -316,6 +342,13 @@ impl Cli {
             // one path per process is not a leak worth a lifetime parameter for.
             "store-dir" => options.store_dir = Some(Box::leak(value.to_owned().into_boxed_str())),
             "store-read-threads" => options.store_read_threads = Self::count(value)? as usize,
+            "store-write-lane" => options.store_write_lane = Self::count(value)? != 0,
+            "snapshot-dir" => {
+                options.snapshot_dir = Some(Box::leak(value.to_owned().into_boxed_str()))
+            }
+            "snapshot-every" => options.snapshot_every = Self::count(value)?,
+            "snapshot-bytes" => options.snapshot_bytes = Self::count(value)? as usize,
+            "snapshot-shadow" => options.snapshot_shadow = Self::count(value)? as usize,
             "overlay-limit" => options.overlay_limit = Self::count(value)? as usize,
             "idem-latency" => options.idem_latency = Self::latency(value)?,
             "violate-order-every" => options.violate_order_every = Self::count(value)? as u32,

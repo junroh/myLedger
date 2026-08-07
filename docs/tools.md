@@ -133,9 +133,11 @@ decides what the prediction is worth:
 - **The device's two kinds of cost are separate flags, because they occupy different things.** A lookup's
   read occupies the *device*: `--store-read` and `--store-iops` set a deadline per read and the engine keeps
   working while the queue serves it. A write (`--store-write`) and a sync (`--store-sync`) occupy the
-  *thread*: a real `pwrite` or `fsync` blocks, and on the engine's thread that is every lookup's latency as
-  well, so the round that ran them does nothing more until the clock passes. Zero for all of them is the
-  exact store, which every other answer is measured against. Design notes §16 has the measured curves; the
+  *thread*: a real `pwrite` or `fsync` blocks, and with `--store-write-lane 0` — the default — that is the
+  engine's own thread, so every lookup's latency includes it and the round that ran them does nothing more
+  until the clock passes. **With the lane on the real writes leave that thread but the model's charge does
+  not follow them yet** (§20), so `--store-write` and `--store-write-lane 1` together price something that is
+  not there. Zero for all of them is the exact store, which every other answer is measured against. Design notes §16 has the measured curves; the
   short of it is that a per-block write is roughly four times as expensive per microsecond as a sync, because
   one sync covers every block a round sealed and a write does not.
 - **`--store-dir <path>` puts the engine's blocks in real files**, one per segment, and unset is memory —
@@ -147,6 +149,32 @@ decides what the prediction is worth:
   here — 9% better than synchronous — and is 43% worse at sixteen, because what bounds the count is the cores
   left over after the reactor and the worker. Design notes §18 has the curve, and the reason a number read off
   one machine's spare cores does not travel.
+- **`--store-write-lane <0|1>` puts `pwrite` and `fsync` on a thread of their own.** Off by default, which
+  is the synchronous baseline the way zero read threads is — not a recommendation. It is worth far more than
+  the read pool and for a reason a page cache does not hide: measured against real files at 200k/s, p99.9
+  goes from 103–124ms to 3.4–3.7ms, because an `fsync` is a durability barrier whatever the cache does and
+  it was running on the thread that answers every lookup. **One thread, not a pool**: a segment's first block
+  has to land before the ones after it and a barrier has to follow what it covers, and one queue keeps both.
+  Design notes §20.
+- **`--snapshot-dir <path>` is where snapshots go, and it is not `--store-dir`.** Two flags because they may
+  be two volumes, and which they are is a provisioning decision the design makes elsewhere (§2.2). Naming the
+  directory is what turns the policy on: a cadence with nowhere to write does nothing, so neither flag alone
+  makes a node write files. The run reports `engine snaps` only when one was named.
+- **`--snapshot-every <n>` is a distance, not a duration**, counted in committed batches. That is why there
+  is no snapshot clock to inject: what recovery replays and what the log has to retain are both counted in
+  log positions, and a duration would need a monotonic clock that restarts at zero. A run at 100k/s reports
+  about eighty effects a batch, so the conversion is one multiplication.
+- **`--snapshot-bytes <n>` is the throttle and `--snapshot-shadow <n>` is its ceiling.** The chunk is written
+  inside one worker round, so it is a stall on the thread every lookup passes through — which is why the
+  default is small (4096) even though a larger chunk is cheaper per byte. The shadow is the buckets the
+  stable read holds aside, and a dump that breaches the budget is abandoned rather than allowed to grow; the
+  report prints the peak beside the ceiling, so a throttle too slow for its cadence reads as `abandoned`
+  climbing while `written` stays at zero. Design notes §19 has both curves.
+- **Measuring what a snapshot costs needs `--snapshot-every 1`**, which dumps continuously and is what no
+  deployment does. That is the point: it takes the duty cycle out, so the number is what a dump costs *while
+  it runs*, and a deployment multiplies by its own cadence. Read the median at `--rate 1m` and the throughput
+  at `--rate 0` — a saturated run has no median left to move, and a rate-limited one has no throughput left
+  to lose.
 - **The read queue's depth is a flag, and it bounds what a slow read can hide behind.**
   `--store-queue-depth` (128) is how many reads the store holds at once; past it reads are refused and the
   engine keeps the command. At 40,000 store reads a second, 5ms reads need about two hundred outstanding — at

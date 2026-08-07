@@ -23,6 +23,8 @@ use crate::index::{LOAD_TARGET, SLOT_BYTES};
 use crate::orderer::OrderWait;
 use crate::orderer::Orderer;
 use crate::overlay::HoldOverlay;
+use crate::snapshot::RECORD as SNAPSHOT_RECORD;
+use crate::snapshots::{SnapshotDir, SnapshotPolicy, SnapshotStats, Snapshots};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryPendingConfig {
@@ -63,6 +65,10 @@ pub struct MemoryPendingConfig {
     /// `RECORDS_PER_BLOCK`, which is also what the notice queue has to absorb before the sweep is asked
     /// again.
     pub expiry_blocks_per_round: usize,
+    /// How often a snapshot is written, how fast, and how much the stable read may hold aside while it
+    /// is. `every: 0` writes none, which is the default: where one goes is a directory the caller opens,
+    /// so a configuration alone can never make a node write files nobody asked for.
+    pub snapshot: SnapshotPolicy,
 }
 
 /// Where the engine gets the day retention is measured in.
@@ -95,6 +101,34 @@ impl DaySource {
                 .map(|since| since.as_secs() / 86_400)
                 .unwrap_or(0),
             Self::Fixed(day) => day.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// What the engine has on disk: the blocks its records live on, and the directory its snapshots go to.
+///
+/// **Two paths, because they answer to different volumes.** The design puts the Raft log and the snapshot
+/// on Disk 1 and the pending blocks elsewhere (§2.2), and nothing in this engine depends on that being the
+/// layout — a throttled dump competes with the log's commits on a shared volume and with the engine's own
+/// reads on a separate one, and the throttle is required either way. Taking two paths is what keeps the
+/// choice a provisioning decision instead of one this code made by accident.
+///
+/// Handles rather than paths, and opened by the caller: a directory that cannot be used is a
+/// configuration error, and one discovered on the worker's thread has nowhere to be reported (rule 6).
+pub struct PendingStorage {
+    pub blocks: OpenBacking,
+    /// Where a snapshot goes. `None` writes none, whatever the policy says — the two have to agree for a
+    /// node to write files, so neither alone can make it.
+    pub snapshots: Option<SnapshotDir>,
+}
+
+impl PendingStorage {
+    /// Memory, and no snapshots. What every number in the documents was taken against, and what a run
+    /// gets unless it asked for otherwise.
+    pub fn memory() -> Self {
+        Self {
+            blocks: OpenBacking::Memory,
+            snapshots: None,
         }
     }
 }
@@ -201,6 +235,41 @@ impl PendingCapacity {
 }
 
 impl MemoryPendingConfig {
+    /// Buffered blocks one round may carry out.
+    ///
+    /// **Derived from the queue, because that is the closest thing to a bound on a round's arrivals.** A
+    /// round drains the command queue, so a queue's worth of applies is a queue's worth of records and so
+    /// that many blocks over `RECORDS_PER_BLOCK`.
+    ///
+    /// **It is not a guarantee that the drain keeps up, and the first version of this comment said it was.**
+    /// A round can carry *more* than `queue_capacity` commands, because the sequencer refills the queue
+    /// while the round is emptying it — `drain_commands` pops until the queue is empty, not until it has
+    /// popped a capacity's worth. So nothing bounds a round's applies, the buffer can pass its ceiling
+    /// inside one round, and the stall below is what catches it rather than an impossibility. Measured on
+    /// `partial-settle` at 1M/s for five seconds: 4.58M applies, 89,071 blocks drained, **8 stalls** — rare
+    /// enough to cost nothing and not zero, which is the difference between a bound and a hope.
+    ///
+    /// Set beside `queue_capacity` instead of derived from it, the two could disagree, and the failure
+    /// would be a buffer that grows past the window it was sized for — silent, and visible only as recovery
+    /// taking longer than the flush window promised.
+    pub fn drain_blocks_per_round(&self) -> usize {
+        self.queue_capacity.div_ceil(RECORDS_PER_BLOCK).max(1)
+    }
+
+    /// Blocks the writeback buffer may hold before applying stops.
+    ///
+    /// The window plus one round's drain: the window is what recovery is sized for, and the slack is what
+    /// lets a round's arrivals land before the drain that follows them in the same round carries them out.
+    ///
+    /// Reaching it is ordinary rather than alarming — a round is not bounded by the queue's capacity, so a
+    /// busy one overshoots by a little and the next round's drain clears it, at the cost of one round's
+    /// delay for one command. What it is *not* is a rate limit on the ledger: the applies stall only while
+    /// the buffer is over the ceiling, and the drain that follows in the same round is what ends it. A
+    /// stall count that climbs with the run is the drain genuinely behind, which is a slow store.
+    pub fn buffer_ceiling(&self) -> usize {
+        self.capacity.flush_blocks() + self.drain_blocks_per_round()
+    }
+
     /// Refuses combinations that would misbehave silently — the same job `ReactorConfig::validate` does.
     pub fn validate(&self) -> Result<(), LedgerError> {
         let capacity = &self.capacity;
@@ -228,7 +297,14 @@ impl MemoryPendingConfig {
             // Nor longer than a record is allowed to exist: keeping one in memory past the day its blocks
             // are handed back would leave residency answering from a block the store no longer has.
             && capacity.residency_hours <= capacity.lifetime_days() * 24
-            && capacity.slots() * SLOT_BYTES <= self.index_budget_bytes;
+            && capacity.slots() * SLOT_BYTES <= self.index_budget_bytes
+            // A round that cannot write one record would never finish a dump, and a shadow budget of
+            // nothing gives up on every dump the first time anything is written behind it. Both are
+            // configurations that look like a snapshot policy and produce no snapshot, which is exactly
+            // what `validate` exists to refuse.
+            && (self.snapshot.every == 0
+                || (self.snapshot.bytes_per_round >= SNAPSHOT_RECORD
+                    && self.snapshot.shadow_budget > 0));
         if sane {
             Ok(())
         } else {
@@ -257,6 +333,7 @@ impl Default for MemoryPendingConfig {
                 queue_depth: 128,
                 ..StoreModel::default()
             },
+            snapshot: SnapshotPolicy::default(),
         }
     }
 }
@@ -400,10 +477,18 @@ struct Occupancy {
     /// What putting each lane back in order cost. Published because it is the one cost no per-read bound
     /// covers, and until now the engine computed it and nobody could read it.
     order_wait: OrderWaitGauge,
+    /// Buffered blocks the drain has carried out, and applies refused because it had not. The first is the
+    /// number the drain's move exists to produce — inside apply it could not be separated from apply's own
+    /// time — and the second is the failure mode the move created.
+    drained_blocks: AtomicU64,
+    buffer_stalls: AtomicU64,
     /// Whether the sequencer has room for more expiry voids, as it last said. The sweep offers nothing while
     /// this is false: a declined void is re-offered by the sweep and by nothing else, so without a pause here
     /// a full backlog becomes a re-offer every round. Advisory — a stale read costs one wasted offer.
     wants_expiry: AtomicBool,
+    /// What the snapshot stage has written, given up on, and held aside. Zero throughout when no
+    /// directory was named, which is how a report says "this run wrote none" rather than saying nothing.
+    snapshots: SnapshotGauge,
 }
 
 impl Default for Occupancy {
@@ -420,7 +505,44 @@ impl Default for Occupancy {
             traffic: TrafficGauge::default(),
             applied: AtomicU64::default(),
             order_wait: OrderWaitGauge::default(),
+            drained_blocks: AtomicU64::default(),
+            buffer_stalls: AtomicU64::default(),
             wants_expiry: AtomicBool::new(true),
+            snapshots: SnapshotGauge::default(),
+        }
+    }
+}
+
+/// The snapshot stage's six numbers across the thread boundary, for the same reason the orderer's four
+/// are a gauge: they are the worker's and a report is on the other thread.
+#[derive(Debug, Default)]
+struct SnapshotGauge {
+    written: AtomicU64,
+    abandoned: AtomicU64,
+    bytes: AtomicU64,
+    shadow_peak: AtomicU64,
+    last_rounds: AtomicU64,
+    covered: AtomicU64,
+}
+
+impl SnapshotGauge {
+    fn publish(&self, stats: SnapshotStats) {
+        self.written.store(stats.written, Ordering::Relaxed);
+        self.abandoned.store(stats.abandoned, Ordering::Relaxed);
+        self.bytes.store(stats.bytes, Ordering::Relaxed);
+        self.shadow_peak.store(stats.shadow_peak, Ordering::Relaxed);
+        self.last_rounds.store(stats.last_rounds, Ordering::Relaxed);
+        self.covered.store(stats.covered, Ordering::Relaxed);
+    }
+
+    fn read(&self) -> SnapshotStats {
+        SnapshotStats {
+            written: self.written.load(Ordering::Relaxed),
+            abandoned: self.abandoned.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            shadow_peak: self.shadow_peak.load(Ordering::Relaxed),
+            last_rounds: self.last_rounds.load(Ordering::Relaxed),
+            covered: self.covered.load(Ordering::Relaxed),
         }
     }
 }
@@ -469,10 +591,10 @@ impl MemoryPending {
     /// `Reactor::new` does — the sizes here are derived from declared inputs, so an incoherent
     /// declaration has to be an error at the start rather than a window nobody meant.
     pub fn start(config: MemoryPendingConfig) -> Result<Self, LedgerError> {
-        Self::start_with_days(config, DaySource::WallClock, OpenBacking::Memory)
+        Self::start_with_days(config, DaySource::WallClock, PendingStorage::memory())
     }
 
-    /// The same, with the day and the backing handed in.
+    /// The same, with the day and the storage handed in.
     ///
     /// Both come from outside rather than out of the configuration, and for the same reason: a retention
     /// window is measured in days, so a test that had to wait for one would never exercise expiry at all, and
@@ -481,7 +603,7 @@ impl MemoryPending {
     pub fn start_with_days(
         config: MemoryPendingConfig,
         days: DaySource,
-        backing: OpenBacking,
+        storage: PendingStorage,
     ) -> Result<Self, LedgerError> {
         config.validate()?;
         let (commands, command_rx) = channel(config.queue_capacity);
@@ -489,6 +611,7 @@ impl MemoryPending {
         let (notice_tx, notices) = channel(NOTICE_QUEUE);
         let occupancy = Arc::new(Occupancy::default());
         let worker_occupancy = Arc::clone(&occupancy);
+        let PendingStorage { blocks, snapshots } = storage;
         let thread = WorkerThread::spawn("pending", move |shutdown| {
             PendingWorker {
                 commands: command_rx,
@@ -497,14 +620,18 @@ impl MemoryPending {
                     config.capacity.slots(),
                     config.capacity.flush_blocks(),
                     config.capacity.resident_blocks(),
-                    config.store.build(backing, config.seed ^ 0xb10c),
+                    config.store.build(blocks, config.seed ^ 0xb10c),
                 ),
+                snapshots: snapshots.map(|dest| Snapshots::new(dest, config.snapshot)),
                 occupancy: worker_occupancy,
                 notices: notice_tx,
                 owed: VecDeque::new(),
                 expiring: Vec::new(),
                 lifetime_days: config.capacity.lifetime_days(),
                 expiry_blocks_per_round: config.expiry_blocks_per_round,
+                drain_blocks_per_round: config.drain_blocks_per_round(),
+                buffer_ceiling: config.buffer_ceiling(),
+                buffer_stalls: 0,
                 days,
                 orderer: Orderer::new(config.violate_order_every),
                 stale_answer_every: config.stale_answer_every,
@@ -542,6 +669,23 @@ impl MemoryPending {
     /// What keeping each lane in seq order cost on top of the reads themselves.
     pub fn order_wait(&self) -> OrderWait {
         self.occupancy.order_wait.read()
+    }
+
+    /// What the drain carried out and what it cost the applies behind it: blocks drained, and applies
+    /// refused because the buffer was over its ceiling. The second must stay at zero on any run that is
+    /// measuring the ledger — it means the drain fell behind, which is the one failure the drain's move out
+    /// of apply made possible (§20).
+    pub fn drain_work(&self) -> (u64, u64) {
+        (
+            self.occupancy.drained_blocks.load(Ordering::Relaxed),
+            self.occupancy.buffer_stalls.load(Ordering::Relaxed),
+        )
+    }
+
+    /// What the snapshot stage has done: dumps published and given up on, bytes, the shadow's peak, and
+    /// where the last published one covered to.
+    pub fn snapshots(&self) -> SnapshotStats {
+        self.occupancy.snapshots.read()
     }
 
     /// What this engine is holding: the store on the worker's thread, and the overlay on the
@@ -706,6 +850,9 @@ struct PendingWorker {
     commands: Consumer<PendingCommand>,
     results: StagedProducer<PendingReply>,
     engine: PendingEngine,
+    /// Where a snapshot goes and what paces it there, absent when no directory was named. The stage owns
+    /// its own state (rule 11); the worker owes it a round.
+    snapshots: Option<Snapshots>,
     occupancy: Arc<Occupancy>,
     /// The engine's own end of the notice channel.
     notices: Producer<PendingNotice>,
@@ -719,6 +866,14 @@ struct PendingWorker {
     /// keeps a day's expiry from arriving as a burst; falling behind deletes late, which is safe.
     lifetime_days: u64,
     expiry_blocks_per_round: usize,
+    /// Buffered blocks one round may carry out, and the blocks the buffer may hold before applying stops.
+    /// Both derived rather than set (`MemoryPendingConfig`), because the second only holds if the first
+    /// keeps up with a full command queue.
+    drain_blocks_per_round: usize,
+    buffer_ceiling: usize,
+    /// Applies refused because the buffer was over its ceiling. The drain falling behind, counted — it is
+    /// the failure mode the move created, so a run has to be able to say it never happened.
+    buffer_stalls: u64,
     days: DaySource,
     orderer: Orderer<PendingReply>,
     /// Claim to have applied less than it has, every nth answer. A fault: the data check on the reply is
@@ -757,17 +912,36 @@ impl PendingWorker {
                 | self.sweep_expiry()
                 | self.drain_commands()
                 | self.harvest()
+                // Writes and barriers the store has answered: blocks reach residency and a completed
+                // barrier moves coverage. Beside `harvest` because it is the same job for the other
+                // direction, and before the drain below so this round's submissions find room.
+                | self.engine.collect_writes()
                 | self.deliver()
+                // After the replies are out and before the sync, and both edges are the contract. This
+                // round's appends have to be in the buffer for the drain to see them, and what it seals
+                // has to be there for the sync below to cover. Applying no longer does this (§20).
+                | self.engine.drain(self.drain_blocks_per_round)
                 // Last, so one sync covers every block this round sealed — group commit within a round. The
                 // policy is here because it is a policy: syncing less often costs coverage and nothing else,
                 // and what it buys back is a device's fsync off the thread that answers lookups.
                 // `status.md`'s decisions list has that trade and what would settle it.
-                | self.engine.sync();
+                | self.engine.sync()
+                // After the sync, because a snapshot may carry only what a crash would find: a dump that
+                // began before it would take this round's seals as still-unwritten and leave their slots
+                // out. Costs nothing but a fresher coverage, and there is no reason to give that up.
+                | self.snapshot_round();
             // Taken after the round rather than before, because the round is what incurred it: the writes,
             // syncs and apply-path reads it just did are time this thread would have been inside a syscall
             // for. Absolute, so a real device under the model has already spent it and the gate is a no-op.
             if self.engine.take_store_fault() {
                 self.owe(PendingNotice::StoreFailed);
+                // The apply path is about to be sealed, so nothing more will be applied and a dump of a
+                // node that has stopped is bytes nobody will read. Given up on here rather than left to
+                // finish, because finishing it would keep the shadow and the file writes going for the
+                // whole of a state that is no longer moving.
+                if let Some(snapshots) = self.snapshots.as_mut() {
+                    snapshots.abandon(&mut self.engine);
+                }
             }
             let owed = self.engine.take_store_charge();
             if owed > 0 {
@@ -786,6 +960,15 @@ impl PendingWorker {
             );
             backoff.record(progress);
         }
+    }
+
+    /// This round's share of a snapshot, and nothing at all when no directory was named. The stage keeps
+    /// its own cadence and its own throttle; the worker only owes it a turn.
+    fn snapshot_round(&mut self) -> bool {
+        let Some(snapshots) = self.snapshots.as_mut() else {
+            return false;
+        };
+        snapshots.round(&mut self.engine)
     }
 
     /// First in the round, and it retries until each notice lands: news the sequencer has to act on may
@@ -873,6 +1056,15 @@ impl PendingWorker {
             .applied
             .store(self.engine.applied(), Ordering::Relaxed);
         self.occupancy.order_wait.publish(self.orderer.order_wait());
+        self.occupancy
+            .drained_blocks
+            .store(self.engine.drained_blocks(), Ordering::Relaxed);
+        self.occupancy
+            .buffer_stalls
+            .store(self.buffer_stalls, Ordering::Relaxed);
+        if let Some(snapshots) = self.snapshots.as_ref() {
+            self.occupancy.snapshots.publish(snapshots.stats());
+        }
     }
 
     fn drain_commands(&mut self) -> bool {
@@ -937,6 +1129,18 @@ impl PendingWorker {
                     self.orderer.fill(fence.lane, fence.seq, ready_at, result);
                 }
                 PendingCommand::Apply { effect, at } => {
+                    // The stall the drain's move made necessary. With the producer draining, the window
+                    // could not be exceeded — one record in, one record out — and nothing declared that;
+                    // it held because of where the call sat (rule 18). Now the drain has a budget, so the
+                    // buffer has a ceiling and applying stops at it. Backpressure from here reaches the
+                    // client, because a command the engine will not take pauses the sequencer's intake.
+                    if self.engine.buffered_blocks() > self.buffer_ceiling
+                        || self.engine.writes_outstanding() > self.buffer_ceiling
+                    {
+                        self.buffer_stalls += 1;
+                        self.deferred = Some(command);
+                        return false;
+                    }
                     if let Err(not_stored) = self.engine.write(effect, at) {
                         self.owe(PendingNotice::HoldNotStored {
                             hold: not_stored.hold,
@@ -1141,7 +1345,7 @@ mod worker_tests {
     #[test]
     fn a_day_that_runs_out_arrives_as_notices_on_the_port() {
         let (days, day) = DaySource::manual(0);
-        let mut engine = MemoryPending::start_with_days(config(), days, OpenBacking::Memory)
+        let mut engine = MemoryPending::start_with_days(config(), days, PendingStorage::memory())
             .expect("a test config");
 
         let holds = RECORDS_PER_BLOCK + 1;
@@ -1185,5 +1389,54 @@ mod worker_tests {
             offered, RECORDS_PER_BLOCK,
             "the worker handed over {offered} of {RECORDS_PER_BLOCK} expired holds"
         );
+    }
+
+    /// A snapshot reaches a directory through the real worker, and the numbers reach the port.
+    ///
+    /// The stage's own behaviour is unit-tested in `snapshots.rs` against an engine driven by hand; what
+    /// is only checkable here is the wiring — that a policy in the configuration and a directory in the
+    /// storage meet on the worker's thread, and that what the stage did is readable from the other side of
+    /// it. Every one of those is a place a working stage can be attached to nothing.
+    #[test]
+    fn a_snapshot_reaches_the_directory_and_its_numbers_reach_the_port() {
+        let path = std::env::temp_dir().join(format!("ledger-worker-snap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let dest = SnapshotDir::open(&path).expect("the scratch directory opens");
+        let mut engine = MemoryPending::start_with_days(
+            MemoryPendingConfig {
+                snapshot: SnapshotPolicy {
+                    // One committed batch is enough, so the first applies start a dump.
+                    every: 1,
+                    ..SnapshotPolicy::default()
+                },
+                ..config()
+            },
+            DaySource::WallClock,
+            PendingStorage {
+                blocks: OpenBacking::Memory,
+                snapshots: Some(dest),
+            },
+        )
+        .expect("a test config");
+
+        for id in 1..=RECORDS_PER_BLOCK {
+            let mut command = create(TxId(id as u128));
+            while engine.send(command).is_err() {
+                command = create(TxId(id as u128));
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while engine.snapshots().written == 0 {
+            assert!(
+                Instant::now() < deadline,
+                "the worker wrote no snapshot in five seconds ({:?})",
+                engine.snapshots()
+            );
+        }
+        assert!(
+            path.join("pending.snapshot").exists(),
+            "the port says a snapshot was written and the directory has none"
+        );
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

@@ -29,6 +29,16 @@ help:
 # expires — the sweep then frees each one without reading a block, and reports nothing. So the rate is held
 # down and the holds are given an age longer than the run, which leaves them alive to be found.
 #
+# The one run with directories under it is here for the same reason the `--expiry-days` one is: no other
+# line reaches those paths. Real files, the write lane and a snapshot destination are all off unless asked
+# for, so without this they would be code that only their own unit tests ever run — and the last thing to
+# rot unnoticed here was exactly that, a workload nothing outside `cargo test` exercised.
+#
+# All three in one run on purpose: what they do together is what a deployment does, and a snapshot's
+# coverage moving while the barrier that decides it completes on another thread is the interaction none of
+# them tests alone. `--resolve-after` keeps the holds alive so blocks are actually written, and the cadence
+# is small so a two-second run writes several snapshots. Both directories go with the run.
+#
 # Nothing here gates a latency target, and one reason is worth stating: a long run's tail is the dedup
 # stand-in's, not the ledger's — see `status.md`.
 verify:
@@ -36,6 +46,7 @@ verify:
 	cargo build --release --workspace --all-targets
 	cargo run --release -p ledgerfio -- run --sweep workload=all --duration 1s
 	cargo run --release -p ledgerfio -- run --workload void-heavy --duration 2s --rate 100k --resolve-after 900000 --expiry-days 6
+	blk=$$(mktemp -d); snap=$$(mktemp -d); cargo run --release -p ledgerfio -- run --workload hold-settle --duration 2s --rate 100k --resolve-after 900000 --store-dir $$blk --store-write-lane 1 --snapshot-dir $$snap --snapshot-every 200; status=$$?; rm -rf $$blk $$snap; exit $$status
 	cargo run --release -p ledgerfio -- layout
 	cargo run --release -p ledgersim -- check --seeds 32
 	cargo run --release -p ledgersim -- capacity --duration-ms 200

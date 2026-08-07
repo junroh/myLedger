@@ -72,6 +72,7 @@ fn expiring_day(holds: u64) -> PendingEngine {
         engine
             .write(create(key(at)), ApplyIndex(at + 1))
             .expect("the index took the hold");
+        engine.drain(usize::MAX);
     }
     // The day the buffer is drained into is still day zero, so a roll to the next day seals the last block
     // into it before anything else is written.
@@ -160,6 +161,7 @@ fn survivor_density(options: &BenchOptions) {
             for at in 0..HOLDS {
                 if !at.is_multiple_of(spacing) {
                     let _ = engine.write(remove(key(at)), ApplyIndex(at + 1));
+                    engine.drain(usize::MAX);
                 }
             }
             let (finished, round) = empty_one_day_timed(&mut engine, 2, &mut voids);
@@ -244,6 +246,7 @@ fn empty_one_day_timed(
             engine
                 .write(remove(void.pending_ref), ApplyIndex(day.rounds + 1))
                 .expect("a void removes rather than inserts");
+            engine.drain(usize::MAX);
         }
         if !engine.sweeping() {
             day.freed = true;

@@ -7,7 +7,10 @@ use ledger_account::MemoryAccounts;
 use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{Ack, AckOutcome, LedgerError, Transfer};
 use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
-use ledger_pending::{DaySource, MemoryPending, MemoryPendingConfig, OpenBacking, StoreModel};
+use ledger_pending::{
+    DaySource, MemoryPending, MemoryPendingConfig, OpenBacking, PendingStorage, SnapshotDir,
+    SnapshotPolicy, StoreModel,
+};
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, ReactorConfig};
 use ledger_service::{ClientEndpoint, LedgerService, ServiceConfig};
@@ -93,6 +96,9 @@ impl Runner {
             ],
             pending_traffic: stopped.reactor.pending().traffic(),
             order_wait: stopped.reactor.pending().order_wait(),
+            drain_work: stopped.reactor.pending().drain_work(),
+            snapshots: stopped.reactor.pending().snapshots(),
+            snapshot_shadow_budget: options.snapshot_shadow,
         }
     }
 
@@ -142,18 +148,38 @@ impl Runner {
                 capacity: options.capacity,
                 index_budget_bytes: options.index_budget as usize,
                 expiry_blocks_per_round: options.expiry_blocks_per_round,
+                snapshot: SnapshotPolicy {
+                    // A cadence with nowhere to write is a policy that does nothing, so the directory is
+                    // what turns it on — the same rule `--store-dir` follows.
+                    every: match options.snapshot_dir {
+                        None => 0,
+                        Some(_) => options.snapshot_every,
+                    },
+                    bytes_per_round: options.snapshot_bytes,
+                    shadow_budget: options.snapshot_shadow,
+                },
                 ..MemoryPendingConfig::default()
             },
             calendar.source(),
-            match options.store_dir {
-                None => OpenBacking::Memory,
-                Some(dir) => {
-                    OpenBacking::files(std::path::Path::new(dir), options.store_read_threads)
-                        .unwrap_or_else(|_| {
-                            eprintln!("ledgerfio: --store-dir {dir} cannot be opened");
-                            std::process::exit(2);
-                        })
-                }
+            PendingStorage {
+                blocks: match options.store_dir {
+                    None => OpenBacking::Memory,
+                    Some(dir) => OpenBacking::files(
+                        std::path::Path::new(dir),
+                        options.store_read_threads,
+                        options.store_write_lane,
+                    )
+                    .unwrap_or_else(|_| {
+                        eprintln!("ledgerfio: --store-dir {dir} cannot be opened");
+                        std::process::exit(2);
+                    }),
+                },
+                snapshots: options.snapshot_dir.map(|dir| {
+                    SnapshotDir::open(std::path::Path::new(dir)).unwrap_or_else(|err| {
+                        eprintln!("ledgerfio: --snapshot-dir {dir} cannot be opened ({err})");
+                        std::process::exit(2);
+                    })
+                }),
             },
         )
         .unwrap_or_else(|err| {

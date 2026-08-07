@@ -6,6 +6,7 @@ mod memory;
 mod orderer;
 mod overlay;
 mod snapshot;
+mod snapshots;
 
 /// The seam under the engine, in a filesystem's vocabulary: a segment is a file, brought into being by its
 /// first block and removed whole, and a block is bytes at an offset that follows from its address alone. So
@@ -21,7 +22,7 @@ pub use engine::{NotStored, PendingEngine, Started};
 /// Exported for this crate's own bench: what the index costs as it fills is the number an analytic
 /// estimate of it was guessing, and it can only be measured from outside.
 pub use index::{Candidates, HoldTable, Homeless, DEFAULT_SLOTS, LOAD_TARGET, SLOT_BYTES};
-pub use memory::{DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity};
+pub use memory::{DaySource, MemoryPending, MemoryPendingConfig, PendingCapacity, PendingStorage};
 /// Contract 1 is the engine's own work, so the structure that keeps it lives here. Exported for a
 /// simulation that drives the engine and wants to see what ordering cost it.
 pub use orderer::{OrderWait, Orderer};
@@ -32,6 +33,13 @@ pub use overlay::HoldOverlay;
 /// What the engine writes down so a log can be truncated. The same bytes a follower receives instead of
 /// entries and a restart reads instead of replaying from nothing — see design notes §15.
 pub use snapshot::{NotASnapshot, SnapshotReader, SnapshotWriter, RECORD as SNAPSHOT_RECORD};
+/// Where those bytes go, and what paces them there. A destination of its own rather than the store's,
+/// because whether the two share a volume is a provisioning decision — design notes §19.
+pub use snapshots::{
+    SnapshotDir, SnapshotPolicy, SnapshotStats,
+    DEFAULT_BYTES_PER_ROUND as DEFAULT_SNAPSHOT_BYTES_PER_ROUND,
+    DEFAULT_SHADOW_BUDGET as DEFAULT_SNAPSHOT_SHADOW_BUDGET,
+};
 
 /// The layout claims this crate owns, printed by `ledgerfio layout` beside everyone else's.
 pub const HOT_TYPES: &[ledger_base::TypeLayout] = &[index::BUCKET_LAYOUT, block::BLOCK_LAYOUT];

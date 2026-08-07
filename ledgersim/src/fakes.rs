@@ -408,6 +408,17 @@ impl PendingFake {
         if state.busy_until > state.now {
             return;
         }
+        // The drain, which applying no longer does (§20). Driven here for the same reason `reclaim` is:
+        // the simulator works the engine directly and never runs the worker, so work that moved out of
+        // apply and into the round has to be in *this* round or no seed reaches it — and this is the round
+        // the fault seeds drive, so without it a store that refuses on a write is never asked to.
+        // Unbounded because the simulator has no budget to spread: what a seed is exploring is the
+        // engine's behaviour, not how many rounds it took.
+        state.store.drain(usize::MAX);
+        // And the store's answers, which is what puts a written block in residency and what moves coverage
+        // when a barrier completes. The worker's round has it beside `harvest`; here the whole round is one
+        // method, so it sits next to the drain that submitted them.
+        state.store.collect_writes();
         // Every node reclaims for itself, leader or not: a segment the index has no entry in holds only
         // dead records. Driven here as well as in the real worker, so the seeds see the same split.
         state.store.reclaim();
