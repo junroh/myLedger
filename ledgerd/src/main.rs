@@ -6,8 +6,7 @@ use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{AccountId, Signals};
 use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
 use ledger_pending::{
-    DaySource, MemoryPending, MemoryPendingConfig, OpenBacking, PendingStorage, SnapshotDir,
-    SnapshotPolicy,
+    DaySource, MemoryPending, MemoryPendingConfig, OpenBacking, PendingStorage, SnapshotPolicy,
 };
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_service::{ClientEndpoint, LedgerService, ServiceConfig};
@@ -99,8 +98,10 @@ fn start_pending() -> MemoryPending {
             }),
     };
     let snapshots = flag("--snapshot-dir").map(|dir| {
-        SnapshotDir::open(std::path::Path::new(&dir)).unwrap_or_else(|err| {
-            eprintln!("ledgerd: --snapshot-dir {dir} cannot be opened ({err})");
+        // A directory is a volume: naming the one the blocks are on is what declares the two one disk,
+        // and then one store serves both because there is one device to queue on (§20).
+        OpenBacking::files(std::path::Path::new(&dir), 0, WRITE_LANE).unwrap_or_else(|err| {
+            eprintln!("ledgerd: --snapshot-dir {dir} cannot be opened ({err:?})");
             std::process::exit(2);
         })
     });

@@ -156,17 +156,25 @@ decides what the prediction is worth:
   it was running on the thread that answers every lookup. **One thread, not a pool**: a segment's first block
   has to land before the ones after it and a barrier has to follow what it covers, and one queue keeps both.
   Design notes §20.
-- **`--snapshot-dir <path>` is where snapshots go, and it is not `--store-dir`.** Two flags because they may
-  be two volumes, and which they are is a provisioning decision the design makes elsewhere (§2.2). Naming the
-  directory is what turns the policy on: a cadence with nowhere to write does nothing, so neither flag alone
-  makes a node write files. The run reports `engine snaps` only when one was named.
+- **`--snapshot-dir <path>` is where snapshots go, and whether it is `--store-dir` is the declaration.** Two
+  flags because they may be two volumes, and which they are is a provisioning decision the design makes
+  elsewhere (§2.2). **Naming the same directory for both is how a run says they are one disk**: then one
+  store serves the blocks and the dump, one queue between them, and the dump's writes are ordered with the
+  blocks' on the same lane. Two different directories are two volumes and two queues, and two different
+  directories that are really one disk is a case nothing here can detect — see `status.md` on what declares
+  a node's configuration. Naming the directory is also what turns the policy on: a cadence with nowhere to
+  write does nothing, so neither flag alone makes a node write files. The run reports `engine snaps` only
+  when one was named.
 - **`--snapshot-every <n>` is a distance, not a duration**, counted in committed batches. That is why there
   is no snapshot clock to inject: what recovery replays and what the log has to retain are both counted in
   log positions, and a duration would need a monotonic clock that restarts at zero. A run at 100k/s reports
   about eighty effects a batch, so the conversion is one multiplication.
-- **`--snapshot-bytes <n>` is the throttle and `--snapshot-shadow <n>` is its ceiling.** The chunk is written
-  inside one worker round, so it is a stall on the thread every lookup passes through — which is why the
-  default is small (4096) even though a larger chunk is cheaper per byte. The shadow is the buckets the
+- **`--snapshot-bytes <n>` is the throttle and `--snapshot-shadow <n>` is its ceiling.** A whole number of
+  4096-byte blocks, because a block is what the store takes — anything else is refused at start-up rather
+  than rounded into a number nobody declared. The chunk is written inside one worker round, so with the
+  write lane off it is a stall on the thread every lookup passes through, which is why the default is one
+  block even though a larger chunk is cheaper per byte. ⚠ that argument is the lane's to undo, and the
+  number has not been retaken with `--store-write-lane 1`. The shadow is the buckets the
   stable read holds aside, and a dump that breaches the budget is abandoned rather than allowed to grow; the
   report prints the peak beside the ceiling, so a throttle too slow for its cadence reads as `abandoned`
   climbing while `written` stays at zero. Design notes §19 has both curves.

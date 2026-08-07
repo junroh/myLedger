@@ -13,6 +13,11 @@
 //! in one buffer or write it in one go. Every record in the format is thirty-two bytes wide, so a chunk
 //! boundary can fall anywhere a multiple of thirty-two does and neither side has to carry a partial item.
 //!
+//! **A destination whose unit is a block rounds the last chunk up, and the reader knows it.** A disk takes
+//! 4096-byte blocks and a wire does not, so the padding is the destination's and not this format's; what is
+//! this format's is stopping at the header's count, refusing a tail that is not zeroes, and a version bump
+//! so a reader that predates the padding refuses the file rather than reading it as records.
+//!
 //! **Coverage** is the log position everything up to which has reached a block. It is in the header, and it
 //! is not the position of the last effect applied: the writeback buffer holds records from batches after it,
 //! whose slots this leaves out, so replay starts *after* coverage and creates them again. A snapshot that
@@ -55,7 +60,12 @@ const MAGIC: u64 = 0x5041_5f53_4e41_5031;
 /// Bumped when the layout of any record changes. A reader that does not know a version refuses the stream
 /// rather than interpreting it, because the alternative is a table restored from bytes that meant something
 /// else.
-const VERSION: u32 = 3;
+///
+/// Four is three padded to whole blocks. The records did not change; what changed is that the stream now
+/// goes to the store, whose vocabulary is a 4096-byte block at an offset — so the last one is filled out
+/// with zeroes, and a version-three reader would take that padding for records past the end its own header
+/// promised. The bump is what makes the two refuse each other instead.
+const VERSION: u32 = 4;
 
 /// Why a stream could not be read. Every one of them is a refusal rather than a repair: a snapshot that
 /// does not describe this table is not a snapshot to make the best of.
@@ -134,12 +144,17 @@ impl SnapshotWriter {
         self.at == self.records()
     }
 
-    /// Fills `into` with as many whole records as fit and answers how many bytes were written. Zero means the
-    /// stream is finished, or that `into` was too small to hold one record.
+    /// Fills `into` with as many whole records as fit and answers how many bytes were written. Zero means
+    /// the stream is finished, or that `into` was too small to hold one record.
     ///
     /// `index` is asked for each bucket in turn, and hands back the copy taken before it changed where one was
     /// needed. Sealed-block state is asked of `records`, because a slot pointing anywhere else is written out
     /// empty.
+    ///
+    /// **Records, not blocks.** Rounding the last chunk up belongs to a destination whose unit is a block,
+    /// which a disk is and a wire is not — see `Snapshots`. What the format owes that destination is a
+    /// reader that stops at the header's count and refuses a tail that is not zeroes, and a version that
+    /// keeps an older reader from taking the padding for records.
     pub fn next_chunk(
         &mut self,
         into: &mut [u8],
@@ -233,6 +248,17 @@ impl SnapshotReader {
             return Err(NotASnapshot::Malformed);
         }
         for record in bytes.chunks_exact(RECORD) {
+            // Everything the header promised has arrived, so what is left of this chunk is the padding that
+            // rounds the stream up to a whole block. It has to *be* padding: a tail with anything in it is a
+            // stream that does not agree with its own header, which is the same refusal a record too many
+            // always was. Counting it would also take `at` past the end and make `is_complete` false again,
+            // which is why the bound lives here and `take_one` trusts it.
+            if self.is_complete() {
+                if record.iter().any(|byte| *byte != 0) {
+                    return Err(NotASnapshot::Malformed);
+                }
+                continue;
+            }
             self.take_one(record, index)?;
             self.at += 1;
         }
@@ -276,7 +302,9 @@ impl SnapshotReader {
                     false => Err(NotASnapshot::Malformed),
                 }
             }
-            at if at < HEADER + self.buckets + self.groups_expected => {
+            // The groups, and the last of them is the end of the stream: `take_chunk` owns that bound,
+            // because it is the same bound `is_complete` answers and the padding is measured from it.
+            _ => {
                 let id = BudgetGroup(u128::from_le_bytes(
                     record[0..16].try_into().expect("16 bytes"),
                 ));
@@ -286,9 +314,6 @@ impl SnapshotReader {
                     .insert(id, BudgetState::restored(members, remaining));
                 Ok(())
             }
-            // Past the end: the header said how much there was, so anything after it is a stream that does
-            // not agree with its own header.
-            _ => Err(NotASnapshot::Malformed),
         }
     }
 
@@ -331,7 +356,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::block::{Block, DurableStore, MemoryStore, StoreFault, RECORDS_PER_BLOCK};
+    use crate::block::{Block, DurableStore, MemoryStore, ObjectId, StoreFault, RECORDS_PER_BLOCK};
     use crate::engine::PendingEngine;
 
     /// A chunk small enough that every test here crosses several, because a format that is only ever read in
@@ -348,14 +373,14 @@ mod tests {
         fn submit_write(
             &mut self,
             handle: u64,
-            segment: u8,
+            object: ObjectId,
             offset: u64,
             block: &Block,
             creating: bool,
         ) -> bool {
             self.0
                 .borrow_mut()
-                .submit_write(handle, segment, offset, block, creating)
+                .submit_write(handle, object, offset, block, creating)
         }
 
         fn submit_barrier(&mut self, handle: u64) -> bool {
@@ -372,15 +397,15 @@ mod tests {
 
         fn read_at(
             &mut self,
-            segment: u8,
+            object: ObjectId,
             offset: u64,
             into: &mut Block,
         ) -> Result<(), StoreFault> {
-            self.0.borrow_mut().read_at(segment, offset, into)
+            self.0.borrow_mut().read_at(object, offset, into)
         }
 
-        fn submit(&mut self, handle: u64, segment: u8, offset: u64, now: u64) -> bool {
-            self.0.borrow_mut().submit(handle, segment, offset, now)
+        fn submit(&mut self, handle: u64, object: ObjectId, offset: u64, now: u64) -> bool {
+            self.0.borrow_mut().submit(handle, object, offset, now)
         }
 
         fn poll(&mut self, now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
@@ -391,8 +416,16 @@ mod tests {
             self.0.borrow().inflight()
         }
 
-        fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
-            self.0.borrow_mut().remove(segment)
+        fn remove(&mut self, object: ObjectId) -> Result<(), StoreFault> {
+            self.0.borrow_mut().remove(object)
+        }
+
+        fn rename(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault> {
+            self.0.borrow_mut().rename(from, to)
+        }
+
+        fn exists(&mut self, object: ObjectId) -> bool {
+            self.0.borrow_mut().exists(object)
         }
     }
 

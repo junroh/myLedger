@@ -8,8 +8,8 @@ use ledger_base::ports::{AccountFlags, AccountPort};
 use ledger_base::{Ack, AckOutcome, LedgerError, Transfer};
 use ledger_idempotency::{MemoryIdem, MemoryIdemConfig};
 use ledger_pending::{
-    DaySource, MemoryPending, MemoryPendingConfig, OpenBacking, PendingStorage, SnapshotDir,
-    SnapshotPolicy, StoreModel,
+    DaySource, MemoryPending, MemoryPendingConfig, OpenBacking, PendingStorage, SnapshotPolicy,
+    StoreModel,
 };
 use ledger_raft::{EchoRaft, EchoRaftConfig};
 use ledger_sequencer::{BatchPolicy, ReactorConfig};
@@ -174,11 +174,17 @@ impl Runner {
                         std::process::exit(2);
                     }),
                 },
+                // The same shape as the blocks', because it is the same question: a directory is a
+                // volume, and naming the one the blocks are on is what declares them one disk with one
+                // queue. Read threads are zero — the only read here is a restore, and nothing competes
+                // with it — and the write lane follows the blocks' so the two arms of a measurement
+                // stay comparable.
                 snapshots: options.snapshot_dir.map(|dir| {
-                    SnapshotDir::open(std::path::Path::new(dir)).unwrap_or_else(|err| {
-                        eprintln!("ledgerfio: --snapshot-dir {dir} cannot be opened ({err})");
-                        std::process::exit(2);
-                    })
+                    OpenBacking::files(std::path::Path::new(dir), 0, options.store_write_lane)
+                        .unwrap_or_else(|_| {
+                            eprintln!("ledgerfio: --snapshot-dir {dir} cannot be opened");
+                            std::process::exit(2);
+                        })
                 }),
             },
         )

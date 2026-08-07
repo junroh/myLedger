@@ -8,7 +8,13 @@ use std::thread::{JoinHandle, Thread};
 
 use ledger_base::{channel, Consumer, Producer};
 
-use crate::block::{Block, DurableStore, StoreFault, SEGMENT_VALUES};
+use crate::block::{Block, DurableStore, ObjectId, StoreFault, OBJECT_VALUES};
+
+/// The snapshot a restart reads, and the one being written. Two names because the replacement is a rename
+/// (§19), and they are here rather than beside the dump because naming an object is the store's job — a
+/// directory holding this volume's files holds these two the same way it holds a day's.
+const CURRENT_SNAPSHOT: &str = "pending.snapshot";
+const PARTIAL_SNAPSHOT: &str = "pending.snapshot.part";
 
 /// A read handed to a pool thread, and the same buffer handed back with it.
 ///
@@ -197,7 +203,7 @@ impl Drop for ReadPool {
 struct WriteAsk {
     handle: u64,
     /// `None` is a barrier: everything asked for before it is made durable.
-    at: Option<(u8, u64, bool)>,
+    at: Option<(ObjectId, u64, bool)>,
     buffer: Box<Block>,
 }
 
@@ -233,54 +239,55 @@ struct WriteLane {
 struct LaneFiles {
     dir: File,
     path: PathBuf,
-    files: [Option<File>; SEGMENT_VALUES],
-    /// Segments written since the last barrier, one bit each, and whether a file came into being — a newly
+    files: [Option<File>; OBJECT_VALUES],
+    /// Objects written since the last barrier, one bit each, and whether a file came into being — a newly
     /// created file's *name* is not durable until the directory is synced.
-    dirty: u64,
+    dirty: u128,
     created: bool,
 }
 
 impl LaneFiles {
-    fn name_of(&self, segment: u8) -> PathBuf {
-        self.path.join(format!("seg-{segment:02}.blk"))
-    }
-
-    fn write(&mut self, segment: u8, offset: u64, creating: bool, block: &Block) -> bool {
+    /// **A cached handle is invalidated by the next `creating` write and by nothing else**, which is what
+    /// makes caching them safe beside a `remove` and a `rename` the other side of the store issues. Both of
+    /// those leave the name free, and every object is brought into being again by a write that says it is
+    /// creating: a day's first block after `free_segment`, a dump's first chunk after the last one was
+    /// published or given up on. So the stale handle here is replaced before it can be written through.
+    fn write(&mut self, object: ObjectId, offset: u64, creating: bool, block: &Block) -> bool {
         if creating {
             // `create_new` is `O_EXCL`, and it failing is information rather than an inconvenience: a
             // segment's file already existing means a previous life left it there, and writing over its
             // front would leave a mix of two days that nothing points into and nothing frees (§16).
             let Ok(file) = FileStore::options()
                 .create_new(true)
-                .open(self.name_of(segment))
+                .open(FileStore::name_in(&self.path, object))
             else {
                 return false;
             };
-            self.files[segment as usize] = Some(file);
+            self.files[object.index()] = Some(file);
             self.created = true;
         }
-        if self.files[segment as usize].is_none() {
-            let Ok(file) = FileStore::options().open(self.name_of(segment)) else {
+        if self.files[object.index()].is_none() {
+            let Ok(file) = FileStore::options().open(FileStore::name_in(&self.path, object)) else {
                 return false;
             };
-            self.files[segment as usize] = Some(file);
+            self.files[object.index()] = Some(file);
         }
-        let Some(file) = self.files[segment as usize].as_ref() else {
+        let Some(file) = self.files[object.index()].as_ref() else {
             return false;
         };
         if file.write_at(block, offset).is_err() {
             return false;
         }
-        self.dirty |= 1 << segment;
+        self.dirty |= 1 << object.index();
         true
     }
 
     fn barrier(&mut self) -> bool {
-        for segment in 0..SEGMENT_VALUES {
-            if self.dirty & (1 << segment) == 0 {
+        for object in 0..OBJECT_VALUES {
+            if self.dirty & (1 << object) == 0 {
                 continue;
             }
-            let Some(file) = self.files[segment].as_ref() else {
+            let Some(file) = self.files[object].as_ref() else {
                 continue;
             };
             if file.sync_all().is_err() {
@@ -341,8 +348,8 @@ impl WriteLane {
                 continue;
             };
             let ok = match ask.at {
-                Some((segment, offset, creating)) => {
-                    owned.write(segment, offset, creating, &ask.buffer)
+                Some((object, offset, creating)) => {
+                    owned.write(object, offset, creating, &ask.buffer)
                 }
                 None => owned.barrier(),
             };
@@ -361,7 +368,12 @@ impl WriteLane {
         }
     }
 
-    fn submit(&mut self, handle: u64, at: Option<(u8, u64, bool)>, block: Option<&Block>) -> bool {
+    fn submit(
+        &mut self,
+        handle: u64,
+        at: Option<(ObjectId, u64, bool)>,
+        block: Option<&Block>,
+    ) -> bool {
         let Some(mut buffer) = self.spare.pop() else {
             return false;
         };
@@ -427,16 +439,16 @@ pub struct FileStore {
     dir: File,
     path: PathBuf,
     /// Shared so a pool thread can read one without a lock: `read_at` takes `&self`.
-    files: [Option<Arc<File>>; SEGMENT_VALUES],
-    /// Segments written to since the last sync, one bit each. At most two are ever set — the day being
-    /// written and, for one block, the day before it.
-    dirty: u64,
+    files: [Option<Arc<File>>; OBJECT_VALUES],
+    /// Objects written to since the last sync, one bit each. At most three are ever set — the day being
+    /// written, for one block the day before it, and a snapshot being dumped onto this volume.
+    dirty: u128,
     /// Whether a file has come into being since the last sync, so the directory needs one too.
     created: bool,
     /// Reads asked for and not yet answered, when there is no pool. The `pread` then happens in `poll`, so
     /// nothing overlaps: the simplest correct implementation and the slowest, and the baseline any backend is
     /// measured against.
-    submitted: VecDeque<(u64, u8, u64)>,
+    submitted: VecDeque<(u64, ObjectId, u64)>,
     /// `pread` on N threads, absent when the pool is zero threads wide.
     ///
     /// A field rather than a trait, for now. The design abstracts the read backend and names three — io_uring,
@@ -487,24 +499,36 @@ impl FileStore {
         }
     }
 
-    /// The name a segment's file has. The segment number and nothing else: the offset within the file is a
-    /// function of the address (§16), so a name that carried a block number would be a second place the
-    /// layout lived.
-    fn name_of(&self, segment: u8) -> PathBuf {
-        self.path.join(format!("seg-{segment:02}.blk"))
+    /// The name an object's file has, and the whole of this store's namespace. A day is its segment number
+    /// and nothing else — the offset within the file is a function of the address (§16), so a name carrying a
+    /// block number would be a second place the layout lived — and the snapshot's two are the fixed names
+    /// §19's replacement-by-rename needs.
+    ///
+    /// An associated function on the path rather than a method, because the write lane owns a path of its
+    /// own and must name a file exactly as this side does.
+    pub(crate) fn name_in(path: &Path, object: ObjectId) -> PathBuf {
+        match object {
+            ObjectId::SNAPSHOT_CURRENT => path.join(CURRENT_SNAPSHOT),
+            ObjectId::SNAPSHOT_PARTIAL => path.join(PARTIAL_SNAPSHOT),
+            day => path.join(format!("seg-{:02}.blk", day.index())),
+        }
     }
 
-    /// The segment's file, opened if this store has not touched it yet. Lazy because a restart begins with no
+    fn name_of(&self, object: ObjectId) -> PathBuf {
+        Self::name_in(&self.path, object)
+    }
+
+    /// The object's file, opened if this store has not touched it yet. Lazy because a restart begins with no
     /// open files and the blocks are still there: the index a snapshot restored names them, and the offset
     /// needs nothing but the address.
-    fn file_of(&mut self, segment: u8) -> Result<Arc<File>, StoreFault> {
-        if self.files[segment as usize].is_none() {
+    fn file_of(&mut self, object: ObjectId) -> Result<Arc<File>, StoreFault> {
+        if self.files[object.index()].is_none() {
             let opened = Self::options()
-                .open(self.name_of(segment))
+                .open(self.name_of(object))
                 .map_err(|_| StoreFault::Missing)?;
-            self.files[segment as usize] = Some(Arc::new(opened));
+            self.files[object.index()] = Some(Arc::new(opened));
         }
-        self.files[segment as usize]
+        self.files[object.index()]
             .as_ref()
             .cloned()
             .ok_or(StoreFault::Missing)
@@ -521,8 +545,8 @@ impl FileStore {
         options
     }
 
-    fn note_write(&mut self, segment: u8) {
-        self.dirty |= 1 << segment;
+    fn note_write(&mut self, object: ObjectId) {
+        self.dirty |= 1 << object.index();
     }
 }
 
@@ -531,24 +555,29 @@ impl FileStore {
     /// already existing means a previous life left it there, and writing over its front would leave a mix of
     /// two days that nothing points into and nothing frees. So it refuses, which seals — until there is a
     /// start-up reconcile, this is what stands in for one (§16).
-    fn open_with(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
+    fn open_with(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        block: &Block,
+    ) -> Result<(), StoreFault> {
         let file = Self::options()
             .create_new(true)
-            .open(self.name_of(segment))
+            .open(self.name_of(object))
             .map_err(|_| StoreFault::Device)?;
         file.write_at(block, offset)
             .map_err(|_| StoreFault::Device)?;
-        self.files[segment as usize] = Some(Arc::new(file));
+        self.files[object.index()] = Some(Arc::new(file));
         self.created = true;
-        self.note_write(segment);
+        self.note_write(object);
         Ok(())
     }
 
-    fn append(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
-        self.file_of(segment)?
+    fn append(&mut self, object: ObjectId, offset: u64, block: &Block) -> Result<(), StoreFault> {
+        self.file_of(object)?
             .write_at(block, offset)
             .map_err(|_| StoreFault::Device)?;
-        self.note_write(segment);
+        self.note_write(object);
         Ok(())
     }
 
@@ -559,11 +588,11 @@ impl FileStore {
     /// `sync_all` rather than `sync_data` because appending changes the file's length, and a length is
     /// metadata: `fdatasync` does not promise it.
     fn barrier(&mut self) -> Result<(), StoreFault> {
-        for segment in 0..SEGMENT_VALUES {
-            if self.dirty & (1 << segment) == 0 {
+        for object in 0..OBJECT_VALUES {
+            if self.dirty & (1 << object) == 0 {
                 continue;
             }
-            let Some(file) = self.files[segment].as_ref() else {
+            let Some(file) = self.files[object].as_ref() else {
                 continue;
             };
             file.sync_all().map_err(|_| StoreFault::Device)?;
@@ -584,21 +613,21 @@ impl DurableStore for FileStore {
     fn submit_write(
         &mut self,
         handle: u64,
-        segment: u8,
+        object: ObjectId,
         offset: u64,
         block: &Block,
         creating: bool,
     ) -> bool {
         if let Some(lane) = self.lane.as_mut() {
-            return lane.submit(handle, Some((segment, offset, creating)), Some(block));
+            return lane.submit(handle, Some((object, offset, creating)), Some(block));
         }
         if self.written.len() >= self.queue_depth {
             return false;
         }
         let done = if creating {
-            self.open_with(segment, offset, block)
+            self.open_with(object, offset, block)
         } else {
-            self.append(segment, offset, block)
+            self.append(object, offset, block)
         };
         self.written.push_back((handle, done));
         true
@@ -630,9 +659,14 @@ impl DurableStore for FileStore {
         }
     }
 
-    fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault> {
+    fn read_at(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        into: &mut Block,
+    ) -> Result<(), StoreFault> {
         let read = self
-            .file_of(segment)?
+            .file_of(object)?
             .read_at(into, offset)
             .map_err(|_| StoreFault::Device)?;
         // A short read is the offset being past what the file holds, which is this node's own record of where
@@ -644,11 +678,11 @@ impl DurableStore for FileStore {
         }
     }
 
-    fn submit(&mut self, handle: u64, segment: u8, offset: u64, _now: u64) -> bool {
+    fn submit(&mut self, handle: u64, object: ObjectId, offset: u64, _now: u64) -> bool {
         if self.pool.is_some() {
-            // A segment with no file is a read this cannot take at all, which is backpressure's answer rather
+            // An object with no file is a read this cannot take at all, which is backpressure's answer rather
             // than a fault's: nothing has been promised, so the caller keeps the command and asks again.
-            let Ok(file) = self.file_of(segment) else {
+            let Ok(file) = self.file_of(object) else {
                 return false;
             };
             let pool = self.pool.as_mut().expect("just checked");
@@ -657,7 +691,7 @@ impl DurableStore for FileStore {
         if self.submitted.len() >= self.queue_depth {
             return false;
         }
-        self.submitted.push_back((handle, segment, offset));
+        self.submitted.push_back((handle, object, offset));
         true
     }
 
@@ -665,8 +699,8 @@ impl DurableStore for FileStore {
         if let Some(pool) = self.pool.as_mut() {
             return pool.poll(into);
         }
-        let (handle, segment, offset) = self.submitted.pop_front()?;
-        Some(self.read_at(segment, offset, into).map(|()| handle))
+        let (handle, object, offset) = self.submitted.pop_front()?;
+        Some(self.read_at(object, offset, into).map(|()| handle))
     }
 
     fn inflight(&self) -> usize {
@@ -678,14 +712,32 @@ impl DurableStore for FileStore {
 
     /// Closed and unlinked. The unlink itself is not synced, and does not need to be: `reclaim` uses no clock
     /// and no cursor, so a file that comes back after a crash is found and freed again on the next pass.
-    fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
-        self.files[segment as usize] = None;
-        match std::fs::remove_file(self.name_of(segment)) {
+    fn remove(&mut self, object: ObjectId) -> Result<(), StoreFault> {
+        self.files[object.index()] = None;
+        match std::fs::remove_file(self.name_of(object)) {
             Ok(()) => Ok(()),
             // Already gone is the state this is asking for.
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(_) => Err(StoreFault::Device),
         }
+    }
+
+    /// `rename` and then the directory, because the name is the thing being published and a name is
+    /// durable only once the directory holding it is. The bytes are already durable — the caller's barrier
+    /// is what made them so, and it has to precede this call for the same reason it precedes coverage.
+    ///
+    /// Both cached handles go: this side's for `to` would otherwise still be the file the name was taken
+    /// from, and a read of the published object would answer with the snapshot before it.
+    fn rename(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault> {
+        std::fs::rename(self.name_of(from), self.name_of(to)).map_err(|_| StoreFault::Device)?;
+        self.files[from.index()] = None;
+        self.files[to.index()] = None;
+        self.dir.sync_all().map_err(|_| StoreFault::Device)?;
+        Ok(())
+    }
+
+    fn exists(&mut self, object: ObjectId) -> bool {
+        self.files[object.index()].is_some() || self.name_of(object).exists()
     }
 }
 
@@ -694,10 +746,13 @@ impl DurableStore for FileStore {
 /// Opened here rather than on the worker's thread because a directory that cannot be used is a configuration
 /// error, and a configuration error has to be refused at start-up where somebody can be told — not swallowed
 /// by a thread whose only way to report it would be to panic (rule 6).
+/// Canonical, because the path is what says whether two backings are one volume: two spellings of one
+/// directory are one disk and have to compare equal (`OpenBacking::same_volume`).
 pub fn open_directory(path: &Path) -> Result<(File, PathBuf), std::io::Error> {
     std::fs::create_dir_all(path)?;
-    let dir = File::open(path)?;
-    Ok((dir, path.to_path_buf()))
+    let path = std::fs::canonicalize(path)?;
+    let dir = File::open(&path)?;
+    Ok((dir, path))
 }
 
 #[cfg(test)]
@@ -850,7 +905,12 @@ mod tests {
 
         for (handle, (_, addr)) in sealed.iter().enumerate() {
             assert!(
-                store.submit(handle as u64, addr.segment(), addr.block_offset(), 0),
+                store.submit(
+                    handle as u64,
+                    ObjectId::segment(addr.segment()),
+                    addr.block_offset(),
+                    0
+                ),
                 "the pool would not take read {handle}"
             );
         }

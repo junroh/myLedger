@@ -188,7 +188,9 @@ fn print_help() {
     println!(
         "  --snapshot-every <n>        (0) log positions between snapshots — a distance, so no clock"
     );
-    println!("  --snapshot-bytes <n>        (64k) bytes of the stream one worker round writes");
+    println!(
+        "  --snapshot-bytes <n>        (4k) bytes of the stream one worker round writes; whole blocks"
+    );
     println!("  --snapshot-shadow <n>       (2M) buckets the stable read may hold before a dump is dropped");
     println!("  --overlay-limit <n>         (1M) ceiling on the sequencer's own hold decisions; in flight bounds it");
     println!("  --idem-latency <us>         (1:5) idem; every request pays it");

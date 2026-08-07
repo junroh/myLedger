@@ -39,6 +39,11 @@ help:
 # them tests alone. `--resolve-after` keeps the holds alive so blocks are actually written, and the cadence
 # is small so a two-second run writes several snapshots. Both directories go with the run.
 #
+# Then the same run with **one** directory, which is how a deployment declares that the blocks and the
+# snapshot are on one disk: one store, one queue, and two writers interleaved on one write lane at a real
+# rate. That last part is the reason it is a second line rather than a replacement — the two-directory run
+# is the other shape, and neither covers the other. The unit tests reach the shared store but not the lane.
+#
 # Nothing here gates a latency target, and one reason is worth stating: a long run's tail is the dedup
 # stand-in's, not the ledger's — see `status.md`.
 verify:
@@ -47,6 +52,7 @@ verify:
 	cargo run --release -p ledgerfio -- run --sweep workload=all --duration 1s
 	cargo run --release -p ledgerfio -- run --workload void-heavy --duration 2s --rate 100k --resolve-after 900000 --expiry-days 6
 	blk=$$(mktemp -d); snap=$$(mktemp -d); cargo run --release -p ledgerfio -- run --workload hold-settle --duration 2s --rate 100k --resolve-after 900000 --store-dir $$blk --store-write-lane 1 --snapshot-dir $$snap --snapshot-every 200; status=$$?; rm -rf $$blk $$snap; exit $$status
+	one=$$(mktemp -d); cargo run --release -p ledgerfio -- run --workload hold-settle --duration 2s --rate 100k --resolve-after 900000 --store-dir $$one --store-write-lane 1 --snapshot-dir $$one --snapshot-every 200; status=$$?; rm -rf $$one; exit $$status
 	cargo run --release -p ledgerfio -- layout
 	cargo run --release -p ledgersim -- check --seeds 32
 	cargo run --release -p ledgersim -- capacity --duration-ms 200

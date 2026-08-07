@@ -1,7 +1,9 @@
 use ledger_base::ports::{ApplyIndex, HoldData, PendingEffect};
 use ledger_base::{Amount, BudgetGroup, FxHashMap, MapGauge, Transfer, TransferFlags, TxId};
 
-use crate::block::{DurableStore, LogTraffic, MemoryStore, RecordAddr, RecordLog, SEGMENTS};
+use crate::block::{
+    DurableStore, LogTraffic, MemoryStore, RecordAddr, RecordLog, StoreFault, SEGMENTS,
+};
 use crate::index::{Candidates, HoldTable};
 use crate::snapshot::SnapshotWriter;
 
@@ -895,6 +897,19 @@ impl PendingEngine {
     /// Buckets held aside for a snapshot in progress: what the stable read is costing right now.
     pub fn shadowed_buckets(&self) -> usize {
         self.index.shadowed()
+    }
+
+    /// The volume this engine's blocks are on, for a snapshot declared to be on the same disk. Two writers
+    /// there share one queue because they share one device, which is the whole of why this is reachable at
+    /// all (§20).
+    pub fn volume(&mut self) -> &mut dyn DurableStore {
+        self.records.volume()
+    }
+
+    /// The next completion the log polled that belongs to the other writer on this volume. One queue has one
+    /// poller; this is where the other one collects.
+    pub fn take_foreign_completion(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
+        self.records.take_foreign()
     }
 
     /// Puts a snapshot's group totals back, once its stream is complete. The index restores itself as the

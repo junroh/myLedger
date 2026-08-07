@@ -214,6 +214,69 @@ pub fn decode(bytes: &[u8], _from: RecordAddr) -> (TxId, HoldData) {
     (key, hold)
 }
 
+/// What a store names. A day's blocks are one object and the snapshot's two files are two more, and they
+/// share a namespace because they share a disk (§20).
+///
+/// **A segment is not the store's word for it.** The day ↔ segment mapping is `RecordLog`'s and stays
+/// there; below this the store is a device with objects on it, one of which happens to hold a day. That is
+/// the whole of why this type exists: while a file was named by `segment: u8` there was nowhere for a
+/// snapshot to be written that was not a day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectId(u8);
+
+impl ObjectId {
+    /// The blocks of one day. The segment field is six bits wide, so this cannot reach the two names
+    /// above it — asserted rather than left to that, because what keeps them apart is a fact about a
+    /// different type (rule 18).
+    pub const fn segment(segment: u8) -> Self {
+        debug_assert!(
+            (segment as usize) < SEGMENT_VALUES,
+            "a segment number past the six-bit field would wear one of the snapshot's names"
+        );
+        Self(segment)
+    }
+
+    /// The snapshot a restart reads, and the one being written. Two names is what makes the replacement
+    /// atomic — a dump is written to the second and renamed over the first (§19).
+    pub const SNAPSHOT_CURRENT: Self = Self(SEGMENT_VALUES as u8);
+    pub const SNAPSHOT_PARTIAL: Self = Self(SEGMENT_VALUES as u8 + 1);
+
+    pub const fn index(self) -> usize {
+        self.0 as usize
+    }
+}
+
+/// Objects a store may be asked for: every segment, and the snapshot's two. What a per-object array is
+/// sized from, so a length cannot disagree with the namespace it indexes.
+pub const OBJECT_VALUES: usize = SEGMENT_VALUES + 2;
+
+/// Who asked for an IO, carried in the top bits of its handle so one store serving two callers can hand
+/// each completion back to the one that asked for it.
+///
+/// **The tag is what makes a shared volume possible at all.** Two callers on one store draw handles from
+/// counters of their own, so the numbers collide; a completion queue is one queue, so the poller has to be
+/// able to tell whose each answer is. Deciding it once here is rule 18 — the alternative is each reader
+/// guessing from whether it recognises the number, which is how a completion for somebody else gets
+/// silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IoOwner {
+    Blocks,
+    Snapshot,
+}
+
+const OWNER_SHIFT: u32 = 56;
+
+impl IoOwner {
+    /// The handle a sequence number of this owner's gets.
+    pub const fn handle(self, sequence: u64) -> u64 {
+        ((self as u64) << OWNER_SHIFT) | sequence
+    }
+
+    pub const fn owns(self, handle: u64) -> bool {
+        handle >> OWNER_SHIFT == self as u64
+    }
+}
+
 /// What a store can fail at. Two, and they are different in kind even though the reaction is the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreFault {
@@ -257,7 +320,7 @@ pub trait DurableStore {
     fn submit_write(
         &mut self,
         handle: u64,
-        segment: u8,
+        object: ObjectId,
         offset: u64,
         block: &Block,
         creating: bool,
@@ -277,9 +340,14 @@ pub trait DurableStore {
     fn writes_inflight(&self) -> usize;
     /// `&mut` although reading changes nothing a caller can see: a store that models a device charges
     /// the read, and one that can fail counts it.
-    fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault>;
+    fn read_at(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        into: &mut Block,
+    ) -> Result<(), StoreFault>;
     /// False when the store will not take another read yet, which is backpressure rather than failure.
-    fn submit(&mut self, handle: u64, segment: u8, offset: u64, now: u64) -> bool;
+    fn submit(&mut self, handle: u64, object: ObjectId, offset: u64, now: u64) -> bool;
     /// The next read finished by `now`, copied out. `None` while nothing is due.
     fn poll(&mut self, now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>>;
     fn inflight(&self) -> usize;
@@ -298,7 +366,19 @@ pub trait DurableStore {
     ///
     /// It answers nothing about how many blocks there were. The caller wrote them and so already knows,
     /// and a real store could not answer anyway — `unlink` does not count what it removes.
-    fn remove(&mut self, segment: u8) -> Result<(), StoreFault>;
+    fn remove(&mut self, object: ObjectId) -> Result<(), StoreFault>;
+    /// Gives `from`'s bytes the name `to`, replacing whatever wore it, and makes the name itself durable.
+    /// The one way an object is published: a reader that finds `to` finds all of it or the previous one,
+    /// never a prefix (§19).
+    ///
+    /// Synchronous, beside `remove` rather than on the write queue, and the caller is what orders it: a
+    /// rename issued while writes to `from` are still in flight would publish a prefix. `Snapshots` waits
+    /// for every completion and then a barrier before asking.
+    fn rename(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault>;
+    /// Whether the store has this object at all. Asked before a snapshot is read back, because a node that
+    /// has never written one is the ordinary case and a device that refuses is not — and a read of block
+    /// zero cannot tell them apart, both being `Missing`.
+    fn exists(&mut self, object: ObjectId) -> bool;
 }
 
 /// The exact store: it keeps what it was given and adds no latency. Every other store is measured
@@ -310,11 +390,11 @@ pub trait DurableStore {
 /// so growing the sequence moves pointers rather than four kilobytes at a time — physical contiguity is
 /// what a file has and what nothing here rests on; the offsets are.
 pub struct MemoryStore {
-    segments: [Option<SegmentFile>; SEGMENT_VALUES],
+    objects: [Option<SegmentFile>; OBJECT_VALUES],
     /// Submitted reads, answered in the order they were asked for and with no delay. A store that
     /// modelled a device would answer out of order; this one is the baseline that says what the
     /// structure does when the device is not the variable.
-    submitted: VecDeque<(u64, u8, u64)>,
+    submitted: VecDeque<(u64, ObjectId, u64)>,
     /// Writes and barriers, done as they are taken and answered in the order they were taken. Memory has
     /// no queue to be behind in, so the completion is immediate — which is what makes this the baseline a
     /// backend with a lane is measured against.
@@ -364,7 +444,7 @@ impl SegmentFile {
 impl Default for MemoryStore {
     fn default() -> Self {
         Self {
-            segments: std::array::from_fn(|_| None),
+            objects: std::array::from_fn(|_| None),
             submitted: VecDeque::new(),
             written: VecDeque::new(),
         }
@@ -372,12 +452,12 @@ impl Default for MemoryStore {
 }
 
 impl MemoryStore {
-    fn block_at(&self, segment: u8, offset: u64) -> Result<&Block, StoreFault> {
+    fn block_at(&self, object: ObjectId, offset: u64) -> Result<&Block, StoreFault> {
         debug_assert!(
             offset.is_multiple_of(BLOCK_BYTES as u64),
             "an offset is a whole number of blocks, which is what direct IO requires of it"
         );
-        self.segments[segment as usize]
+        self.objects[object.index()]
             .as_ref()
             .and_then(|file| file.at(offset))
             .ok_or(StoreFault::Missing)
@@ -385,22 +465,28 @@ impl MemoryStore {
 }
 
 impl MemoryStore {
-    fn open_with(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
+    fn open_with(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        block: &Block,
+    ) -> Result<(), StoreFault> {
         // What `O_EXCL` is for, and a self-invariant rather than a fault: both sides of it are ours. A
-        // segment brought into being twice would hold two days' blocks under one day's count.
+        // segment brought into being twice would hold two days' blocks under one day's count, and a
+        // snapshot's partial brought into being twice would be two dumps interleaved in one file.
         debug_assert!(
-            self.segments[segment as usize].is_none(),
-            "a segment is brought into being once, by its first block"
+            self.objects[object.index()].is_none(),
+            "an object is brought into being once, by its first block"
         );
-        self.segments[segment as usize] = Some(SegmentFile {
+        self.objects[object.index()] = Some(SegmentFile {
             base: offset,
             blocks: vec![Some(Block::copy_of(block))],
         });
         Ok(())
     }
 
-    fn append(&mut self, segment: u8, offset: u64, block: &Block) -> Result<(), StoreFault> {
-        let file = self.segments[segment as usize]
+    fn append(&mut self, object: ObjectId, offset: u64, block: &Block) -> Result<(), StoreFault> {
+        let file = self.objects[object.index()]
             .as_mut()
             .ok_or(StoreFault::Missing)?;
         // At the end, or past it. Never before it: blocks are written once, so an offset already occupied is
@@ -410,7 +496,7 @@ impl MemoryStore {
         // write already hold addresses.
         debug_assert!(
             offset >= file.end(),
-            "a block was written over one this segment already has"
+            "a block was written over one this object already has"
         );
         file.put(offset, block);
         Ok(())
@@ -421,15 +507,15 @@ impl DurableStore for MemoryStore {
     fn submit_write(
         &mut self,
         handle: u64,
-        segment: u8,
+        object: ObjectId,
         offset: u64,
         block: &Block,
         creating: bool,
     ) -> bool {
         let done = if creating {
-            self.open_with(segment, offset, block)
+            self.open_with(object, offset, block)
         } else {
-            self.append(segment, offset, block)
+            self.append(object, offset, block)
         };
         self.written.push_back((handle, done));
         true
@@ -450,32 +536,51 @@ impl DurableStore for MemoryStore {
         self.written.len()
     }
 
-    fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault> {
-        into.copy_from_slice(self.block_at(segment, offset)?);
+    fn read_at(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        into: &mut Block,
+    ) -> Result<(), StoreFault> {
+        into.copy_from_slice(self.block_at(object, offset)?);
         Ok(())
     }
 
-    fn submit(&mut self, handle: u64, segment: u8, offset: u64, _now: u64) -> bool {
-        self.submitted.push_back((handle, segment, offset));
+    fn submit(&mut self, handle: u64, object: ObjectId, offset: u64, _now: u64) -> bool {
+        self.submitted.push_back((handle, object, offset));
         true
     }
 
     fn poll(&mut self, _now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
-        let (handle, segment, offset) = self.submitted.pop_front()?;
-        Some(self.read_at(segment, offset, into).map(|()| handle))
+        let (handle, object, offset) = self.submitted.pop_front()?;
+        Some(self.read_at(object, offset, into).map(|()| handle))
     }
 
     fn inflight(&self) -> usize {
         self.submitted.len()
     }
 
-    fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
+    fn remove(&mut self, object: ObjectId) -> Result<(), StoreFault> {
         // One drop, which is what `unlink` costs. What this replaced went looking through a map for the
         // blocks of a day, and that was a stand-in's cost rather than a store's: the sweep bench had to
         // leave the round that frees a day out of its numbers because it was the worst round at every
         // size and hid the one being measured.
-        self.segments[segment as usize] = None;
+        self.objects[object.index()] = None;
         Ok(())
+    }
+
+    /// A move, which is what a rename is: the bytes do not go anywhere and whatever wore the name is
+    /// dropped by being replaced.
+    fn rename(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault> {
+        let moved = self.objects[from.index()]
+            .take()
+            .ok_or(StoreFault::Missing)?;
+        self.objects[to.index()] = Some(moved);
+        Ok(())
+    }
+
+    fn exists(&mut self, object: ObjectId) -> bool {
+        self.objects[object.index()].is_some()
     }
 }
 
@@ -660,13 +765,28 @@ impl OpenBacking {
             write_lane,
         })
     }
-}
 
-impl StoreModel {
-    pub fn build(&self, backing: OpenBacking, seed: u64) -> Box<dyn DurableStore> {
-        let exact: Box<dyn DurableStore> = match backing {
-            OpenBacking::Memory => Box::new(MemoryStore::default()),
-            OpenBacking::Files {
+    /// Whether two backings are the same disk, and so want one store between them (§20).
+    ///
+    /// **It answers only the case it cannot be wrong about.** The same directory is the same volume by
+    /// definition — `open_directory` canonicalises, so two spellings of one path are one answer here.
+    /// Two *different* directories on one disk is the case that matters and the case nothing can detect:
+    /// `st_dev` is wrong in both directions (two partitions of one NVMe have different ids and one queue;
+    /// LVM, RAID and network volumes have one id across several devices), so it takes a declaration, and
+    /// that declaration does not exist yet. Memory is one volume because there is one memory.
+    pub fn same_volume(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Memory, Self::Memory) => true,
+            (Self::Files { path: ours, .. }, Self::Files { path: theirs, .. }) => ours == theirs,
+            _ => false,
+        }
+    }
+
+    /// The store this backing is, with no device modelled in front of it.
+    pub fn open(self, queue_depth: usize) -> Box<dyn DurableStore> {
+        match self {
+            Self::Memory => Box::new(MemoryStore::default()),
+            Self::Files {
                 dir,
                 path,
                 read_threads,
@@ -674,11 +794,17 @@ impl StoreModel {
             } => Box::new(crate::files::FileStore::new(
                 dir,
                 path,
-                self.queue_depth.max(1),
+                queue_depth,
                 read_threads,
                 write_lane,
             )),
-        };
+        }
+    }
+}
+
+impl StoreModel {
+    pub fn build(&self, backing: OpenBacking, seed: u64) -> Box<dyn DurableStore> {
+        let exact = backing.open(self.queue_depth.max(1));
         if self.is_exact() {
             return exact;
         }
@@ -745,9 +871,9 @@ pub struct LatencyStore {
     write: Cost,
     sync: Cost,
     prng: Prng,
-    /// Reads handed to the store below and not yet answered by it: handle, segment, offset, and when this
+    /// Reads handed to the store below and not yet answered by it: handle, object, offset, and when this
     /// model says the device is done with them.
-    inflight: Vec<(u64, u8, u64, u64)>,
+    inflight: Vec<(u64, ObjectId, u64, u64)>,
     /// Reads the store below *has* answered, waiting for this model's own time to pass: handle, due, bytes.
     ///
     /// The bytes have to be held, and there is no way around it: the store below answers in its order and
@@ -834,7 +960,7 @@ impl DurableStore for LatencyStore {
     fn submit_write(
         &mut self,
         handle: u64,
-        segment: u8,
+        object: ObjectId,
         offset: u64,
         block: &Block,
         creating: bool,
@@ -845,7 +971,7 @@ impl DurableStore for LatencyStore {
             return true;
         }
         self.inner
-            .submit_write(handle, segment, offset, block, creating)
+            .submit_write(handle, object, offset, block, creating)
     }
 
     fn submit_barrier(&mut self, handle: u64) -> bool {
@@ -874,12 +1000,17 @@ impl DurableStore for LatencyStore {
     /// The read that cannot be submitted and harvested: the apply path is in order and cannot park a
     /// decision half way, and the expiry walk reads a whole block at a time. Both hold the thread, so both
     /// are charged to it rather than to the device's queue.
-    fn read_at(&mut self, segment: u8, offset: u64, into: &mut Block) -> Result<(), StoreFault> {
+    fn read_at(
+        &mut self,
+        object: ObjectId,
+        offset: u64,
+        into: &mut Block,
+    ) -> Result<(), StoreFault> {
         self.charge(self.read);
         if self.refuses() {
             return Err(StoreFault::Device);
         }
-        self.inner.read_at(segment, offset, into)?;
+        self.inner.read_at(object, offset, into)?;
         self.corrupt(into);
         Ok(())
     }
@@ -894,17 +1025,17 @@ impl DurableStore for LatencyStore {
     ///
     /// The queue depth is this model's, and it counts what is held either side of the store below: refusing
     /// here is what a device with a full queue does.
-    fn submit(&mut self, handle: u64, segment: u8, offset: u64, now: u64) -> bool {
+    fn submit(&mut self, handle: u64, object: ObjectId, offset: u64, now: u64) -> bool {
         if self.inflight.len() + self.completed.len() >= self.queue_depth {
             return false;
         }
         // The store below first: a deadline recorded for a read it would not take is a read this would
         // release having never done it (rule 17).
-        if !self.inner.submit(handle, segment, offset, now) {
+        if !self.inner.submit(handle, object, offset, now) {
             return false;
         }
         let due = self.device.serve(now, &mut self.prng);
-        self.inflight.push((handle, segment, offset, due));
+        self.inflight.push((handle, object, offset, due));
         true
     }
 
@@ -963,8 +1094,19 @@ impl DurableStore for LatencyStore {
 
     /// Freeing costs the device nothing this model charges for: it is off any request's path, and a device
     /// that made it expensive would be one whose extents this store does not model.
-    fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
-        self.inner.remove(segment)
+    fn remove(&mut self, object: ObjectId) -> Result<(), StoreFault> {
+        self.inner.remove(object)
+    }
+
+    /// A namespace change costs the device nothing this model charges for, for the same reason freeing does
+    /// not. What it does cost — the directory sync a real backing does inside it — is the barrier's cost and
+    /// is charged there.
+    fn rename(&mut self, from: ObjectId, to: ObjectId) -> Result<(), StoreFault> {
+        self.inner.rename(from, to)
+    }
+
+    fn exists(&mut self, object: ObjectId) -> bool {
+        self.inner.exists(object)
     }
 }
 
@@ -1029,8 +1171,14 @@ pub struct RecordLog {
     /// the barrier completes this becomes `unsynced`; when it fails, `unsynced` already covers them because
     /// the two runs are contiguous.
     after_barrier: Option<(u64, ApplyIndex)>,
-    /// Handles for writes and barriers. One counter, because the completion queue is one queue.
+    /// Sequence numbers for writes and barriers. One counter, because the completion queue is one queue;
+    /// the handle it becomes carries `IoOwner::Blocks`, so a store shared with the snapshot can tell the
+    /// two apart.
     write_handles: u64,
+    /// Completions this log did not ask for, waiting for the owner that did. Non-empty only on a volume two
+    /// callers share, and bounded by that caller's own queue — it cannot have more outstanding than the
+    /// store will hold.
+    foreign: VecDeque<(u64, Result<(), StoreFault>)>,
     segment: u8,
     /// The blocks each day wrote, so expiry can read a day's own records instead of searching the index
     /// for them. Block numbers count on across day boundaries, so a day owns a contiguous range and two
@@ -1112,6 +1260,7 @@ impl RecordLog {
             barrier: None,
             after_barrier: None,
             write_handles: 0,
+            foreign: VecDeque::new(),
             segment: 0,
             days: [BlockRange::default(); SEGMENT_VALUES],
             next_block: 0,
@@ -1182,7 +1331,7 @@ impl RecordLog {
         let freed = self.days[segment as usize].blocks as usize;
         // Nothing to react to: the reaction to a store that cannot do as it is told is rule 19's, and it
         // arrives with a store that can fail at it.
-        let _ = self.store.remove(segment);
+        let _ = self.store.remove(ObjectId::segment(segment));
         self.freed += freed as u64;
         self.days[segment as usize] = BlockRange::default();
         freed
@@ -1233,11 +1382,11 @@ impl RecordLog {
         // A barrier is not taken until the store says so, and nothing is recorded before it does (rule 17):
         // a handle spent on a barrier the queue refused would be one nothing ever completes, and coverage
         // would stop for ever waiting for it.
-        let handle = self.write_handles + 1;
+        let handle = IoOwner::Blocks.handle(self.write_handles + 1);
         if !self.store.submit_barrier(handle) {
             return false;
         }
-        self.write_handles = handle;
+        self.write_handles += 1;
         self.barrier = Some(handle);
         true
     }
@@ -1347,7 +1496,7 @@ impl RecordLog {
         let offset = block * BLOCK_BYTES as u64;
         if self
             .store
-            .read_at(segment, offset, &mut self.scratch)
+            .read_at(ObjectId::segment(segment), offset, &mut self.scratch)
             .is_err()
         {
             // The range says this block was written, so the store not having it is this node's own
@@ -1473,7 +1622,11 @@ impl RecordLog {
         self.store_reads += 1;
         if self
             .store
-            .read_at(addr.segment(), addr.block_offset(), &mut self.scratch)
+            .read_at(
+                ObjectId::segment(addr.segment()),
+                addr.block_offset(),
+                &mut self.scratch,
+            )
             .is_err()
         {
             self.note_fault();
@@ -1489,10 +1642,12 @@ impl RecordLog {
     /// Asks the store for the block this address is on. False is backpressure: the store will not take
     /// another read yet.
     pub fn fetch(&mut self, handle: u64, addr: RecordAddr, now: u64) -> bool {
-        if !self
-            .store
-            .submit(handle, addr.segment(), addr.block_offset(), now)
-        {
+        if !self.store.submit(
+            handle,
+            ObjectId::segment(addr.segment()),
+            addr.block_offset(),
+            now,
+        ) {
             return false;
         }
         self.fetching.insert(handle, addr);
@@ -1653,25 +1808,41 @@ impl RecordLog {
             else {
                 break;
             };
-            let handle = *write_handles + 1;
+            let handle = IoOwner::Blocks.handle(*write_handles + 1);
             // Refused means the store's queue is full: the note stays where it is and is offered again next
             // round. Nothing observable moves before the store has taken it (rule 17) — the handle is only
             // spent once the submit succeeded.
             if !store.submit_write(
                 handle,
-                unwritten.segment,
+                ObjectId::segment(unwritten.segment),
                 offset,
                 &held.bytes,
                 unwritten.opening,
             ) {
                 break;
             }
-            *write_handles = handle;
+            *write_handles += 1;
             pending_writes.pop_front();
             submitted_writes.push_back((handle, unwritten));
             any = true;
         }
         any
+    }
+
+    /// The volume these blocks are on, for whoever else is on it.
+    ///
+    /// **Not a way past the log, and the namespace is what keeps it honest**: an object is a day or a
+    /// snapshot, and the day ↔ segment mapping stays here. What a sharer gets is the disk, which is the
+    /// point of there being one — every IO into it is submitted, counted and queued at this one place
+    /// whoever asked for it (§20).
+    pub fn volume(&mut self) -> &mut dyn DurableStore {
+        self.store.as_mut()
+    }
+
+    /// The next completion this log polled that belongs to somebody else. Drained by that owner, which is
+    /// how a shared volume keeps one poller and still answers two callers.
+    pub fn take_foreign(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
+        self.foreign.pop_front()
     }
 
     /// Blocks closed or submitted and not yet answered for.
@@ -1688,6 +1859,15 @@ impl RecordLog {
     pub fn collect_writes(&mut self) -> bool {
         let mut any = false;
         while let Some((handle, outcome)) = self.store.poll_written() {
+            // Somebody else's, on a store this volume shares. One queue has one poller, so what does not
+            // belong to the blocks is put where its owner will find it rather than dropped — dropping it
+            // would leave that owner waiting on a completion that already came (rule 18: the handle says
+            // whose it is, and nobody has to infer it).
+            if !IoOwner::Blocks.owns(handle) {
+                self.foreign.push_back((handle, outcome));
+                any = true;
+                continue;
+            }
             any = true;
             if self.barrier == Some(handle) {
                 self.barrier = None;
@@ -1817,6 +1997,7 @@ pub struct LogTraffic {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testkit::HoldingStore;
 
     fn hold(amount: Amount) -> HoldData {
         HoldData {
@@ -1891,11 +2072,11 @@ mod tests {
         };
         let mut modelled = LatencyStore::new(Box::new(MemoryStore::default()), slow_model, 1);
         let block = Block::zeroed();
-        assert!(modelled.submit_write(1, 0, 0, &block, true));
+        assert!(modelled.submit_write(1, ObjectId::segment(0), 0, &block, true));
         assert_eq!(modelled.poll_written(), Some((1, Ok(()))));
         let mut into = Block::zeroed();
 
-        assert!(modelled.submit(7, 0, 0, 0));
+        assert!(modelled.submit(7, ObjectId::segment(0), 0, 0));
         assert!(
             modelled.poll(0, &mut into).is_none(),
             "the model released a read at once, so its own time did not gate anything"
@@ -1916,112 +2097,14 @@ mod tests {
             ..StoreModel::default()
         };
         let mut stacked = LatencyStore::new(inner, free, 3);
-        assert!(stacked.submit_write(1, 0, 0, &block, true));
+        assert!(stacked.submit_write(1, ObjectId::segment(0), 0, &block, true));
         assert_eq!(stacked.poll_written(), Some((1, Ok(()))));
-        assert!(stacked.submit(9, 0, 0, 0));
+        assert!(stacked.submit(9, ObjectId::segment(0), 0, 0));
         assert!(
             stacked.poll(0, &mut into).is_none(),
             "the outer model released a read the store below had not answered"
         );
         assert_eq!(stacked.poll(1_000, &mut into), Some(Ok(9)));
-    }
-
-    /// A store that takes writes and answers for them only when asked.
-    ///
-    /// `MemoryStore` answers as it takes, so nothing is ever outstanding under it and the eviction gate is
-    /// unreachable. Shared through an `Rc` for the same reason the snapshot tests' store is: the log owns
-    /// the box, and the test has to reach past it to say when the device replies.
-    #[derive(Clone, Default)]
-    struct HoldingStore(std::rc::Rc<std::cell::RefCell<Holding>>);
-
-    #[derive(Default)]
-    struct Holding {
-        inner: MemoryStore,
-        held: VecDeque<(u64, Result<(), StoreFault>)>,
-        release: usize,
-    }
-
-    impl HoldingStore {
-        fn release_all(&self) {
-            let mut held = self.0.borrow_mut();
-            held.release = held.held.len();
-        }
-    }
-
-    impl DurableStore for HoldingStore {
-        fn submit_write(
-            &mut self,
-            handle: u64,
-            segment: u8,
-            offset: u64,
-            block: &Block,
-            creating: bool,
-        ) -> bool {
-            let mut held = self.0.borrow_mut();
-            if !held
-                .inner
-                .submit_write(handle, segment, offset, block, creating)
-            {
-                return false;
-            }
-            while let Some(done) = held.inner.poll_written() {
-                held.held.push_back(done);
-            }
-            true
-        }
-
-        fn submit_barrier(&mut self, handle: u64) -> bool {
-            let mut held = self.0.borrow_mut();
-            if !held.inner.submit_barrier(handle) {
-                return false;
-            }
-            while let Some(done) = held.inner.poll_written() {
-                held.held.push_back(done);
-            }
-            true
-        }
-
-        fn poll_written(&mut self) -> Option<(u64, Result<(), StoreFault>)> {
-            let mut held = self.0.borrow_mut();
-            if held.release == 0 {
-                return None;
-            }
-            let done = held.held.pop_front()?;
-            held.release -= 1;
-            Some(done)
-        }
-
-        fn writes_inflight(&self) -> usize {
-            self.0.borrow().held.len()
-        }
-
-        fn read_at(
-            &mut self,
-            segment: u8,
-            offset: u64,
-            into: &mut Block,
-        ) -> Result<(), StoreFault> {
-            self.0.borrow_mut().inner.read_at(segment, offset, into)
-        }
-
-        fn submit(&mut self, handle: u64, segment: u8, offset: u64, now: u64) -> bool {
-            self.0
-                .borrow_mut()
-                .inner
-                .submit(handle, segment, offset, now)
-        }
-
-        fn poll(&mut self, now: u64, into: &mut Block) -> Option<Result<u64, StoreFault>> {
-            self.0.borrow_mut().inner.poll(now, into)
-        }
-
-        fn inflight(&self) -> usize {
-            self.0.borrow().inner.inflight()
-        }
-
-        fn remove(&mut self, segment: u8) -> Result<(), StoreFault> {
-            self.0.borrow_mut().inner.remove(segment)
-        }
     }
 
     /// **A block that is not in the memory tier has already been written**, and a store answering out of

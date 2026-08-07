@@ -4,11 +4,28 @@
 //! readers and only one of them is a disk — a follower too far behind receives the same stream over a wire
 //! that does not exist yet (design notes §15).
 //!
-//! **One file, replaced whole.** A dump is written to a partial name, made durable, and only then renamed
-//! over the current one, with the directory synced after so the name itself survives. So a crash at any
-//! point leaves either the previous snapshot or the new one, and never a prefix of the new one wearing the
-//! current one's name — which a reader could not tell from a complete stream, since the header says how
-//! many records there are and a truncated file simply ends early.
+//! **It goes through the store, which is the one path to a disk** (§20). A chunk is a whole block at an
+//! offset, submitted and answered for exactly as a record block is, so the dump's writes are counted,
+//! queued and bounded by the same thing everything else on that volume is. Before this they were a
+//! `File::write_all` beside the store: invisible to every IO figure the tools print, sharing no queue with
+//! the reads they compete with.
+//!
+//! **Its queue is its own, and the volume's is not.** Blocks and snapshots are two writers with two
+//! backlogs, two handle spaces and two reactions to a full queue — the log stops applying so backpressure
+//! reaches the client, and a dump simply waits. What they share is the device, when a deployment declares
+//! that they do: then one `DurableStore` serves both, because IO into one disk has to be managed and
+//! watched in one place whoever asked for it.
+//!
+//! **One file, replaced whole.** A dump is written to a partial name, made durable by a barrier, and only
+//! then renamed over the current one — and the store's `rename` syncs the directory, because a name is not
+//! durable until the directory holding it is. So a crash at any point leaves either the previous snapshot
+//! or the new one, and never a prefix of the new one wearing the current one's name.
+//!
+//! **The rename waits for every completion, and that is rule 22 rather than caution.** While the chunk
+//! write was a synchronous `write_all`, "the stream is written" and "the last chunk returned" were the same
+//! moment; submitted, they are not. A rename issued between them would publish a prefix. So the dump has
+//! phases — filling, sealing, publishing — and nothing destructive happens while a write of this dump is
+//! still outstanding, including the removal of a partial that is being given up on.
 //!
 //! **The cadence is a log distance, not a duration, and that is what removes the clock.** What recovery
 //! costs is the effects it replays, and what the log has to retain is the entries it keeps — both are
@@ -16,14 +33,14 @@
 //! backwards) nor a monotonic one (which restarts at zero). A node applying nothing writes no snapshots,
 //! and a node at ten times the rate writes them ten times as often, without either being configured for.
 //!
-//! **The throttle is bytes a round**, which is the same shape every other background path here takes.
-//! What it buys is measured rather than argued: the dump's own work is nothing — 42.7GB of stream costs
-//! the engine three to eight seconds (`cargo bench -p ledger-pending --bench snapshot`) — and 85 seconds
-//! of a 500MB/s volume. So the throttle is pacing against a disk and against the worker's thread, not
-//! against this code, and the one thing it trades is below.
+//! **The throttle is bytes a round**, which is the same shape every other background path here takes, and
+//! it is now a whole number of blocks because a block is what the store takes. What it buys is measured
+//! rather than argued: the dump's own work is nothing — 42.7GB of stream costs the engine three to eight
+//! seconds (`cargo bench -p ledger-pending --bench snapshot`) — and 85 seconds of a 500MB/s volume. So the
+//! throttle is pacing against a disk and against the worker's thread, not against this code.
 //!
 //! **A round is what the dump gets, so it yields to traffic without being told to.** The stage takes one
-//! chunk per worker round and the worker's rounds go to commands first, so the same throttle writes
+//! turn per worker round and the worker's rounds go to commands first, so the same throttle writes
 //! 558MB/s when the engine has rounds to spare and 35MB/s when it is saturated — measured at 4KB a round,
 //! five seconds of `partial-settle` at 1M/s against the same at the ceiling. That is the property a rate
 //! limit expressed in bytes a second would not have had.
@@ -35,112 +52,11 @@
 //! growing past it. Abandoning costs the work and nothing else: the previous snapshot is still current,
 //! and the next cadence tries again.
 
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
-
 use ledger_base::ports::ApplyIndex;
 
+use crate::block::{Block, DurableStore, IoOwner, ObjectId, StoreFault, BLOCK_BYTES};
 use crate::engine::PendingEngine;
-use crate::snapshot::{NotASnapshot, SnapshotReader, SnapshotWriter, RECORD};
-
-/// The snapshot a restart reads. One name, because the log retention rule makes an older one useless: a
-/// snapshot is only restorable while the log still holds everything after its coverage.
-const CURRENT: &str = "pending.snapshot";
-/// The one being written. A separate name is what makes the replacement atomic — see the module note.
-const PARTIAL: &str = "pending.snapshot.part";
-
-/// Read back in pieces for the same reason it is written in them: the whole is 42.7GB at the design's
-/// size. Larger than the write chunk because nothing competes with a restore — there is no traffic yet.
-const READ_CHUNK: usize = 1 << 20;
-
-/// Where snapshots go: a directory, opened and checked before any thread owns it.
-///
-/// Opened by the caller for the same reason `open_directory` is (`files.rs`): a directory that cannot be
-/// used is a configuration error, and a configuration error has to be refused at start-up where somebody
-/// can be told rather than on a worker thread whose only way to report it would be to panic (rule 6).
-///
-/// **Its own directory, not the store's.** Whether the two share a volume is a provisioning decision and
-/// the design puts the log and the snapshot together (§2.2); either way the throttle is required, so
-/// nothing here depends on the answer. Taking two paths is what keeps the answer outside the code.
-pub struct SnapshotDir {
-    /// Open for its own sake: a rename is not durable until the directory it happened in is synced, and
-    /// syncing a directory means having it open.
-    dir: File,
-    path: PathBuf,
-}
-
-impl SnapshotDir {
-    pub fn open(path: &Path) -> Result<Self, std::io::Error> {
-        std::fs::create_dir_all(path)?;
-        let dir = File::open(path)?;
-        Ok(Self {
-            dir,
-            path: path.to_path_buf(),
-        })
-    }
-
-    fn current(&self) -> PathBuf {
-        self.path.join(CURRENT)
-    }
-
-    fn partial(&self) -> PathBuf {
-        self.path.join(PARTIAL)
-    }
-
-    /// Reads the current snapshot into `engine`, and answers whether there was one. A directory with no
-    /// snapshot in it is the ordinary state of a node that has not written one yet, so it is `Ok(false)`
-    /// rather than an error.
-    ///
-    /// **What this restores is the index, the group totals and the coverage — not a node.** The engine's
-    /// `RecordLog` still has no position: it does not know which block to write next or which blocks each
-    /// day owns, so an engine restored here answers lookups against the blocks that are there and must not
-    /// be written to. Deriving those from the restored slots is the first half of the start-up reconcile,
-    /// and it is deliberately not here — see `status.md`. Until it is, this has one caller and it is a
-    /// test.
-    pub fn read_into(&self, engine: &mut PendingEngine) -> Result<bool, NotASnapshot> {
-        let mut file = match File::open(self.current()) {
-            Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-            Err(_) => return Err(NotASnapshot::Unreadable),
-        };
-        let mut reader = SnapshotReader::new();
-        let mut chunk = vec![0u8; READ_CHUNK];
-        loop {
-            let read = Self::fill(&mut file, &mut chunk)?;
-            if read == 0 {
-                break;
-            }
-            // A stream is a whole number of records by construction, so a tail that is not one is a file
-            // that was truncated — refused rather than interpreted, like every other malformed stream.
-            if !read.is_multiple_of(RECORD) {
-                return Err(NotASnapshot::Malformed);
-            }
-            reader.take_chunk(&chunk[..read], engine.index_mut())?;
-        }
-        if !reader.is_complete() {
-            return Err(NotASnapshot::Malformed);
-        }
-        let coverage = reader.coverage();
-        engine.restore(reader.into_groups(), coverage);
-        Ok(true)
-    }
-
-    /// As much of `into` as the file has. A short `read` is ordinary rather than an error, so the loop is
-    /// what turns a stream of them into whole chunks.
-    fn fill(file: &mut File, into: &mut [u8]) -> Result<usize, NotASnapshot> {
-        let mut at = 0;
-        while at < into.len() {
-            match file.read(&mut into[at..]) {
-                Ok(0) => break,
-                Ok(read) => at += read,
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => return Err(NotASnapshot::Unreadable),
-            }
-        }
-        Ok(at)
-    }
-}
+use crate::snapshot::{NotASnapshot, SnapshotReader, SnapshotWriter};
 
 /// How often a snapshot is written, how fast, and how much the stable read may hold aside while it is.
 ///
@@ -152,9 +68,9 @@ pub struct SnapshotPolicy {
     /// Log positions between one dump's coverage and the next dump's start. **Zero writes none**, which is
     /// the default everywhere: a node that wrote files nobody asked for would change what a run means.
     pub every: u64,
-    /// Bytes of the stream one worker round writes — the throttle. It is a `pwrite` on the thread that
-    /// answers lookups, which is the same thread and the same cost as a block write, and the closed
-    /// decision on those is what says the budget is real.
+    /// Bytes of the stream one worker round writes — the throttle. A whole number of blocks, because a
+    /// block is the unit the store takes; `MemoryPendingConfig::validate` refuses anything else rather
+    /// than rounding a declared number into a different one.
     pub bytes_per_round: usize,
     /// Buckets the copy-on-write side buffer may hold before the dump is abandoned. The declared ceiling
     /// rule 20 asks for: without it the bound is whatever the allocator does when a dump runs long.
@@ -175,12 +91,17 @@ impl Default for SnapshotPolicy {
 ///
 /// **Chosen for the tail rather than for the total**, and the two disagree. Per byte written a larger chunk
 /// is cheaper — 64KB costs 0.11% of throughput for each MB/s it writes against 4KB's 0.28%, because the
-/// syscall is amortised over more of them. But a chunk is written inside one worker round, so it is a stall
-/// on the thread every lookup passes through, and while a dump runs the median goes 1.5ms at 4KB to 6.5ms
-/// at 64KB against a baseline of 1.3ms. A small chunk that runs more of the time costs the median a little;
-/// a large one that runs less of the time costs a percentile a lot, and a percentile is what the contract
-/// names. Design notes §19 has both curves.
-pub const DEFAULT_BYTES_PER_ROUND: usize = 4096;
+/// syscall is amortised over more of them. But a chunk was written inside one worker round, so it was a
+/// stall on the thread every lookup passes through, and while a dump runs the median goes 1.5ms at 4KB to
+/// 6.5ms at 64KB against a baseline of 1.3ms. A small chunk that runs more of the time costs the median a
+/// little; a large one that runs less of the time costs a percentile a lot, and a percentile is what the
+/// contract names. Design notes §19 has both curves.
+///
+/// **That argument is against an arrangement that has since changed, and the number has to be taken
+/// again.** The chunk holds the worker's thread only while the write is synchronous; on a write lane it is
+/// a queue's cost, and the cheaper large chunk wins. It stays at a block because that is the right number
+/// for the default path, which is still the synchronous one — see §20's list of what it invalidates.
+pub const DEFAULT_BYTES_PER_ROUND: usize = BLOCK_BYTES;
 
 /// Buckets the shadow may hold: 64MB of slots, and it is headroom rather than a prediction.
 ///
@@ -199,7 +120,7 @@ pub struct SnapshotStats {
     pub written: u64,
     /// Dumps given up on: a write that failed, a shadow past its budget, or a store that broke under one.
     pub abandoned: u64,
-    /// Bytes handed to the file, published ones and given-up ones alike — what the throttle actually cost
+    /// Bytes handed to the store, published ones and given-up ones alike — what the throttle actually cost
     /// the volume.
     pub bytes: u64,
     /// The most buckets the stable read held aside at once, against `shadow_budget`.
@@ -217,10 +138,20 @@ pub struct SnapshotStats {
 /// buffer for the same reason the engine owns its scratch block: a background path that allocated per
 /// round would allocate for ever.
 pub struct Snapshots {
-    dest: SnapshotDir,
+    /// The volume this dump goes to when it is not the engine's own. `None` means the deployment declared
+    /// one disk for both, so the blocks' store serves this too — one queue, because there is one device.
+    own: Option<Box<dyn DurableStore>>,
     policy: SnapshotPolicy,
-    chunk: Vec<u8>,
+    /// One block, produced and then submitted. It is held across rounds when the queue would not take it:
+    /// producing a chunk consumes the shadow entries for the buckets it read, so a chunk cannot be
+    /// produced twice, and a refusal must therefore keep the bytes rather than the position.
+    chunk: Box<Block>,
+    /// Whether `chunk` holds a block that has been produced and not yet taken by the store.
+    unsubmitted: bool,
     inflight: Option<InFlight>,
+    /// Sequence numbers for this writer's submissions. Its own counter, tagged `IoOwner::Snapshot`, so a
+    /// shared volume can hand each completion back to the writer that asked for it.
+    handles: u64,
     /// The position the next dump is measured from. Moved by an attempt rather than by a success, so a
     /// destination that keeps refusing backs off to the cadence instead of retrying every round — it is
     /// not a claim about what is on disk, and `stats.covered` is.
@@ -228,19 +159,47 @@ pub struct Snapshots {
     stats: SnapshotStats,
 }
 
+/// What a dump is doing. The phases exist because the write is submitted rather than done: each one is a
+/// thing that must not happen until the one before it has been answered for.
+enum Phase {
+    /// Producing chunks and submitting them.
+    Filling,
+    /// The stream is submitted. A barrier is what makes it durable before the name changes; `None` is one
+    /// the queue has not taken yet.
+    Sealing(Option<u64>),
+    /// The barrier has been answered, so the bytes are on the disk. What is left is the name — and it
+    /// waits for the last completion, because a rename with a write of this dump still out would publish
+    /// a prefix.
+    Publishing,
+    /// This dump will not be published. The shadow is already gone; what is left is to answer for the
+    /// writes still out and then remove the partial — removing it first would leave writes landing in a
+    /// file nothing will ever look at.
+    Draining,
+}
+
 struct InFlight {
     writer: SnapshotWriter,
-    file: File,
     rounds: u64,
+    /// Blocks of the stream submitted so far, which is both the next offset and whether the next write is
+    /// the one that brings the object into being.
+    blocks: u64,
+    /// Writes and barriers of this dump the store has not answered for.
+    outstanding: usize,
+    phase: Phase,
 }
 
 impl Snapshots {
-    pub fn new(dest: SnapshotDir, policy: SnapshotPolicy) -> Self {
+    /// `own` is the volume this writes to, and `None` says the deployment declared the blocks' disk for
+    /// both. Handed in rather than opened here: which volume a directory is on is a declaration, and the
+    /// one thing this stage must not do is decide it (§20).
+    pub fn new(own: Option<Box<dyn DurableStore>>, policy: SnapshotPolicy) -> Self {
         Self {
-            chunk: vec![0u8; policy.bytes_per_round.max(RECORD)],
-            dest,
+            own,
             policy,
+            chunk: Block::zeroed(),
+            unsubmitted: false,
             inflight: None,
+            handles: 0,
             next_from: ApplyIndex::default(),
             stats: SnapshotStats::default(),
         }
@@ -250,7 +209,31 @@ impl Snapshots {
         self.stats
     }
 
-    /// This round's share: a chunk of the dump in flight, or the start of one if the log has moved far
+    /// The disk. One place, whether it is this stage's own or shared with the blocks — which is the whole
+    /// of what "one path to a device" buys: nothing above here has two ways to reach one.
+    fn volume<'a>(
+        own: &'a mut Option<Box<dyn DurableStore>>,
+        engine: &'a mut PendingEngine,
+    ) -> &'a mut dyn DurableStore {
+        match own {
+            Some(store) => store.as_mut(),
+            None => engine.volume(),
+        }
+    }
+
+    /// The next completion of this stage's. On a volume of its own that is the store's queue; on a shared
+    /// one the log is the poller and this is where it leaves what is not its own.
+    fn completion(
+        own: &mut Option<Box<dyn DurableStore>>,
+        engine: &mut PendingEngine,
+    ) -> Option<(u64, Result<(), StoreFault>)> {
+        match own {
+            Some(store) => store.poll_written(),
+            None => engine.take_foreign_completion(),
+        }
+    }
+
+    /// This round's share: a turn at the dump in flight, or the start of one if the log has moved far
     /// enough since the last. Answers whether it did anything, so the worker's backoff sees it as work.
     pub fn round(&mut self, engine: &mut PendingEngine) -> bool {
         if self.inflight.is_some() {
@@ -268,33 +251,31 @@ impl Snapshots {
     /// Ends a dump in flight without publishing it. The worker calls this when the store has broken: the
     /// apply path is sealed, so nothing more will be applied and a half-written snapshot of a node that
     /// has stopped is work nobody will read.
+    ///
+    /// The shadow goes now; the partial goes when the writes still out have been answered for. Those are
+    /// two events because the store made them two — see `give_up`.
     pub fn abandon(&mut self, engine: &mut PendingEngine) {
-        let Some(run) = self.inflight.take() else {
+        let Some(mut run) = self.inflight.take() else {
             return;
         };
-        self.give_up(run, engine);
+        self.give_up(&mut run, engine);
+        self.inflight = Some(run);
     }
 
-    /// The file first, the shadow second. Opening is the fallible half and it changes nothing observable
-    /// (rule 17); `begin_snapshot` is what the engine then has to live with until the dump ends.
+    /// Starts one. The partial is removed first so the dump's first chunk can bring the object into being:
+    /// `creating` is what a store checks with `O_EXCL`, and a partial left by a crash would otherwise
+    /// refuse the first write of every dump until one of them cleared it.
     fn begin(&mut self, engine: &mut PendingEngine) -> bool {
-        let opened = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(self.dest.partial());
-        let Ok(file) = opened else {
-            // Counted and backed off rather than retried: a directory that refuses one round refuses the
-            // next, and a retry every round would be a syscall per round for as long as it stays broken.
-            self.stats.abandoned += 1;
-            self.next_from = engine.applied_through();
-            return false;
-        };
+        let store = Self::volume(&mut self.own, engine);
+        let _ = store.remove(ObjectId::SNAPSHOT_PARTIAL);
         self.inflight = Some(InFlight {
             writer: engine.begin_snapshot(),
-            file,
             rounds: 0,
+            blocks: 0,
+            outstanding: 0,
+            phase: Phase::Filling,
         });
+        self.unsubmitted = false;
         true
     }
 
@@ -303,13 +284,42 @@ impl Snapshots {
             return false;
         };
         run.rounds += 1;
-        let written = engine.next_snapshot_chunk(&mut run.writer, &mut self.chunk);
-        if written > 0 {
-            self.stats.bytes += written as u64;
-            if run.file.write_all(&self.chunk[..written]).is_err() {
-                self.give_up(run, engine);
-                return true;
+        let mut broken = false;
+        while let Some((handle, outcome)) = Self::completion(&mut self.own, engine) {
+            debug_assert!(
+                IoOwner::Snapshot.owns(handle),
+                "a completion that is not this writer's reached it"
+            );
+            run.outstanding = run.outstanding.saturating_sub(1);
+            if outcome.is_err() {
+                broken = true;
+            } else if matches!(run.phase, Phase::Sealing(Some(barrier)) if barrier == handle) {
+                run.phase = Phase::Publishing;
             }
+        }
+        if broken {
+            // A failed write ends the dump rather than retrying the chunk, and the shadow is why:
+            // producing a chunk consumes the shadow entries for the buckets it read, so a chunk that was
+            // produced and not written cannot be produced again. Retry is at the granularity of a dump,
+            // which is the granularity the cadence already has.
+            self.give_up(&mut run, engine);
+        }
+        match run.phase {
+            Phase::Filling => self.fill(&mut run, engine),
+            Phase::Sealing(None) => {
+                // Everything this dump wrote is submitted, and a barrier is what makes it durable. Asked
+                // for before the writes are answered for on purpose: the lane keeps the order, so a barrier
+                // behind them in the queue is a barrier behind them on the device.
+                let handle = IoOwner::Snapshot.handle(self.handles + 1);
+                let store = Self::volume(&mut self.own, engine);
+                if store.submit_barrier(handle) {
+                    self.handles += 1;
+                    run.outstanding += 1;
+                    run.phase = Phase::Sealing(Some(handle));
+                }
+            }
+            // Waiting: for the barrier, or for the last completion the two arms below need.
+            Phase::Sealing(Some(_)) | Phase::Publishing | Phase::Draining => {}
         }
         // Asked after the chunk rather than before it, because the chunk is what the shadow was holding
         // for: the buckets this round read are dropped as they are read, so the peak is what is left.
@@ -320,54 +330,161 @@ impl Snapshots {
         // comparison on the apply path to bound a background one.
         let shadow = engine.shadowed_buckets();
         self.stats.shadow_peak = self.stats.shadow_peak.max(shadow as u64);
-        if run.writer.is_complete() {
-            self.publish(run, engine);
+        if shadow > self.policy.shadow_budget {
+            self.give_up(&mut run, engine);
+        }
+        // Nothing destructive while a write of this dump is still out, and the two ends of that need
+        // different amounts of it. The **rename** is ordered by the barrier already — a barrier follows
+        // every write it covers, and its completion is what `Publishing` means — so the count is belt
+        // beside braces there. The **removal** has no barrier and nothing else: `abandon` arrives whenever
+        // the store breaks, and removing the object with chunks still queued would leave them landing in a
+        // file nothing will look at, their completions arriving for a dump that no longer exists. One
+        // counter for both, because "this dump still has IO out" is one fact (rule 18).
+        if run.outstanding > 0 {
+            self.inflight = Some(run);
             return true;
         }
-        if written == 0 || shadow > self.policy.shadow_budget {
-            self.give_up(run, engine);
-            return true;
+        match run.phase {
+            Phase::Publishing => self.publish(run, engine),
+            Phase::Draining => {
+                let store = Self::volume(&mut self.own, engine);
+                let _ = store.remove(ObjectId::SNAPSHOT_PARTIAL);
+            }
+            _ => self.inflight = Some(run),
         }
-        self.inflight = Some(run);
         true
     }
 
-    /// Durable, then current, then the name durable too — one call, because two of the three succeeding is
-    /// a snapshot that is not one (rule 16). The shadow is already gone: the writer completing is what
-    /// ended it.
+    /// Produces blocks and submits them, up to the throttle. One at a time, because a produced block that
+    /// the queue would not take has to wait as bytes: the shadow entries it read are already gone, so the
+    /// same block cannot be produced a second time.
+    fn fill(&mut self, run: &mut InFlight, engine: &mut PendingEngine) {
+        for _ in 0..(self.policy.bytes_per_round / BLOCK_BYTES).max(1) {
+            if !self.unsubmitted {
+                let produced = engine.next_snapshot_chunk(&mut run.writer, &mut self.chunk[..]);
+                if produced == 0 {
+                    run.phase = Phase::Sealing(None);
+                    return;
+                }
+                // The last chunk of a stream is short of a block, and a disk takes whole ones. Zeroed
+                // rather than left as whatever the buffer held, because the reader has to be able to tell
+                // padding from a record it was not promised — see `SnapshotReader::take_chunk`.
+                self.chunk[produced..].fill(0);
+                self.unsubmitted = true;
+            }
+            let handle = IoOwner::Snapshot.handle(self.handles + 1);
+            let creating = run.blocks == 0;
+            let offset = run.blocks * BLOCK_BYTES as u64;
+            let store = Self::volume(&mut self.own, engine);
+            // Refused is the volume's queue being full, which for this writer means waiting — the log's
+            // answer to the same refusal is to stop applying, and one queue cannot express two reactions.
+            if !store.submit_write(
+                handle,
+                ObjectId::SNAPSHOT_PARTIAL,
+                offset,
+                &self.chunk,
+                creating,
+            ) {
+                return;
+            }
+            self.handles += 1;
+            self.unsubmitted = false;
+            run.blocks += 1;
+            run.outstanding += 1;
+            self.stats.bytes += BLOCK_BYTES as u64;
+            if run.writer.is_complete() {
+                run.phase = Phase::Sealing(None);
+                return;
+            }
+        }
+    }
+
+    /// The name, and then the cadence. The bytes are durable already — the barrier this waited for is what
+    /// made them so — and the store's rename is what makes the *name* durable, which is the half a `sync`
+    /// of the file alone would leave out.
     fn publish(&mut self, run: InFlight, engine: &mut PendingEngine) {
         let coverage = run.writer.coverage();
-        let rounds = run.rounds;
-        let published = run.file.sync_all().is_ok()
-            && std::fs::rename(self.dest.partial(), self.dest.current()).is_ok()
-            && self.dest.dir.sync_all().is_ok();
+        let store = Self::volume(&mut self.own, engine);
+        let published = store
+            .rename(ObjectId::SNAPSHOT_PARTIAL, ObjectId::SNAPSHOT_CURRENT)
+            .is_ok();
+        if !published {
+            let _ = store.remove(ObjectId::SNAPSHOT_PARTIAL);
+        }
         // Whatever happened, the next dump is measured from here: a destination that refused the rename
         // will refuse it again in a round's time, and the cadence is the right thing to wait for.
         self.next_from = engine.applied_through();
         if published {
             self.stats.written += 1;
-            self.stats.last_rounds = rounds;
+            self.stats.last_rounds = run.rounds;
             self.stats.covered = coverage.raw();
             return;
         }
         self.stats.abandoned += 1;
-        let _ = std::fs::remove_file(self.dest.partial());
     }
 
-    /// Ends a dump that will not be published: the shadow goes, the partial file goes, and the cadence
-    /// starts again from here. Nothing is lost but the work — the current snapshot is untouched, which is
-    /// the whole reason a dump is written to a name of its own.
-    fn give_up(&mut self, run: InFlight, engine: &mut PendingEngine) {
-        drop(run.file);
-        let _ = std::fs::remove_file(self.dest.partial());
+    /// Ends a dump that will not be published: the shadow goes now, the cadence starts again from here, and
+    /// the partial waits for the writes still out. Nothing is lost but the work — the current snapshot is
+    /// untouched, which is the whole reason a dump is written to a name of its own.
+    ///
+    /// The shadow does not wait for the IO and must not: it is the index holding buckets aside, so keeping
+    /// it until a device answers would make a slow disk cost the apply path memory.
+    fn give_up(&mut self, run: &mut InFlight, engine: &mut PendingEngine) {
+        if matches!(run.phase, Phase::Draining) {
+            return;
+        }
+        run.phase = Phase::Draining;
+        self.unsubmitted = false;
         engine.abandon_snapshot();
         self.stats.abandoned += 1;
         self.next_from = engine.applied_through();
+    }
+
+    /// Reads the current snapshot into `engine`, and answers whether there was one. A volume with no
+    /// snapshot on it is the ordinary state of a node that has not written one yet, so it is `Ok(false)`
+    /// rather than an error — and that is a question for `exists` rather than for a read, because a read of
+    /// block zero cannot tell an absent object from an absent block.
+    ///
+    /// **What this restores is the index, the group totals and the coverage — not a node.** The engine's
+    /// `RecordLog` still has no position: it does not know which block to write next or which blocks each
+    /// day owns, so an engine restored here answers lookups against the blocks that are there and must not
+    /// be written to. Deriving those from the restored slots is the first half of the start-up reconcile,
+    /// and it is deliberately not here — see `status.md`. Until it is, this has one caller and it is a
+    /// test.
+    pub fn read_into(&mut self, engine: &mut PendingEngine) -> Result<bool, NotASnapshot> {
+        let store = Self::volume(&mut self.own, engine);
+        if !store.exists(ObjectId::SNAPSHOT_CURRENT) {
+            return Ok(false);
+        }
+        let mut reader = SnapshotReader::new();
+        let mut at = 0u64;
+        while !reader.is_complete() {
+            let store = Self::volume(&mut self.own, engine);
+            // The two faults say two different things here and the difference is worth keeping. A block
+            // this object does not have, before the header's count has been met, is a stream that ends
+            // earlier than it said it would — malformed. A device that refused is not a claim about the
+            // format at all (§17).
+            match store.read_at(
+                ObjectId::SNAPSHOT_CURRENT,
+                at * BLOCK_BYTES as u64,
+                &mut self.chunk,
+            ) {
+                Ok(()) => {}
+                Err(StoreFault::Missing) => return Err(NotASnapshot::Malformed),
+                Err(StoreFault::Device) => return Err(NotASnapshot::Unreadable),
+            }
+            at += 1;
+            reader.take_chunk(&self.chunk, engine.index_mut())?;
+        }
+        let coverage = reader.coverage();
+        engine.restore(reader.into_groups(), coverage);
+        Ok(true)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use ledger_base::ports::PendingEffect;
@@ -375,6 +492,8 @@ mod tests {
 
     use super::*;
     use crate::block::{MemoryStore, RECORDS_PER_BLOCK};
+    use crate::snapshot::RECORD;
+    use crate::testkit::HoldingStore;
 
     /// A directory of its own per test, removed with it. Named from the process and a counter for the same
     /// reason `files.rs`'s is: a test that could collide with another run of itself fails for a reason
@@ -393,24 +512,20 @@ mod tests {
             Self(path)
         }
 
-        /// Snapshots and blocks in directories of their own, which is what the two flags are: the
-        /// destination is not the store's, so a test that put them together would be testing a layout
-        /// no deployment has to have.
-        fn dir(&self) -> SnapshotDir {
-            SnapshotDir::open(&self.0.join("snapshots")).expect("the scratch directory opens")
-        }
-
-        /// A store over the same block files each time it is asked for, so a restored engine reads the
-        /// blocks the first one wrote — which is the whole shape of a restart. An engine restored over
-        /// an empty store would find every slot and read none of them.
-        fn store(&self) -> Box<dyn crate::block::DurableStore> {
-            let (dir, path) = crate::files::open_directory(&self.0.join("blocks"))
+        fn volume(&self, at: &str) -> Box<dyn DurableStore> {
+            let (dir, path) = crate::files::open_directory(&self.0.join(at))
                 .expect("the scratch directory opens");
             Box::new(crate::files::FileStore::new(dir, path, 32, 0, false))
         }
 
-        fn files(&self) -> Vec<String> {
-            let mut names: Vec<String> = std::fs::read_dir(self.0.join("snapshots"))
+        /// Snapshots and blocks on volumes of their own, which is what two directories mean until a
+        /// deployment declares otherwise.
+        fn snapshots(&self) -> Box<dyn DurableStore> {
+            self.volume("snapshots")
+        }
+
+        fn files(&self, at: &str) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(self.0.join(at))
                 .expect("the scratch directory reads")
                 .map(|entry| {
                     entry
@@ -422,6 +537,12 @@ mod tests {
                 .collect();
             names.sort();
             names
+        }
+
+        fn write_current(&self, bytes: &[u8]) {
+            let dir = self.0.join("snapshots");
+            std::fs::create_dir_all(&dir).expect("the scratch directory");
+            std::fs::write(dir.join("pending.snapshot"), bytes).expect("the junk file writes");
         }
     }
 
@@ -446,6 +567,11 @@ mod tests {
         PendingEngine::sized(slots, 1, 1024, Box::new(MemoryStore::default()))
     }
 
+    /// A stage on a volume of its own, which is what two directories mean.
+    fn apart(store: Box<dyn DurableStore>, policy: SnapshotPolicy) -> Snapshots {
+        Snapshots::new(Some(store), policy)
+    }
+
     fn fill(engine: &mut PendingEngine, holds: u64) {
         for id in 1..=holds {
             engine
@@ -457,33 +583,38 @@ mod tests {
         engine.collect_writes();
     }
 
-    /// Rounds until the stage stops having anything to do, so a test drives it the way the worker does.
+    /// Rounds until the stage stops having anything to do, so a test drives it the way the worker does —
+    /// the log's own poll included, because on a shared volume that is what routes this stage's
+    /// completions to it.
     fn drive(snapshots: &mut Snapshots, engine: &mut PendingEngine, rounds: usize) {
         for _ in 0..rounds {
-            if !snapshots.round(engine) {
+            let worked = snapshots.round(engine);
+            engine.collect_writes();
+            if !worked {
                 break;
             }
         }
     }
 
-    /// A snapshot written to a directory is read back into another engine over the same blocks, and
-    /// every hold it carried answers the same. The whole point of a destination, end to end and through
-    /// real files on both sides — which is the shape of a restart rather than of a round trip in memory.
+    /// A snapshot written to a volume is read back into another engine over the same blocks, and every
+    /// hold it carried answers the same. The whole point of a destination, end to end and through real
+    /// files on both sides — which is the shape of a restart rather than of a round trip in memory.
     #[test]
-    fn a_snapshot_written_to_a_directory_restores_into_another_engine() {
+    fn a_snapshot_written_to_a_volume_restores_into_another_engine() {
         let scratch = Scratch::new();
         let slots = 1 << 12;
         // Residency of nothing, so a carried slot has to be read from the files the first engine wrote.
-        let mut source = PendingEngine::sized(slots, 1, 0, scratch.store());
+        let mut source = PendingEngine::sized(slots, 1, 0, scratch.volume("blocks"));
         let holds = RECORDS_PER_BLOCK as u64 * 3;
         fill(&mut source, holds);
 
-        let mut snapshots = Snapshots::new(
-            scratch.dir(),
+        let mut snapshots = apart(
+            scratch.snapshots(),
             SnapshotPolicy {
                 every: 1,
-                // Several rounds' worth, so the pacing is exercised rather than stepped over.
-                bytes_per_round: RECORD * 4,
+                // One block a round, so several rounds are needed and the pacing is exercised rather than
+                // stepped over.
+                bytes_per_round: BLOCK_BYTES,
                 ..SnapshotPolicy::default()
             },
         );
@@ -493,18 +624,17 @@ mod tests {
         assert_eq!(stats.abandoned, 0);
         assert!(stats.last_rounds > 1, "the throttle wrote it in one round");
         assert_eq!(
-            scratch.files(),
-            vec![CURRENT.to_string()],
+            scratch.files("snapshots"),
+            vec!["pending.snapshot".to_string()],
             "the partial outlived the rename"
         );
 
-        let mut restored = PendingEngine::sized(slots, 1, 0, scratch.store());
+        let mut restored = PendingEngine::sized(slots, 1, 0, scratch.volume("blocks"));
         assert!(
-            scratch
-                .dir()
+            apart(scratch.snapshots(), SnapshotPolicy::default())
                 .read_into(&mut restored)
                 .expect("a snapshot this table can take"),
-            "the directory had no snapshot in it"
+            "the volume had no snapshot on it"
         );
         assert_eq!(restored.coverage(), ApplyIndex(stats.covered));
 
@@ -526,7 +656,7 @@ mod tests {
                     before.debit_account
                 ),
                 (after.remaining, after.budget_members, after.debit_account),
-                "hold {id} differs after a round trip through the directory"
+                "hold {id} differs after a round trip through the volume"
             );
             carried += 1;
         }
@@ -534,20 +664,108 @@ mod tests {
         assert!(restored.counts_agree());
     }
 
-    /// A directory with no snapshot in it is the ordinary state of a node that has not written one, so it
+    /// **One disk, one store, and the log is what polls it.** Two directories are two volumes and a
+    /// declaration is what collapses them; when it does, the dump submits to the blocks' store and its
+    /// completions come back through the log's own poll. Both halves are asserted: the snapshot and the
+    /// day's blocks end up in one directory, and the dump publishes — which it cannot do unless every
+    /// completion reached the writer that was waiting for it.
+    #[test]
+    fn a_declared_volume_carries_the_blocks_and_the_snapshot_on_one_store() {
+        let scratch = Scratch::new();
+        let slots = 1 << 12;
+        let mut source = PendingEngine::sized(slots, 1, 0, scratch.volume("one"));
+        fill(&mut source, RECORDS_PER_BLOCK as u64 * 3);
+
+        // No store of its own: the blocks' volume is this dump's volume too.
+        let mut snapshots = Snapshots::new(
+            None,
+            SnapshotPolicy {
+                every: 1,
+                bytes_per_round: BLOCK_BYTES,
+                ..SnapshotPolicy::default()
+            },
+        );
+        drive(&mut snapshots, &mut source, 100_000);
+        assert_eq!(
+            snapshots.stats().written,
+            1,
+            "a dump on the blocks' own volume never published, so its completions did not reach it"
+        );
+        let names = scratch.files("one");
+        assert!(
+            names.contains(&"pending.snapshot".to_string())
+                && names.iter().any(|name| name.starts_with("seg-")),
+            "one volume did not hold both the blocks and the snapshot: {names:?}"
+        );
+
+        let mut restored = PendingEngine::sized(slots, 1, 0, scratch.volume("one"));
+        assert!(
+            Snapshots::new(None, SnapshotPolicy::default())
+                .read_into(&mut restored)
+                .expect("a snapshot this table can take"),
+            "the shared volume had no snapshot on it"
+        );
+        assert!(restored.counts_agree());
+    }
+
+    /// **The name waits for the barrier**, and this is the test that says so. While the write was a
+    /// synchronous call, "the last chunk returned" and "the stream is on the disk" were one event;
+    /// submitted, they are two, and a rename between them publishes a prefix (rule 22).
+    ///
+    /// The store here answers nothing until it is told to, which is what a device with a queue does. So
+    /// the dump reaches the end of its stream with its completions outstanding, and the current name may
+    /// not appear until they arrive.
+    #[test]
+    fn a_dump_publishes_nothing_until_its_writes_are_answered_for() {
+        let mut source = engine(1 << 12);
+        fill(&mut source, RECORDS_PER_BLOCK as u64 * 3);
+        let held = HoldingStore::default();
+        let mut snapshots = apart(
+            Box::new(held.clone()),
+            SnapshotPolicy {
+                every: 1,
+                bytes_per_round: BLOCK_BYTES,
+                ..SnapshotPolicy::default()
+            },
+        );
+
+        drive(&mut snapshots, &mut source, 10_000);
+        assert!(
+            held.holds(ObjectId::SNAPSHOT_PARTIAL),
+            "the dump submitted nothing to hold"
+        );
+        assert_eq!(
+            snapshots.stats().written,
+            0,
+            "a dump was published while its writes were still outstanding"
+        );
+        assert!(
+            !held.holds(ObjectId::SNAPSHOT_CURRENT),
+            "the current name appeared before the stream was on the disk"
+        );
+
+        // And it publishes once they are answered for, which is the same claim from the other side: what
+        // it was waiting for was the completions and nothing else.
+        held.stop_holding();
+        drive(&mut snapshots, &mut source, 10_000);
+        assert_eq!(snapshots.stats().written, 1);
+        assert!(held.holds(ObjectId::SNAPSHOT_CURRENT));
+    }
+
+    /// A volume with no snapshot on it is the ordinary state of a node that has not written one, so it
     /// answers "there was none" rather than failing.
     #[test]
-    fn an_empty_directory_is_not_a_broken_snapshot() {
+    fn a_volume_with_no_snapshot_on_it_is_not_a_broken_one() {
         let scratch = Scratch::new();
         let mut restored = engine(1 << 12);
         assert_eq!(
-            scratch.dir().read_into(&mut restored),
+            apart(scratch.snapshots(), SnapshotPolicy::default()).read_into(&mut restored),
             Ok(false),
-            "an empty directory was read as a broken snapshot"
+            "an empty volume was read as a broken snapshot"
         );
     }
 
-    /// **The reason a dump is written to a name of its own.** A partial file is not the current one, so a
+    /// **The reason a dump is written to a name of its own.** A partial is not the current one, so a
     /// crash part way through leaves the previous snapshot readable — and the previous one here is no
     /// snapshot at all, which is the same claim at its edge.
     #[test]
@@ -556,26 +774,26 @@ mod tests {
         let mut source = engine(1 << 12);
         fill(&mut source, RECORDS_PER_BLOCK as u64 * 3);
 
-        let mut snapshots = Snapshots::new(
-            scratch.dir(),
+        let mut snapshots = apart(
+            scratch.snapshots(),
             SnapshotPolicy {
                 every: 1,
-                bytes_per_round: RECORD,
+                bytes_per_round: BLOCK_BYTES,
                 ..SnapshotPolicy::default()
             },
         );
         // A few rounds only, so the stream is well short of its end.
-        drive(&mut snapshots, &mut source, 4);
+        drive(&mut snapshots, &mut source, 3);
         assert_eq!(snapshots.stats().written, 0, "the dump finished too soon");
         assert_eq!(
-            scratch.files(),
-            vec![PARTIAL.to_string()],
+            scratch.files("snapshots"),
+            vec!["pending.snapshot.part".to_string()],
             "a dump in progress was already wearing the current name"
         );
 
         let mut restored = engine(1 << 12);
         assert_eq!(
-            scratch.dir().read_into(&mut restored),
+            apart(scratch.snapshots(), SnapshotPolicy::default()).read_into(&mut restored),
             Ok(false),
             "a dump in progress was readable as the current snapshot"
         );
@@ -594,11 +812,13 @@ mod tests {
         let holds = RECORDS_PER_BLOCK as u64 * 3;
         fill(&mut source, holds);
 
-        let mut snapshots = Snapshots::new(
-            scratch.dir(),
+        let mut snapshots = apart(
+            scratch.snapshots(),
             SnapshotPolicy {
-                every: 1,
-                bytes_per_round: RECORD,
+                // Far enough that the writes below cannot start a second dump: what is being asserted is
+                // what became of the first one, and a fresh partial beside it would answer for it.
+                every: holds,
+                bytes_per_round: BLOCK_BYTES,
                 shadow_budget: 0,
             },
         );
@@ -609,10 +829,14 @@ mod tests {
             if !snapshots.round(&mut source) {
                 break;
             }
+            source.collect_writes();
             next += 1;
             let _ = source.write(create(next as u128), ApplyIndex(next));
             source.drain(usize::MAX);
         }
+        // And on to where the dump has answered for its writes, because the partial goes then and not
+        // when the shadow does.
+        drive(&mut snapshots, &mut source, 8);
         assert_eq!(
             snapshots.stats().written,
             0,
@@ -628,9 +852,9 @@ mod tests {
             "the shadow outlived the dump it was for"
         );
         assert!(
-            scratch.files().is_empty(),
+            scratch.files("snapshots").is_empty(),
             "an abandoned dump left its partial behind: {:?}",
-            scratch.files()
+            scratch.files("snapshots")
         );
     }
 
@@ -643,8 +867,8 @@ mod tests {
         fill(&mut source, RECORDS_PER_BLOCK as u64);
         let applied = source.applied_through().raw();
 
-        let mut snapshots = Snapshots::new(
-            scratch.dir(),
+        let mut snapshots = apart(
+            scratch.snapshots(),
             SnapshotPolicy {
                 // Further than this engine has ever got, so no number of rounds reaches it.
                 every: applied * 100,
@@ -678,23 +902,28 @@ mod tests {
     /// A broken store ends the dump in flight, which is what the worker does with it when the apply path
     /// seals: nothing more will be applied, so a dump of a state that has stopped moving is bytes nobody
     /// will read, and finishing it would hold the shadow for the whole of it.
+    ///
+    /// The shadow goes at once and the partial goes when the writes still out have been answered for —
+    /// two events, because a removal that overtook a write would leave it landing in a file nothing looks
+    /// at.
     #[test]
     fn a_dump_is_given_up_on_when_the_store_breaks_under_it() {
-        let scratch = Scratch::new();
         let mut source = engine(1 << 12);
         fill(&mut source, RECORDS_PER_BLOCK as u64 * 3);
-
-        let mut snapshots = Snapshots::new(
-            scratch.dir(),
+        // Writes answered only when told, so the partial has something to wait for: what the seal ends is
+        // the dump, and what ends the object is the last completion.
+        let held = HoldingStore::default();
+        let mut snapshots = apart(
+            Box::new(held.clone()),
             SnapshotPolicy {
                 every: 1,
-                bytes_per_round: RECORD,
+                bytes_per_round: BLOCK_BYTES,
                 ..SnapshotPolicy::default()
             },
         );
-        drive(&mut snapshots, &mut source, 4);
+        drive(&mut snapshots, &mut source, 3);
         assert!(
-            source.shadowed_buckets() > 0 || snapshots.inflight.is_some(),
+            held.holds(ObjectId::SNAPSHOT_PARTIAL),
             "there was no dump in flight to give up on"
         );
 
@@ -704,35 +933,48 @@ mod tests {
             0,
             "the shadow outlived the dump the seal ended"
         );
-        assert!(
-            scratch.files().is_empty(),
-            "the given-up dump left its partial behind: {:?}",
-            scratch.files()
-        );
         assert_eq!(snapshots.stats().written, 0);
         assert_eq!(snapshots.stats().abandoned, 1);
+
+        // **The shadow goes now and the object goes later**, which is the whole of what a submitted write
+        // changed here: removing it with chunks still queued would leave them landing in a file nothing
+        // will look at.
+        drive(&mut snapshots, &mut source, 8);
+        assert!(
+            held.holds(ObjectId::SNAPSHOT_PARTIAL),
+            "the partial was removed while writes to it were still outstanding"
+        );
+        held.stop_holding();
+        drive(&mut snapshots, &mut source, 8);
+        assert!(
+            !held.holds(ObjectId::SNAPSHOT_PARTIAL),
+            "the given-up dump left its partial behind"
+        );
 
         // And a second call is not a second abandonment: there is nothing in flight, so it counts nothing.
         snapshots.abandon(&mut source);
         assert_eq!(snapshots.stats().abandoned, 1);
     }
 
-    /// Bytes that are not a snapshot are refused rather than interpreted, and a directory holding one is
+    /// Bytes that are not a snapshot are refused rather than interpreted, and an object holding them is
     /// the same refusal a stream is — the destination adds no leniency of its own.
     #[test]
-    fn a_current_file_that_is_not_a_snapshot_is_refused() {
+    fn a_current_object_that_is_not_a_snapshot_is_refused() {
         let scratch = Scratch::new();
-        let dir = scratch.dir();
-        std::fs::write(dir.current(), [0u8; RECORD]).expect("the junk file writes");
-
         let mut restored = engine(1 << 12);
+        scratch.write_current(&[0u8; BLOCK_BYTES]);
         assert_eq!(
-            dir.read_into(&mut restored),
+            apart(scratch.snapshots(), SnapshotPolicy::default()).read_into(&mut restored),
             Err(NotASnapshot::Unrecognised)
         );
 
         // And a stream cut short is malformed rather than a table half restored being called a restore.
-        std::fs::write(dir.current(), [0u8; RECORD - 1]).expect("the short file writes");
-        assert_eq!(dir.read_into(&mut restored), Err(NotASnapshot::Malformed));
+        // Short of a whole block is what the store answers `Missing` to, which is the object ending
+        // before its own header said it would.
+        scratch.write_current(&[0u8; RECORD]);
+        assert_eq!(
+            apart(scratch.snapshots(), SnapshotPolicy::default()).read_into(&mut restored),
+            Err(NotASnapshot::Malformed)
+        );
     }
 }

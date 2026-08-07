@@ -4,8 +4,8 @@ What is built and verified, and what is not. Written to be read before picking u
 reasoning lives in `design-notes.md`, the terms in `glossary.md`, and how to run things in `tools.md`.
 
 Verified at the time of writing with **`make verify`** — the tests in debug, the release build, every
-`ledgerfio` workload, a run that writes snapshots to a directory, `ledgerfio layout`, and all three
-`ledgersim` modes. It is a target rather than a
+`ledgerfio` workload, two runs that write snapshots (one to a volume of its own and one to the blocks'),
+`ledgerfio layout`, and all three `ledgersim` modes. It is a target rather than a
 list here because a list here is what drifted: a workload that aborted on the reactor thread went two
 commits unnoticed, since `cargo test` runs for milliseconds and reaching that defect took a second of
 release build. What `make verify` still does not cover is `cargo bench -p ledger-pending` and `ledgerd`
@@ -154,11 +154,27 @@ test asserts the store was reached.
 
 ### The store's interface is a disk's, backed by memory
 
-`DurableStore` is a filesystem's vocabulary: a segment is a file, brought into being by its first block
+`DurableStore` is a filesystem's vocabulary: an **object** is a file, brought into being by its first block
 (a write that says it is creating), appended to at an offset, read at an offset, made durable by a **barrier**,
-removed whole, and able to fail. Writes and barriers are submitted and answered for, the way reads already
+renamed, removed whole, and able to fail. Writes and barriers are submitted and answered for, the way reads already
 were (§20). `MemoryStore` backs it today and `LatencyStore` prices a device in front of any backend. Design notes
 §16.
+
+- **An object is a day's blocks or one of the snapshot's two files**, in one namespace because they are on
+  one disk. The day ↔ segment mapping stays in `RecordLog`: below the store there are objects, not days.
+  While a file was named by `segment: u8` there was nowhere for a snapshot to be written that was not a
+  day, which is why this type exists (§20).
+- **One instance per volume, and every IO into that disk goes through it** — reads and writes, the blocks'
+  and the snapshot's. That is what makes the store the one place a queue depth, an in-flight count and
+  (later) a watchdog can live. Two writers keep queues of their own *above* it, with reactions of their
+  own to a full one: the log stops applying so backpressure reaches the client, a dump waits. A completion
+  queue is one queue, so `IoOwner` in the top bits of a handle says whose each answer is, and the log
+  routes what is not its own to a mailbox the snapshot drains.
+- **What says two directories are one volume is a declaration, and only half of one exists.**
+  `OpenBacking::same_volume` recognises the same directory, canonicalised — the case it cannot be wrong
+  about. `st_dev` is refused for being wrong in both directions (§20). So two directories are two volumes
+  today, and the second is opened exact: the `--store-*` knobs describe the blocks' device, and pricing a
+  second disk with the first one's numbers is the same guess turned round.
 
 - **The offset is a function of the address** — the block number times the block size — so nothing has to be
   restored to know where a block sits: a segment's file begins with a hole and its own blocks are one extent
@@ -276,11 +292,24 @@ The test writes between chunks until the table relocates, then asserts the two f
 or below coverage is carried, and the holds that answer equal the table's entries — the second is what a
 relocation written twice would break.
 
-**And it goes somewhere.** `SnapshotDir` is a directory with one file in it, written to a partial name, made
-durable, renamed over the current one, and the directory synced after — so a crash leaves the previous
-snapshot or the new one and never a prefix of the new one wearing the current name. One name and not a
-series, because an older snapshot is only restorable while the log still holds everything after its coverage.
-Design notes §19.
+**And it goes somewhere, through the store.** A dump is written to the partial object, made durable by a
+barrier, renamed over the current one, and the directory synced inside that rename — so a crash leaves the
+previous snapshot or the new one and never a prefix of the new one wearing the current name. One name and
+not a series, because an older snapshot is only restorable while the log still holds everything after its
+coverage. Design notes §19 and §20.
+
+- **The stream is padded to whole blocks (format version 4)**, because a block is what the store takes.
+  The padding is the destination's rather than the format's — a follower receiving the same bytes over a
+  wire has no blocks — so `SnapshotWriter` still hands out 32-byte records and the stage rounds the last
+  chunk up. The reader stops at the header's count and refuses a tail that is anything but zeroes; the
+  version bump is what stops an older reader taking the padding for records.
+- **Nothing destructive happens while a write of the dump is outstanding**, which is rule 22 asked in
+  advance this time rather than after four patches. A rename between "the last chunk returned" and "the
+  stream is on the disk" publishes a prefix, and a removal with chunks queued leaves them landing in a file
+  nothing will look at. So a dump has phases, the shadow still goes the moment a dump is given up on — it
+  is memory, and a slow disk must not cost the apply path any — and the object goes when the last
+  completion has. The test drives those two apart with a store that answers only when told, and reverting
+  the wait fails it.
 
 - **The cadence is a log distance, which is what leaves the engine with no clock for it.** What recovery
   costs is the effects it replays and what the log has to retain is the entries it keeps, both counted in log
@@ -315,7 +344,7 @@ Design notes §19.
 
 ### Starting a node from one is not built, and the order matters
 
-`SnapshotDir::read_into` restores the index, the group totals and the coverage. That is not a node.
+`Snapshots::read_into` restores the index, the group totals and the coverage. That is not a node.
 
 The engine's `RecordLog` still has no position: it does not know which block to write next, or which blocks
 each day owns. So a restored engine answers lookups against the blocks that are there and **must not be
@@ -424,37 +453,32 @@ neither is outstanding work.
   barrier's completion clears only the first. Folding them would let a snapshot carry slots naming a block a
   restart cannot read.
 
-- **Every IO except a lookup's read and the block writes still runs on the thread that answers lookups.** Design notes §20 has the decision and the responsibility split; this is the gap it names.
-  What is left on it: the `unlink`, **the expiry sweep's block reads**, the apply-path fallback read
-  (measured at zero), and the snapshot chunk — which does not go through the store at all. Reads have a pool
-  and it is off by default; writes have a lane and it is off by default, and both defaults are the
-  synchronous baseline every number is compared against rather than a recommendation.
+- **Some IO still runs on the thread that answers lookups, and it is no longer the interesting IO.** Design
+  notes §20 has the decision and the responsibility split; this is the gap it names. What is left on that
+  thread: the `unlink`, **the expiry sweep's block reads**, the apply-path fallback read (measured at zero),
+  and the snapshot's chunk write and restore read — which go through the store now but are synchronous
+  there unless the lane is on. Reads have a pool and it is off by default; writes have a lane and it is off
+  by default, and both defaults are the synchronous baseline every number is compared against rather than a
+  recommendation.
 
-  **And the snapshot does not go through the store at all** — `Snapshots::step` calls `File::write_all`
-  directly, outside `DurableStore`. So its writes are counted by nothing, bounded by nothing, share no
-  queue, and appear in no IO figure the tools report. §20's answer is not a layer under the store but the
-  store itself: it is already the device abstraction — `RecordLog` computes the offset and hands down a
-  block — and the writes it takes now submit and complete. **Three things are left to move the snapshot onto
-  it**, and they are the whole of what remains of §20:
+  **The snapshot goes through the store now**, so its writes are counted, queued and bounded rather than
+  being a `File::write_all` beside it, invisible to every IO figure the tools print. §20's answer was not a
+  layer under the store but the store itself: it is already the device abstraction — `RecordLog` computes
+  the offset and hands down a block — and it took three things, all of which are built. A file named by an
+  **object id** rather than `segment: u8`, so the days and the snapshot's two files live in one namespace.
+  **`rename` beside `remove`**, because publishing is a namespace change and the directory sync belongs
+  inside it. And the **stream padded to whole blocks** (version 4), because a block is what the store takes.
 
-  1. **A file named by an object id rather than `segment: u8`**, so the store's days and the snapshot's two
-     files live in one namespace.
-  2. **`rename` beside `remove`** — the snapshot's atomic replacement is a namespace change, which is the
-     same kind of operation.
-  3. **The stream padded to whole blocks.** The store's vocabulary is a 4096-byte block at an offset, which
-     is also what direct IO requires; the format's records are 32 bytes so a chunk already fits, but the tail
-     does not. The reader stops at the header's record count, so padding costs a version bump and nothing
-     else.
-
-  After that, **one instance per declared volume** is what makes "the same disk" mean something — and the
-  declaration is a configuration question this repository has not answered yet (see the entry below on what
-  declares a node's configuration).
+  **One instance per volume is what makes "the same disk" mean something, and half of it is built.** The
+  same directory for both is one store, which is the case a path cannot be wrong about; two different
+  directories on one disk needs a declaration, and that is the configuration question below. Nothing is
+  guessed in the meantime — `st_dev` is refused in §20 for being wrong in both directions.
 
   **The read pool's default was never the problem, and saying so matters because the first version of this
   entry claimed it was.** Zero is recorded below as "a refusal to pick rather than a measurement", with the
   curve's non-transferability and the condition that makes zero a ceiling both written down. That question
   was asked and answered. What was missing is that **only reads were ever asked**: that a write, a barrier
-  and the sweep's reads hold the engine's thread is stated in three places as a fact about where a cost
+  and the sweep's reads hold the engine's thread was stated in three places as a fact about where a cost
   lands, and nowhere as a question about whether it should.
 
   Measured, the write is rare for a workload whose holds die young (`hold-settle` at 100k/s: 58% die in the
@@ -642,7 +666,7 @@ unanswered, and **when that default stops being safe**. The source design's own 
 
 - **Who records the apply index on the *account* side, and how is it restored?**
   *Default:* nobody, and it is now one side rather than two. The pending engine's half is closed: a snapshot
-  carries its coverage in the header, `SnapshotDir::read_into` puts it back, and a run reports where the last
+  carries its coverage in the header, `Snapshots::read_into` puts it back, and a run reports where the last
   published one covered to. The account component keeps none and restores none. The seam that names the
   concept is still what holds it open — `ApplyIndex`, a commit carrying its batch's log position, the reactor
   recording the last one it applied, and two tests.
@@ -678,25 +702,32 @@ unanswered, and **when that default stops being safe**. The source design's own 
   existed". It needs a push channel the ledger does not have, so this is a protocol decision, not an
   engine one.
 
-- **What does `sync()` cover, once one store instance serves both the blocks and the snapshot?**
-  *Default:* everything dirty. It takes no argument on purpose — §16 made durability a fact about the store
-  at a moment rather than a watermark per segment, because a block can be durable inside a file whose *name*
-  is not, and the file-then-directory order is what that call owns. **Per-file `fsync` is not the obstacle**
-  and it is worth writing down, because the no-argument signature reads like a claim that it is:
-  `FileStore::sync` already calls `sync_all` on each dirty file, and `fsync(fd)` is per file by definition —
-  `sync()` is the system-wide one and `syncfs` the filesystem-wide one, and neither is what this uses.
-  *Stops being safe:* when the snapshot shares the instance (§20). One call would then sync both, which is
-  safe and wasteful — each side's barrier becomes the other's latency, and the two have very different write
-  rates. It is a question about scope, not about what the kernel can do.
+- **What does a barrier cover, now that one store instance can serve both the blocks and the snapshot?**
+  *Default:* everything dirty on that store, and this is live rather than hypothetical — `--snapshot-dir`
+  naming the same directory as `--store-dir` is one instance today. `submit_barrier` takes no argument on
+  purpose: §16 made durability a fact about the store at a moment rather than a watermark per object,
+  because a block can be durable inside a file whose *name* is not, and the file-then-directory order is
+  what that call owns. **Per-file `fsync` is not the obstacle** and it is worth writing down, because the
+  no-argument signature reads like a claim that it is: the backing already calls `sync_all` on each dirty
+  file, and `fsync(fd)` is per file by definition — `sync()` is the system-wide one and `syncfs` the
+  filesystem-wide one, and neither is what this uses.
+  *Stops being safe:* it is safe and wasteful now — each side's barrier makes the other's writes durable
+  too, and the two have very different write rates, so a dump's barrier every round is an `fsync` of the
+  blocks nobody asked for. Nothing is wrong; what is unmeasured is what it costs, and the way to ask is one
+  directory against two on the run `make verify` already has. It becomes a question rather than a cost the
+  moment a barrier is slow enough for one writer's cadence to set the other's latency.
 
-- **What declares this node's configuration, once a volume is one of the things it declares?**
-  *Default:* command-line flags, and there are already more than forty. §20 adds a volume name to two
-  directories, which is one more of the same. Every knob here has landed as a flag because that is where the
-  tools' knobs go, and a node's configuration is not a tool's argument list — a declared file (TOML, YAML,
-  JSON) is what a deployment can review, diff and keep.
-  *Stops being safe:* it is already awkward, and it becomes a correctness question the moment a wrong volume
-  declaration silently gives two disks one queue depth. Recorded here so that adding volumes as flags is not
-  mistaken for an answer to this.
+- **What declares this node's configuration, and in particular which directories are one volume?**
+  *Default:* command-line flags, and there are already more than forty — plus one rule that is not a flag:
+  the same directory for the blocks and the snapshot is one store, and two different directories are two.
+  That rule answers the only case a path can answer, and it leaves the case that matters open. Two
+  directories on one disk get two queues today, which means two queue depths against one device — the same
+  shape of mistake as reading a number of ours as a number of the device's, and the reason `st_dev`
+  detection was refused (§20). Every knob here has landed as a flag because that is where the tools' knobs
+  go, and a node's configuration is not a tool's argument list — a declared file (TOML, YAML, JSON) is what
+  a deployment can review, diff and keep.
+  *Stops being safe:* it is already awkward, and the volume rule above is where it becomes a number rather
+  than a nuisance. Recorded here so that adding volumes as flags is not mistaken for an answer to this.
 
 - **How many threads should issue the store's reads in a deployment?**
   *Default:* none, and that is a refusal to pick rather than a measurement. The curve on this machine peaks at
@@ -762,10 +793,11 @@ An entry that vanishes reads as a question nobody ever asked.
   exactly. It is declared in buckets now and a breach abandons the dump, which costs the work and nothing
   else.
 
-  ⚠ **This number is answered against an arrangement that is changing, and it does not survive it.** The
-  whole argument for 4096 is that a chunk holds the worker's thread. §20 decides that every IO moves to a
-  lane of its own, and once the chunk does not hold that thread the tail argument is gone and the cheaper
-  large chunk wins. It stays here as closed because it was genuinely measured and it is the right number
+  ⚠ **This number is answered against an arrangement that has since changed, and it does not survive it.**
+  The whole argument for 4096 is that a chunk holds the worker's thread. The chunk now goes through the
+  store, so with `--store-write-lane 1` it does not hold that thread at all, the tail argument is gone and
+  the cheaper large chunk wins. The throttle also has to be a whole number of blocks now, which is what the
+  retaking would move between. It stays here as closed because it was genuinely measured and it is the right number
   for the code that exists — but it has to be taken again with the lane, and the same is true of the block
   durability entry below. Left as a note rather than reopened, because reopening a question that *was*
   answered would lose the measurement with it.

@@ -23,8 +23,7 @@ use crate::index::{LOAD_TARGET, SLOT_BYTES};
 use crate::orderer::OrderWait;
 use crate::orderer::Orderer;
 use crate::overlay::HoldOverlay;
-use crate::snapshot::RECORD as SNAPSHOT_RECORD;
-use crate::snapshots::{SnapshotDir, SnapshotPolicy, SnapshotStats, Snapshots};
+use crate::snapshots::{SnapshotPolicy, SnapshotStats, Snapshots};
 
 #[derive(Debug, Clone, Copy)]
 pub struct MemoryPendingConfig {
@@ -105,13 +104,19 @@ impl DaySource {
     }
 }
 
-/// What the engine has on disk: the blocks its records live on, and the directory its snapshots go to.
+/// What the engine has on disk: the blocks its records live on, and where its snapshots go.
 ///
-/// **Two paths, because they answer to different volumes.** The design puts the Raft log and the snapshot
-/// on Disk 1 and the pending blocks elsewhere (§2.2), and nothing in this engine depends on that being the
-/// layout — a throttled dump competes with the log's commits on a shared volume and with the engine's own
-/// reads on a separate one, and the throttle is required either way. Taking two paths is what keeps the
-/// choice a provisioning decision instead of one this code made by accident.
+/// **Two backings, because they answer to different volumes.** The design puts the Raft log and the
+/// snapshot on Disk 1 and the pending blocks elsewhere (§2.2), and nothing in this engine depends on that
+/// being the layout — a throttled dump competes with the log's commits on a shared volume and with the
+/// engine's own reads on a separate one, and the throttle is required either way. Taking two backings is
+/// what keeps the choice a provisioning decision instead of one this code made by accident.
+///
+/// **And when the two name one volume they get one store.** IO into a disk has to be managed and watched
+/// in one place whoever asked for it, so a queue depth belongs to the device rather than to the writer
+/// (§20). What decides that they are one volume is `OpenBacking::same_volume`, which today can only
+/// recognise the case it cannot be wrong about — the same directory. Two directories on one disk is a
+/// declaration this repository has not built yet, and it is on `status.md` rather than guessed at here.
 ///
 /// Handles rather than paths, and opened by the caller: a directory that cannot be used is a
 /// configuration error, and one discovered on the worker's thread has nowhere to be reported (rule 6).
@@ -119,7 +124,7 @@ pub struct PendingStorage {
     pub blocks: OpenBacking,
     /// Where a snapshot goes. `None` writes none, whatever the policy says — the two have to agree for a
     /// node to write files, so neither alone can make it.
-    pub snapshots: Option<SnapshotDir>,
+    pub snapshots: Option<OpenBacking>,
 }
 
 impl PendingStorage {
@@ -298,12 +303,15 @@ impl MemoryPendingConfig {
             // are handed back would leave residency answering from a block the store no longer has.
             && capacity.residency_hours <= capacity.lifetime_days() * 24
             && capacity.slots() * SLOT_BYTES <= self.index_budget_bytes
-            // A round that cannot write one record would never finish a dump, and a shadow budget of
+            // A round that cannot write one block would never finish a dump, and a shadow budget of
             // nothing gives up on every dump the first time anything is written behind it. Both are
             // configurations that look like a snapshot policy and produce no snapshot, which is exactly
-            // what `validate` exists to refuse.
+            // what `validate` exists to refuse. A throttle that is not a whole number of blocks is
+            // refused rather than rounded: the store takes blocks, and rounding a declared number into a
+            // different one is how a configuration comes to mean something nobody asked for.
             && (self.snapshot.every == 0
-                || (self.snapshot.bytes_per_round >= SNAPSHOT_RECORD
+                || (self.snapshot.bytes_per_round >= BLOCK_BYTES
+                    && self.snapshot.bytes_per_round.is_multiple_of(BLOCK_BYTES)
                     && self.snapshot.shadow_budget > 0));
         if sane {
             Ok(())
@@ -612,6 +620,11 @@ impl MemoryPending {
         let occupancy = Arc::new(Occupancy::default());
         let worker_occupancy = Arc::clone(&occupancy);
         let PendingStorage { blocks, snapshots } = storage;
+        // One store when the two name one volume, and the `Option` the stage takes is exactly that
+        // question: dropping the backing here is what says the blocks' store is this dump's store too.
+        let dumps = snapshots.is_some();
+        let apart = snapshots.filter(|backing| !backing.same_volume(&blocks));
+        let queue_depth = config.store.queue_depth.max(1);
         let thread = WorkerThread::spawn("pending", move |shutdown| {
             PendingWorker {
                 commands: command_rx,
@@ -622,7 +635,16 @@ impl MemoryPending {
                     config.capacity.resident_blocks(),
                     config.store.build(blocks, config.seed ^ 0xb10c),
                 ),
-                snapshots: snapshots.map(|dest| Snapshots::new(dest, config.snapshot)),
+                // A volume of its own is opened exact, with no device modelled in front of it: the
+                // `--store-*` knobs describe the blocks' device, and pricing a second disk with the first
+                // one's numbers would be claiming the two are the same — the guess §20 refuses in the
+                // other direction. A snapshot on the modelled device is what declaring one volume gets.
+                snapshots: dumps.then(|| {
+                    Snapshots::new(
+                        apart.map(|backing| backing.open(queue_depth)),
+                        config.snapshot,
+                    )
+                }),
                 occupancy: worker_occupancy,
                 notices: notice_tx,
                 owed: VecDeque::new(),
@@ -1401,7 +1423,7 @@ mod worker_tests {
     fn a_snapshot_reaches_the_directory_and_its_numbers_reach_the_port() {
         let path = std::env::temp_dir().join(format!("ledger-worker-snap-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&path);
-        let dest = SnapshotDir::open(&path).expect("the scratch directory opens");
+        let dest = OpenBacking::files(&path, 0, false).expect("the scratch directory opens");
         let mut engine = MemoryPending::start_with_days(
             MemoryPendingConfig {
                 snapshot: SnapshotPolicy {

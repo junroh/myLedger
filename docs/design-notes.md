@@ -2332,7 +2332,10 @@ carries both.
 ### One file, replaced by rename
 
 `pending.snapshot.part` is written, made durable, renamed over `pending.snapshot`, and the directory synced
-after so the name itself survives. A crash at any point leaves the previous snapshot or the new one, never a
+after so the name itself survives. All four through the store, which is the one path to a disk (§20): the
+partial and the current are two **objects** in its namespace, a chunk is a block at an offset, durable is a
+barrier, and the rename is the store's — it syncs the directory, because that half is what a `sync` of the
+file alone leaves out. A crash at any point leaves the previous snapshot or the new one, never a
 prefix of the new one wearing the current name — which a reader could not tell from a complete stream, since
 the header says how many records there are and a truncated file simply ends early.
 
@@ -2344,9 +2347,24 @@ previous one its life until the moment the new one is complete.
 consumes the shadow entries for the buckets it read, so a chunk that was produced and not written cannot be
 produced again. Retry is at the granularity of a dump, and that is the granularity the cadence already has.
 
+A chunk the store's queue *refuses* is a different thing and is not a failure: the block waits in the
+buffer it was produced into and is offered again next round. That is the same distinction the trait draws
+everywhere — `false` is backpressure, an error completion is a fault — and it matters here because the two
+would otherwise look alike from inside a dump.
+
+**The stream is padded to whole blocks, which is a format version rather than a detail.** A block is what
+the store takes, and the format's records are 32 bytes, so 128 fit exactly and only the last chunk is
+short. The reader stops at the header's count and refuses a tail that is anything but zeroes; a reader that
+predates the padding would take those zeroes for records past the end its own header promised, so the
+version went to four and the two refuse each other. The padding itself belongs to the destination and not
+to the format — a follower receiving the same bytes over a wire has no blocks — which is why
+`SnapshotWriter` still hands out records and `Snapshots` is what rounds the last one up.
+
 ### Where it goes is two directories, because that is a provisioning decision
 
-`--store-dir` and `--snapshot-dir` are separate flags, and neither implies the other. The design puts the
+`--store-dir` and `--snapshot-dir` are separate flags, and neither implies the other. Naming the *same*
+directory for both is how a deployment says they are one disk, and then one store serves both — see §20,
+where the instance count follows the disk rather than the writer. The design puts the
 Raft log and the snapshot on Disk 1 (§2.2); this code does not care, and that is the point. What sharing
 changes is only the arithmetic — a shared volume measures the snapshot's share against the log's own write
 rate, a separate one against the engine's reads — and the throttle is required either way, which is what
@@ -2358,7 +2376,7 @@ reached on recovery grounds.
 
 ### What this does not do: start a node
 
-`SnapshotDir::read_into` restores the index, the group totals and the coverage — and that is not a node. The
+`Snapshots::read_into` restores the index, the group totals and the coverage — and that is not a node. The
 engine's `RecordLog` still has no position: it does not know which block to write next or which blocks each
 day owns, so a restored engine answers lookups against the blocks that are there and **must not be written
 to**. Its one caller is a test.
@@ -2371,9 +2389,11 @@ together. `status.md` carries it.
 
 ## 20. There is one path to a device, and apply is not on it
 
-> **Decided, not built.** Nothing below is code. It is written now because the work it describes
+> **Written before it was built, and now mostly built.** It was written first because the work it describes
 > invalidates numbers this repository already reports as answers — §19's throttle above all — and a measured
-> number whose arrangement is about to change reads exactly like a settled one.
+> number whose arrangement is about to change reads exactly like a settled one. What is code and what is not
+> is the table at the end; two things are deliberately outstanding, the volume declaration and the watchdog,
+> and each says why below.
 >
 > **Tried** — a pool for reads only, default off, and every other IO synchronous on the pending worker's
 > thread.
@@ -2446,21 +2466,67 @@ from a directory to a volume is declared, for the reason in the four lines above
 and a queue depth derived from a guess is the same mistake this repository has now made twice in the other
 direction — reading a number of ours as a number of the device's.
 
-### What has to change, and one of the three is done
+### What has to change, and all three are done
 
 1. **Writes become `submit`/`poll`.** ✅ `submit_write`, `submit_barrier` and `poll_written` replace
    `open_with`, `append` and `sync`. A `Result` returned inline is what put the `pwrite` on the caller's
    thread; completions are what move `unsynced` and coverage instead.
-2. **A file is named by an object id, not by `segment: u8`.** Left. The store's days and the snapshot's two
-   files would then live in one namespace, and the day ↔ segment mapping stays in `RecordLog` where it
-   belongs.
-3. **`rename` joins `remove`.** Left. The snapshot's atomic replacement needs it, and it is the same kind of
-   operation: a namespace change rather than a block one.
+2. **A file is named by an object id, not by `segment: u8`.** ✅ `ObjectId` is a segment or one of the
+   snapshot's two names, in one namespace because they are on one disk, and the day ↔ segment mapping
+   stays in `RecordLog` where it belongs. The store's per-object arrays are sized from the namespace
+   (`OBJECT_VALUES`) rather than from the segment field, so the two cannot disagree.
+3. **`rename` joins `remove`.** ✅ Synchronous, beside it, and it syncs the directory: a name is not durable
+   until the directory holding it is, which is the half a `sync` of the file alone leaves out.
 
 `MemoryStore` answers a write the moment it takes it, which is what keeps it the exact baseline every number
 in these documents was taken against. `LatencyStore` still charges its write and barrier costs to the
 *thread* rather than to a queue, and that is deliberate until the lane is the default: a model that priced a
 write as a queue's cost while the backing did it inline would be describing something that is not there.
+
+### The snapshot on the store, and what the move actually cost
+
+The three above were the interface. What the snapshot needed beyond them was one question asked in
+advance, and it is the question rule 22 exists for: **who was relying on the chunk write being
+synchronous?** Three answers, and none of them is in the new code:
+
+- **`publish`.** "The last chunk returned" and "the stream is on the disk" were one moment. Submitted they
+  are two, and a rename between them publishes a prefix — a file wearing the current name that a reader
+  cannot tell from a complete stream, since the header says how many records there are and a short file
+  simply ends early. So a dump has phases now (filling, sealing, publishing), the barrier is what ends the
+  second, and its completion is what `Publishing` means.
+- **`give_up`.** Removing the partial with chunks still queued leaves them landing in a file nothing will
+  ever look at, and their completions arriving for a dump that no longer exists. The shadow still goes at
+  once — it is the index holding buckets aside, so a slow disk must not cost the apply path memory — and
+  the object goes when the last completion has. Two events, and the test drives them apart with a store
+  that answers when it is told to.
+- **`begin`.** A partial a crash left behind refuses the `creating` write that brings the object into
+  being, which would cost a dump per restart until one of them cleared it. It is removed at the start of a
+  dump instead, which is the cadence's own rate rather than the round's.
+
+**One counter for all three**, because "this dump still has IO out" is one fact (rule 18). For the rename
+the barrier already orders it; for the removal there is nothing else, and that is the one the test holds.
+
+### Two writers, one disk, and which of those the instance count follows
+
+The instance count follows the **disk**, not the writer. Pending has two write paths — the blocks and the
+snapshot — and two queues is right for them: two backlogs, two handle spaces, and two different reactions
+to a full queue, since the log stops applying so backpressure reaches the client while a dump simply waits.
+Those queues are *above* the store. Below it is the device's, and when the two paths are on one disk they
+share it, because IO into one disk has to be managed and watched in one place whoever asked for it.
+
+That has one consequence that had to be built rather than assumed: **a completion queue is one queue, so
+the poller has to know whose each answer is.** `IoOwner` is in the top bits of every write handle, the log
+routes what is not its own to a mailbox the snapshot drains, and neither side infers ownership from
+whether it recognises a number. An early draft of this work argued the opposite — that a store of its own
+per writer removes the demultiplexing problem — and that is exactly the shortcut that breaks the moment a
+deployment declares one volume. It was dropped for that reason.
+
+**What decides that two directories are one volume is a declaration, and it does not exist yet.**
+`same_volume` answers only the case it cannot be wrong about: the same directory, canonicalised. `st_dev`
+is refused above, for being wrong in both directions. Until the declaration lands, two directories are two
+volumes and get two instances — and a snapshot on a volume of its own is opened **exact**, with no device
+modelled in front of it, because the `--store-*` knobs describe the blocks' device and pricing a second
+disk with the first one's numbers would be the same guess in the other direction.
 
 ### Ordering belongs to the implementation, the reaction belongs to the caller
 
@@ -2490,7 +2556,7 @@ touches apply. One queue cannot express two reactions, so it does not try to.
 | `read_at` | **the expiry sweep**, `each_record_in_day` ← `propose_expiry` | `expiry_blocks_per_round` a round while a day is being emptied |
 | `read_at` | the apply-path fallback, `RecordLog::read` | measured at **zero** — the record it wants was appended moments ago and the buffer is an hour wide |
 | `submit` / `poll` | a lookup that missed both memory windows | the only one with a lane, and it is off by default |
-| snapshot chunk | `Snapshots::step`, in the worker's round | §19's throttle |
+| `submit_write` / `submit_barrier` / `rename` | `Snapshots::step`, in the worker's round | §19's throttle, and one barrier and one rename per dump |
 
 Two rows are easy to miss and both were missed once here. The **day rollover** already issues a device write
 outside apply. The **expiry sweep** already issues device reads on the worker's thread, and unlike the apply
@@ -2735,14 +2801,20 @@ removed (rule 12).
 | closing a block and writing it as two calls | **built** |
 | writes submitted and completed, with the barrier's bookkeeping | **built** |
 | a write lane: one thread, ordered, synchronous baseline kept | **built** |
-| the snapshot on the store — object ids, `rename`, a padded stream | left |
-| one store instance per declared volume | left, and behind a configuration question |
+| the snapshot on the store — object ids, `rename`, a padded stream | **built** |
+| one store instance per volume, where the volume can be told | **built** for the same directory; the declaration that would let two directories say they are one disk is left, behind a configuration question |
 | the watchdog | left, deliberately — see below |
 
-The three left are structural rather than load-bearing: the payload of this section is that the block write
-and the `fsync` are off the thread that answers lookups, and the measurement above is what that was worth.
-What the snapshot's move buys is that its writes are counted, bounded and queued with everything else on the
-same volume instead of being invisible to every IO figure the tools print.
+What is left is the declaration and the watchdog. The payload of this section is that the block write and
+the `fsync` are off the thread that answers lookups, and the measurement above is what that was worth. What
+the snapshot's move bought is that its writes are counted, bounded and queued rather than being a
+`File::write_all` beside the store — and on a volume the deployment declares as one, queued with the blocks
+they compete with.
+
+What is still on the worker's thread and named so it is not read as done: the `unlink`, the expiry sweep's
+block reads, the apply-path fallback read (measured at zero) — and the snapshot's chunk write and its
+restore read, which are on the store now but still synchronous there unless the lane is on. The lane is off
+by default, which is the baseline every number is compared against.
 
 ### What is deliberately left out, and why each
 
