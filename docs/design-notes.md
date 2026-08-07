@@ -2521,6 +2521,18 @@ whether it recognises a number. An early draft of this work argued the opposite 
 per writer removes the demultiplexing problem — and that is exactly the shortcut that breaks the moment a
 deployment declares one volume. It was dropped for that reason.
 
+**What sharing costs is the dump's share of the device, and nothing of the ledger's.** Measured with the
+arms alternated, `hold-settle` with the write lane on and a dump running throughout: throughput at the
+ceiling is within the ±7% band either way (mean +0.9% for the shared volume, which is no side), p99.9 at
+100k/s is 1.95ms against 1.98ms, and the two runs in sixteen pairs that went past 8ms were the
+*two*-volume arm's. What moves is the dump. Saturated it writes **37MB against 53MB** — the chunk queues
+behind the block writes, which is the whole point of one queue — and rate-limited, with rounds to spare,
+it writes **117.5MB against 100.7MB**, one dump more in two seconds. The second has two candidate causes
+these runs do not separate: one barrier covering both writers instead of two, or one lane thread instead
+of two on a machine with four performance cores. `status.md` has the command and carries the scope
+question, which this does not answer — it says what sharing costs, not whether a barrier should have been
+per-writer.
+
 **What decides that two directories are one volume is a declaration, and it does not exist yet.**
 `same_volume` answers only the case it cannot be wrong about: the same directory, canonicalised. `st_dev`
 is refused above, for being wrong in both directions. Until the declaration lands, two directories are two

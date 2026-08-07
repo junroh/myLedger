@@ -711,11 +711,19 @@ unanswered, and **when that default stops being safe**. The source design's own 
   no-argument signature reads like a claim that it is: the backing already calls `sync_all` on each dirty
   file, and `fsync(fd)` is per file by definition — `sync()` is the system-wide one and `syncfs` the
   filesystem-wide one, and neither is what this uses.
-  *Stops being safe:* it is safe and wasteful now — each side's barrier makes the other's writes durable
-  too, and the two have very different write rates, so a dump's barrier every round is an `fsync` of the
-  blocks nobody asked for. Nothing is wrong; what is unmeasured is what it costs, and the way to ask is one
-  directory against two on the run `make verify` already has. It becomes a question rather than a cost the
-  moment a barrier is slow enough for one writer's cadence to set the other's latency.
+  *Stops being safe:* not yet, and it is measured rather than assumed now. One directory against two,
+  arms alternated, `hold-settle` with `--store-write-lane 1` and `--snapshot-every 200`: **the ledger pays
+  nothing either way and the dump's share of the device is what moves.** Throughput at the ceiling is
+  1.92–1.98M tx/s against 1.95–2.01M, mean +0.9% for the shared volume — inside the ±7% band, so no side
+  (§10). p99.9 at 100k/s is 1.95ms against 1.98ms at the median, and the excursions above 8ms in sixteen
+  pairs were the *two*-volume arm's, not the shared one's. What does move is what the dump gets through:
+  **saturated it writes 37MB against 53MB, about thirty percent less**, because the chunk now queues behind
+  the block writes on one device; rate-limited, with rounds to spare, it writes 117.5MB against 100.7MB —
+  one dump more in the same two seconds. Both directions are what a shared queue should do. Which of two
+  explanations owns the second — one barrier covering both writers instead of two, or one lane thread
+  instead of two on a machine with four performance cores — is not separated by these runs, and neither is
+  the scope question itself: this says what sharing costs, not whether a barrier should have been
+  per-writer.
 
 - **What declares this node's configuration, and in particular which directories are one volume?**
   *Default:* command-line flags, and there are already more than forty — plus one rule that is not a flag:
@@ -899,6 +907,12 @@ The ones that decide the most:
   median left to move. Continuous dumping is what `--snapshot-every 1` is for, and no deployment does that —
   it is how the duty cycle is taken out of the measurement. **Not a sweep**: a sweep runs the arms minutes
   apart with no baseline between, and this machine moves ten percent in an hour.
+- `ledgerfio run --workload hold-settle --duration 2s --resolve-after 900000 --store-write-lane 1
+  --snapshot-every 200`, once with `--store-dir` and `--snapshot-dir` naming **one** directory and once
+  naming two, alternated pair by pair — what declaring the two writers onto one disk costs. Read the
+  dump's own `wrote NN MB` rather than the ledger's throughput: the throughput difference is inside the
+  band and the dump's is not. `--rate 0` and `--rate 100k` answer opposite halves of it, which is the
+  point — a shared queue slows the dump when the device is busy and speeds it when it is not.
 - `ledgersim check --seeds 64` — every invariant under fault injection, including the store path.
 - `cargo bench -p ledger-pending --bench sweep -- --repeat 5 --pin 2` — what emptying one day costs,
   driven through the real engine. Three rows, and the middle one is the one a policy needs: records read
