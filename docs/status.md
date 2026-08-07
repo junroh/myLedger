@@ -729,6 +729,26 @@ unanswered, and **when that default stops being safe**. The source design's own 
   is 149 per million if the cap drops to 32. That is `SE-OQ-2`, answered. What is missing is the operational
   half.
 
+- **Should reads for one block be coalesced, and where does the read path learn that they can be?**
+  *Default:* they are not. Fifty-one lookups for records on one block become fifty-one store reads of that
+  block, and fifty-one queue slots.
+  *Where it shows:* expiry, by construction. A block holds fifty-one records, the sweep turns them into
+  fifty-one voids in one slice, and each of those is judged with a lookup of a record on that same block.
+  The day being emptied is `retention + grace` old and residency is a day wide, so every one of those
+  reads misses memory and reaches the device. Measured: **92,000 store reads for 92,000 holds released**,
+  and the queue at its full depth of 128 with 1,592 refusals against it.
+  *What was tried and did not work:* keeping the last block read, in the buffer it was read into. It
+  changed nothing, and the reason is the shape of the burst rather than the size of the cache — all
+  fifty-one lookups are *submitted* before any completes, so at submit time the block has not been read
+  yet. Coalescing is the version that fits: a read for a block already in flight registers as a waiter
+  instead of submitting, and one completion answers all of them. That saves the queue slots as well as
+  the reads, which a cache cannot.
+  *Correctness rests on one thing:* a sealed block's bytes never change, which is what makes a whole-block
+  checksum possible and what makes block numbers safe to key on — they count on across days and are never
+  reused, so a number names one set of bytes for the life of the ledger.
+  *Stops being safe:* it is not a safety question, it is an eight-fold one. On a device at 100µs a read,
+  92,000 reads a second is nine thread-seconds a second; coalesced it is 1,800.
+
 - **Where does `expiry_blocks_per_round` come from, and should it be a budget per round at all?**
   *Default:* a constant, two blocks a round. The headroom argument for it measured the **requirement** — a
   design day's survivors against a day — and never measured the **cost**, which is the other side of the

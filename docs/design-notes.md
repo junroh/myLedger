@@ -2622,6 +2622,34 @@ volume's now, because it is one fact and the disk is its owner (rule 18). And `w
 being a method one test calls: it is the field a report prints, which is the same accounting the watchdog
 will read when its reaction is chosen.
 
+### The expiry path reads one block fifty-two times, and only the first of them is the sweep's
+
+The sweep reads a day's block to find its survivors — that is one read for up to fifty-one voids. Each of
+those voids is then judged like any resolution, which means a lookup, which means reading the record: **the
+same block, fifty-one more times.** The day being emptied is `retention + grace` old and residency is a day
+wide, so none of it is in memory and every one of them reaches the device.
+
+Measured: 92,000 store reads for 92,000 holds released, with the read queue at its full depth of 128 and
+1,592 refusals against it. The sweep's own share is fewer than two thousand blocks — about two percent.
+
+The lookup cannot simply be dropped. It is what makes the judge's data current: between the sweep reading a
+record and the judge deciding, a client settle for the same hold can commit, and the queue's order is what
+guarantees the answer reflects it. It is also what puts the request in its lane.
+
+**What can go is the read inside it.** A block's bytes never change once sealed — that is what the
+whole-block checksum rests on — and block numbers count on across days and are never reused, so a block
+number names one set of bytes for the life of the ledger. Two shapes were considered and only one fits.
+
+*Keeping the last block read* was tried and changed nothing, which is worth writing down because it sounds
+like it should work. The fifty-one lookups are all **submitted before any completes** — the queue reaches
+its depth on them — so at submit time the block has not been read yet, and by the time it has, the rest are
+already in the queue.
+
+*Coalescing* is the shape that fits: a read for a block already in flight registers as a waiter rather than
+submitting, and one completion answers all of them. It saves the queue slots as well as the reads, which is
+the half a cache cannot reach — and those slots are what the 1,592 refusals are made of. `status.md` carries
+it as the open question, with the numbers.
+
 ### What is left on the worker's thread, and the one that turned out not to be a threading problem
 
 Two reads are still synchronous on the pending worker's thread. One is the apply-path fallback and it
