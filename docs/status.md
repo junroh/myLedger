@@ -188,11 +188,13 @@ fail. `MemoryStore` backs it today and `LatencyStore` prices a device in front o
 What it unblocks, and what each is worth now:
 
 - **`SE-OQ-4`**, the read backend, has its portable third: `FileStore` reads on N threads
-  (`--store-read-threads`), each with its own SPSC pair, and zero threads is the synchronous baseline. What it
-  does *not* have is a reason to be turned on here — measured, the pool costs a third of the read ceiling and
-  buys nothing, because without `O_DIRECT` every read is a page-cache hit and there is nothing to overlap. So
-  the default is zero rather than the design's sixteen, and the arithmetic for a deployment is in §16. io_uring
-  and libaio are the same two methods again, and the trait arrives with the second implementation.
+  (`--store-read-threads`), each with its own SPSC pair, and zero is the synchronous baseline. Measured, the
+  curve peaks at **two threads and 9% over synchronous**, then falls to 43% *below* it at sixteen — because what
+  bounds the count is the cores this assembly has spare, not the reads it has to serve. The default is zero
+  because that number is a deployment's and not a constant. **And the same measurement is the design's own
+  argument for io_uring, as a number**: Little's law wants a hundred reads outstanding at 0.5ms and 200k/s,
+  cores here allow two threads, and no thread pool closes a gap of fifty. io_uring and libaio are the same two
+  methods again; the trait arrives with the second implementation.
 - **`SE-OQ-6`**, the `≤5ms` worst case, has its tooling and not its answer. Against the model: 5ms reads
   sustain 100k tx/s at p99.9 9.7ms with a queue depth of 512. Against a real filesystem at 40,000 store reads
   a second: p99 5.4ms and p99.9 6.1ms at depth 2048, against p99 93.7ms at 128 — **twice now a "the device is
@@ -510,14 +512,17 @@ unanswered, and **when that default stops being safe**. The source design's own 
   engine one.
 
 - **How many threads should issue the store's reads in a deployment?**
-  *Default:* none. Reads happen synchronously inside `poll`, which overlaps nothing, and that is the measured
-  best answer on this machine: with the page cache in front of the files a pool costs a third of the read
-  ceiling. The design says sixteen, from Little's law at half a millisecond a read.
-  *Stops being safe:* the moment `O_DIRECT` is in play, because then every store read is a device read and a
-  synchronous one serialises them into a single round's worth. The arithmetic is not in doubt — reads a second
-  times the latency of one — what is missing is the latency, which needs the device. It is a flag rather than a
-  derivation because `PendingCapacity` declares arrivals and survivor shares but not the *miss* rate, which is
-  what turns a lookup rate into a store read rate.
+  *Default:* none, and that is a refusal to pick rather than a measurement. The curve on this machine peaks at
+  two threads (9% over synchronous) and is 43% below synchronous at sixteen, because what bounds the count is
+  the cores left after the reactor, the pending worker and the client — a deployment's property, not a
+  constant. The design says sixteen, which is Little's law at half a millisecond a read.
+  *Stops being safe:* the moment `O_DIRECT` is in play, and then zero is not merely suboptimal but the ceiling:
+  the synchronous read happens *inside* `poll` on the worker's own thread, so a 100µs device read caps store
+  reads at 10k a second and stalls the whole component for each of them. **The measured curve does not transfer
+  either** — here a read is CPU, so a thread competes for a core; on a device it blocks in the kernel and costs
+  nothing, which is the contention that shapes the curve disappearing. What a deployment needs is the device's
+  latency, and 100µs at 30k reads a second wants three threads while 0.5ms at 200k wants a hundred — the last
+  of those is the only corner a pool cannot reach, and it is io_uring's.
 
 - **Which of the design's storage questions are still untouched, and is that acceptable?**
   *Default:* three of the five have moved and two have not. `SE-OQ-4` (io_uring against a thread pool) is now

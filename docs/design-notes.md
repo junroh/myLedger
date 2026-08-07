@@ -2031,32 +2031,72 @@ io_uring owns the descriptors and issues its own reads, so a decorator over a sy
 become one. The field is not a trait yet — the design abstracts the backend and this is one implementation, so
 the trait arrives with the second (rule 4).
 
-**Measured, and the answer is that it costs a third of the read ceiling and buys nothing here.**
+**Measured, and the shape of it is a peak rather than a slope.** Two runs per point, `--rate 0` so the ledger
+rather than the client is the limit, every read a store read:
 
-| `--store-read-threads` | p99 at 100k tx/s | ceiling |
+| `--store-read-threads` | reads/s | per read |
 |---|---|---|
-| 0 (synchronous in `poll`) | 5.43ms | 993k tx/s, 490k reads/s |
-| 16 | 5.71ms | 663k tx/s, 322k reads/s |
-| 64 | 5.74ms | — |
+| 0 (synchronous in `poll`) | 551–556k | 1.80µs |
+| **2** | **600–605k** | **1.65µs** |
+| 4 | 500–506k | 1.99µs |
+| 6 | 461–463k | 2.16µs |
+| 8 | 448–451k | 2.22µs |
+| 16 | 313–326k | 3.1µs |
 
-The reason is the page cache. A pool pays for itself where a read *blocks*; without `O_DIRECT` every read is a
-cache hit of a few microseconds, the queue hop and the wakeup cost more than the read, and the threads take CPU
-from the reactor on a machine with four performance cores. So the default is **zero**, which is what is
-verified, and not the design's sixteen — that figure assumes half-millisecond reads, and a deployment which
-bypasses the cache has to set it from Little's law on the *store read* rate: threads ≈ reads a second × the
-latency of one.
+So the pool is worth 9% at two threads and costs 43% at sixteen, and **what decides which is the cores it has
+left rather than the reads it has to serve.** This machine has four performance cores and the reactor thread,
+the pending worker and the client driver already want them; two is what is spare. Above that each thread is
+taking a core from the thing it is trying to help.
 
-**And its value cannot be measured here at all**, which is worth stating rather than leaving as an absence. To
-see a pool help, the reads have to block, and the only slow reads available are modelled — but `LatencyStore`
-sits *outside* `FileStore`, so it holds completions the pool has already produced and the pool's threads never
-block for the modelled time. The composition cannot express "the backing is slow". Same wall as `O_DIRECT`, and
-the same answer: a Linux host.
+**That is not Little's law, and confusing the two is the mistake worth not repeating.** Little's law says how
+many reads have to be *outstanding* — 0.5ms against 200k/s is a hundred — and threads are only one way to hold
+them, capped by cores. When the two disagree, and here they disagree by fifty times, **the gap is exactly what
+io_uring is for**: one thread holding a queue a hundred deep. The design puts io_uring first and the pool third,
+and this is that ordering as a number rather than a preference.
 
-**One measurement was of my own mistake, and it is the reason the table above has no cliff.** The first version
-parked each idle thread with a fifty-microsecond timeout, so sixty-four idle threads woke twenty thousand times
-a second each — 1.3M wakeups against four cores — and that configuration reported p50 174ms against 1.6ms.
-`park` needs no timeout: `unpark` leaves a token when it arrives first, so a thread about to sleep returns
-immediately instead. With the timeout gone, sixty-four threads are indistinguishable from sixteen.
+The default stays zero. Not because a pool is worthless — two threads is a real 9% — but because the right
+count follows from cores this assembly happens to have spare, which is a deployment's property and not a
+constant. `--store-read-threads` and the curve above are how one is chosen.
+
+**Two attributions I got wrong on the way, both by measuring instead of arguing.** The first: a run at sixteen
+threads read as "a pool costs a third of the read ceiling and buys nothing", and it was oversubscription on a
+four-core machine rather than the pool. The second: I supposed the per-read cost was the `unpark` syscall on the
+worker's thread, so I tried spin-only threads — 2.46µs against park's 1.99µs at the same count. Spinning threads
+steal cores, and stealing a core is dearer than a syscall. The dominant term is contention, not handoff.
+
+**The curve above is a page-cache curve, and on a device the cost model inverts.** That is the one thing not to
+carry across from it. Here a "read" is a syscall and a `memcpy` — pure CPU — so a reader thread *competes* for a
+core and the marginal thread costs more than it earns past two. On a device with `O_DIRECT` the thread is
+**blocked in the kernel**, spending no CPU at all, and sixteen blocked threads cost almost nothing. The
+contention that shapes this table is exactly what disappears when the read becomes real.
+
+Which is why zero is the wrong number for a device and not merely a refusal to pick. The synchronous path does
+its `pread` *inside* `poll`, on the pending worker's own thread: a 100µs device read caps store reads at 10k a
+second **and stalls the whole component for each of them** — no applies, no lookups answered, no sync. A pool is
+not an optimisation there, it is what stops the synchronous path from being the ceiling.
+
+How many, by the same arithmetic and now with the corner it applies to:
+
+| read latency | store reads/s | outstanding needed |
+|---|---|---|
+| 100µs (NVMe, `O_DIRECT`) | 30k | 3 |
+| 100µs | 200k | 20 |
+| 500µs (the design's figure) | 30k | 15 |
+| 500µs | 200k | 100 |
+
+Threads reach the first three. Only the last needs one thread holding a deep queue, which is io_uring's case —
+so the design's ordering is right and the gap is narrower than a single corner suggests. Sixteen, the design's
+own number, is the third row.
+
+**And none of it can be measured here**, which is the part the table cannot fix: to see a pool overlap anything
+the reads have to block, and the only slow reads available are modelled — `LatencyStore` sits outside
+`FileStore`, so it holds completions the pool has already produced and the pool's threads never block for the
+modelled time. Same wall as `O_DIRECT`, same answer: a Linux host.
+
+**One number in that table was mine rather than the pool's, and it is why there is no cliff in it.** The first
+version parked each idle thread with a fifty-microsecond timeout, so sixteen idle threads woke twenty thousand
+times a second each and sixty-four reported p50 174ms against 1.6ms. `park` needs no timeout — `unpark` leaves a
+token when it arrives first — and with it gone the curve is monotonic past its peak.
 
 ### Still unbuilt, and named so it is not read as done
 

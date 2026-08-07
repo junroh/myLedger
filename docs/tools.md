@@ -143,9 +143,10 @@ decides what the prediction is worth:
   syscall path rather than a model of it, and on this machine it is *not* a measurement of a device: macOS has
   no `O_DIRECT`, so reads come through the page cache. Design notes §16 has both columns.
 - **`--store-read-threads <n>` issues the store's reads on a pool** instead of synchronously inside `poll`.
-  Zero is the default and the measured best answer here: with the page cache in front of the files a pool costs
-  a third of the read ceiling, because a cache hit is cheaper than a queue hop. It is for a deployment that
-  bypasses the cache, and design notes §16 has the arithmetic for the number.
+  Zero is the default, and that is a refusal to pick rather than a measurement: the curve peaks at two threads
+  here — 9% better than synchronous — and is 43% worse at sixteen, because what bounds the count is the cores
+  left over after the reactor and the worker. Design notes §16 has the curve, and the reason a number read off
+  one machine's spare cores does not travel.
 - **The read queue's depth is a flag, and it bounds what a slow read can hide behind.**
   `--store-queue-depth` (128) is how many reads the store holds at once; past it reads are refused and the
   engine keeps the command. At 40,000 store reads a second, 5ms reads need about two hundred outstanding — at
