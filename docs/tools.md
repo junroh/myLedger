@@ -266,3 +266,31 @@ fences, lookups, evictions, seq gaps, quarantines, refused commits — because "
 "nothing happened" look identical otherwise. That report is how a missing fault gets noticed: the
 first version of the simulator injected out-of-order replies that could never fire, and the coverage
 line is what showed it.
+
+## `sizing/` — how much RAM and how much disk
+
+`ledgerfio` and `ledgersim` measure a node that is running. `sizing/` answers for one nobody has run:
+memory and disk for a stated demand and a stated policy.
+
+```
+make sizing            # the answer for the example demand in sizing/model.py
+make sizing-units      # refresh sizing/units.json after changing a sized struct
+open sizing/sizing.ipynb
+```
+
+**The split is the whole design.** The code owns what one unit costs — `size_of`, published by
+`ledgerfio layout --json` — and the model owns how many. Nothing in `sizing/` hard-codes a byte count,
+because a struct that changed would leave a number that is wrong and says nothing.
+
+`make verify` runs `sizing-check`, which regenerates the dump from the build in front of it and refuses
+a difference, naming what moved. That is the same discipline as `layout_claim!`: a size does not drift,
+it fails.
+
+**Three rates, not one.** A peak decides what is held in flight, the busiest hour decides the windows an
+hour wide, and the day decides retention. The idem map is where this bites hardest — the window is an
+hour and there is no queue to absorb a peak into, so 300k/s for one minute costs 2.2GB and the same rate
+for a whole hour costs 71GB.
+
+**What is deliberately absent is throughput and the tail.** Design notes §10 records the formula for
+them being built, measured and refused, and `ledgersim` is what replaced it. A sizing model that grew a
+performance term would be rebuilding exactly that.

@@ -1,4 +1,4 @@
-.PHONY: verify test-all fio fio-hold sim sim-check help
+.PHONY: verify test-all fio fio-hold sim sim-check sizing sizing-check sizing-units help
 
 help:
 	@echo "Available targets:"
@@ -8,6 +8,8 @@ help:
 	@echo "  make sim ARGS='...' - cargo run --release -p ledgersim -- <args>"
 	@echo "  make fio-hold      - cargo run --release -p ledgerfio -- run --workload hold-settle --duration 3s --accounts 100000"
 	@echo "  make sim-check     - cargo run --release -p ledgersim -- check --seeds 16"
+	@echo "  make sizing        - python3 sizing/model.py, the memory and disk answer"
+	@echo "  make sizing-units  - refresh sizing/units.json after changing a sized struct"
 
 # What `docs/status.md` says it was verified with, as something that can be run rather than
 # remembered. A crash in a workload took two commits to notice because the tools were not part of any
@@ -72,6 +74,29 @@ verify:
 	cargo run --release -p ledgersim -- check --seeds 32
 	cargo run --release -p ledgersim -- capacity --duration-ms 200
 	cargo run --release -p ledgersim -- require --rate 500000
+	$(MAKE) --no-print-directory sizing-check
+
+# The sizing model may not hard-code a unit cost, so it reads them from a cached dump -- and a cache
+# nothing checks is the same stale number one step further away. This regenerates from the build in
+# front of it and refuses a difference: change a sized struct and `make verify` says so, the same way
+# `layout_claim!` fails a build rather than letting a size drift.
+#
+# The commit is excluded from the comparison on purpose. It records where the numbers came from, and
+# demanding it match HEAD would mean refreshing the file on every unrelated commit -- a check that
+# fires for something it is not about is one people learn to re-run past.
+sizing-check:
+	@cargo build --release -p ledgerfio --quiet
+	@./target/release/ledgerfio layout --json | (cd sizing && python3 units.py check)
+	@python3 sizing/model.py > /dev/null
+	@echo "sizing units match the build"
+
+sizing:
+	@python3 sizing/model.py
+
+sizing-units:
+	@cargo build --release -p ledgerfio --quiet
+	@./target/release/ledgerfio layout --json | (cd sizing && python3 units.py write)
+	@echo "sizing/units.json refreshed"
 
 test-all:
 	cargo test --workspace --quiet

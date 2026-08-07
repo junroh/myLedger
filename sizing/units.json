@@ -1,0 +1,148 @@
+{
+  "block_bytes": 4096,
+  "bucket_rule": "next_power_of_two(entries * 8 / 7)",
+  "cache_line": 128,
+  "commit": "e0767ebad7f1ad90627de28beb340f875949215f",
+  "parts": [
+    {
+      "bytes": 228,
+      "name": "work slots",
+      "owner": "sequencer",
+      "unit": "slot"
+    },
+    {
+      "bytes": 4,
+      "name": "deferred dispatches",
+      "owner": "sequencer",
+      "unit": "slot"
+    },
+    {
+      "bytes": 32,
+      "name": "lane state",
+      "owner": "sequencer",
+      "unit": "account"
+    },
+    {
+      "bytes": 112,
+      "name": "open batch effects",
+      "owner": "sequencer",
+      "unit": "effect"
+    },
+    {
+      "bytes": 40,
+      "name": "batches awaiting consensus",
+      "owner": "sequencer",
+      "unit": "batch"
+    },
+    {
+      "bytes": 116,
+      "name": "spare batch buffers",
+      "owner": "sequencer",
+      "unit": "effect"
+    },
+    {
+      "bytes": 80,
+      "name": "ack backlog",
+      "owner": "sequencer",
+      "unit": "entry"
+    },
+    {
+      "bytes": 80,
+      "name": "queued engine writes",
+      "owner": "sequencer",
+      "unit": "effect"
+    },
+    {
+      "bytes": 48,
+      "name": "account records",
+      "owner": "accounts",
+      "unit": "account"
+    },
+    {
+      "bytes": 17,
+      "name": "account index",
+      "owner": "accounts",
+      "unit": "bucket"
+    },
+    {
+      "bytes": 33,
+      "name": "idem keys",
+      "owner": "idem",
+      "unit": "bucket"
+    },
+    {
+      "bytes": 8,
+      "name": "engine index",
+      "owner": "pending",
+      "unit": "slot"
+    },
+    {
+      "bytes": 33,
+      "name": "engine budget groups",
+      "owner": "pending",
+      "unit": "bucket"
+    },
+    {
+      "bytes": 49,
+      "name": "overlay entries",
+      "owner": "pending",
+      "unit": "bucket"
+    },
+    {
+      "bytes": 4096,
+      "name": "engine writeback buffer",
+      "owner": "pending",
+      "unit": "block"
+    },
+    {
+      "bytes": 4096,
+      "name": "engine resident blocks",
+      "owner": "pending",
+      "unit": "block"
+    },
+    {
+      "bytes": 4096,
+      "name": "engine record blocks",
+      "owner": "pending",
+      "unit": "block"
+    },
+    {
+      "bytes": 4096,
+      "name": "volume read cache",
+      "owner": "pending",
+      "unit": "block"
+    },
+    {
+      "bytes": 4096,
+      "name": "volume write lane",
+      "owner": "pending",
+      "unit": "block"
+    },
+    {
+      "bytes": 4096,
+      "name": "volume read pool",
+      "owner": "pending",
+      "unit": "block"
+    },
+    {
+      "bytes": 80,
+      "name": "pending record",
+      "owner": "pending",
+      "unit": "record"
+    },
+    {
+      "bytes": 112,
+      "name": "kept log",
+      "owner": "consensus",
+      "unit": "effect"
+    },
+    {
+      "bytes": 32,
+      "name": "proposals in flight",
+      "owner": "consensus",
+      "unit": "batch"
+    }
+  ],
+  "records_per_block": 51,
+  "source": "ledgerfio layout --json"
+}
