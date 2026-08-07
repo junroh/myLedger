@@ -389,6 +389,8 @@ pub struct MemoryPending {
     applies_sent: u64,
     /// What the store is holding, published by the worker because the store lives on its thread.
     occupancy: Arc<Occupancy>,
+    /// Blocks the volume's read cache was given. Fixed at start-up, so it is a number rather than a gauge.
+    read_cache_blocks: usize,
     /// A test's hold on the replies — see `AnswerGate`. Open unless somebody closed it.
     replies: AnswerGate,
     _thread: WorkerThread,
@@ -794,6 +796,7 @@ impl MemoryPending {
             ),
             applies_sent: 0,
             occupancy,
+            read_cache_blocks: config.read_cache_blocks,
             replies,
             _thread: thread,
         })
@@ -880,6 +883,16 @@ impl MemoryPending {
             self.occupancy.blocks.peak(),
             0,
             blocks * BLOCK_BYTES,
+        );
+        // Taken at start-up whether or not it is used, so entries and peak are the same number. No
+        // capacity is passed: a fixed allocation is not a ceiling something reached, and reporting it as
+        // one would put it in the list of things a run should worry about.
+        footprint.other(
+            "volume read cache",
+            self.read_cache_blocks,
+            self.read_cache_blocks,
+            0,
+            self.read_cache_blocks * BLOCK_BYTES,
         );
         for part in self.overlay.footprint().parts() {
             footprint.other(
